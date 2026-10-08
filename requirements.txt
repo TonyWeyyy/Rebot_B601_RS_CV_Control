@@ -1,0 +1,17 @@
+# rebot_palm_follow_grasp 依赖清单
+# Python 3.10+（推荐 Ubuntu 22.04/24.04 实体机，虚拟机跑视觉+控制容易掉帧）
+
+motorbridge>=0.4.0          # 电机控制 SDK（rebot_control 依赖）
+pyorbbecsdk2>=2.0.0         # Orbbec 官方 SDK v2（导入名仍是 pyorbbecsdk；
+                            #   若装过 v1 的 pyorbbecsdk 请先 pip uninstall）
+mediapipe==0.10.14          # 手部关键点检测（HandLandmarker）
+opencv-contrib-python>=4.8  # 相机采集 / ArUco（标定用）/ 画面绘制
+numpy>=1.24
+PyYAML>=6.0                 # config/grasp.yaml
+pynput>=1.7                 # 键盘监听（启停跟随 / 标定微动）
+pinocchio>=3.0              # 运动学（FK / 雅可比），读 reBotArm_control_py 的 URDF
+scipy>=1.10                 # handeye_joint_calib.py 联合标定最小二乘
+
+# 另外需要两个源码仓库（非 pip 包），路径在 rebot_adapter.py 顶部配置：
+#   git clone https://github.com/LAN-GER/rebot_control.git        # 运动下发
+#   git clone https://github.com/Seeed-Projects/reBotArm_control_py.git  # URDF
