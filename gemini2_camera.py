@@ -34,16 +34,62 @@ class Gemini2Camera:
         self.pipeline = Pipeline()
         config = Config()
 
+        # ---- 高帧率（>30fps）需要先切换深度工作模式 ----
+        # Gemini 2 规格：默认 Unbinned Dense 模式下 RGB 封顶 30fps；
+        # 只有 Binned Sparse Default 模式才开放 深度640x400@60 + RGB 1280x720@60。
+        # 代价：BS 模式深度是降采样的，精度/细节略低于默认模式。
+        if fps > 30:
+            try:
+                device = self.pipeline.get_device()
+                mode_list = device.get_depth_work_mode_list()
+                bs_mode = None
+                for i in range(mode_list.get_count()):
+                    m = mode_list.get_depth_work_mode_by_index(i)
+                    name = m.get_name() if hasattr(m, 'get_name') else str(m)
+                    print(f"[Gemini2] 可用深度工作模式: {name}")
+                    if "Binned" in name and "Sparse" in name:
+                        bs_mode = m
+                if bs_mode is not None:
+                    device.set_depth_work_mode(bs_mode)
+                    print("[Gemini2] 已切换深度工作模式 -> Binned Sparse Default"
+                          "（开放 60fps；深度精度略降）")
+                else:
+                    print("[Gemini2] 未找到 Binned Sparse 模式，60fps 不可用，"
+                          "将回退到 30fps")
+            except Exception as e:
+                print(f"[Gemini2] 切换深度工作模式失败({e})，将回退到 30fps")
+
         # ---- 彩色流（请求 MJPG，取流后用 OpenCV 解码，省 USB 带宽）----
         color_profiles = self.pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
         try:
             color_profile = color_profiles.get_video_stream_profile(
                 width, height, OBFormat.MJPG, fps)
         except OBError:
-            color_profile = color_profiles.get_default_video_stream_profile()
-            print(f"[Gemini2] 未找到 {width}x{height}@{fps} MJPG，使用默认彩色配置: "
-                  f"{color_profile.get_width()}x{color_profile.get_height()}")
+            # 诊断：打印相机当前实际枚举到的全部彩色 profile
+            # （60fps MJPG 只在 USB 3.x 下出现；看不到就说明链路掉到 USB 2.0）
+            print(f"[Gemini2] 未找到 {width}x{height}@{fps} MJPG，"
+                  f"相机实际支持的彩色流:")
+            for i in range(color_profiles.get_count()):
+                p = color_profiles.get_stream_profile_by_index(i)
+                print(f"    {p.get_width()}x{p.get_height()}@"
+                      f"{p.get_fps()} {p.get_format()}")
+            # 退而求其次：任意分辨率但帧率达标的 MJPG（保帧率优先于保分辨率）
+            color_profile = None
+            best_area = None
+            for i in range(color_profiles.get_count()):
+                p = color_profiles.get_stream_profile_by_index(i)
+                if p.get_format() == OBFormat.MJPG and p.get_fps() == fps:
+                    area = p.get_width() * p.get_height()
+                    if best_area is None or area < best_area:
+                        color_profile, best_area = p, area
+            if color_profile is None:
+                color_profile = color_profiles.get_default_video_stream_profile()
+            print(f"[Gemini2] 回退使用: {color_profile.get_width()}x"
+                  f"{color_profile.get_height()}@{color_profile.get_fps()}")
         config.enable_stream(color_profile)
+        # 记录实际生效的彩色分辨率（可能与请求的 640x480 不同，如 60fps 模式下 1280x720）
+        self.width = color_profile.get_width()
+        self.height = color_profile.get_height()
 
         # ---- 深度流（HW D2C 时优先用官方推荐的 D2C profile 列表选择）----
         depth_profile = None
@@ -58,7 +104,11 @@ class Gemini2Camera:
                         depth_profile = p
                         break
                 if depth_profile is None and d2c_profiles.get_count() > 0:
-                    depth_profile = d2c_profiles.get_stream_profile_by_index(0)
+                    # 兜底取 D2C 列表里帧率最高的（取第一个帧率随缘：实测出现过 10/30fps）
+                    depth_profile = max(
+                        (d2c_profiles.get_stream_profile_by_index(i)
+                         for i in range(d2c_profiles.get_count())),
+                        key=lambda p: p.get_fps())
             except OBError:
                 depth_profile = None
 

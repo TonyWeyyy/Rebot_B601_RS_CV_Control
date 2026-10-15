@@ -417,6 +417,14 @@ def main():
     print(f"初始化 Gemini 2 相机（{camera_fps} fps）...")
     cam = Gemini2Camera(fps=camera_fps)
     fx, fy, cx, cy = cam.fx, cam.fy, cam.cx, cam.cy
+    # 捏合像素阈值按 640 宽标定（grasp.yaml 中 closed_px/open_px）；
+    # 相机实际分辨率不同时（如 60fps 模式下 1280x720）按比例自动换算
+    pinch_scale = cam.width / 640.0 if cam.width != 640 else 1.0
+    if pinch_scale != 1.0:
+        pinch_closed_px *= pinch_scale
+        pinch_open_px *= pinch_scale
+        print(f"[配置] 相机宽度 {cam.width}px，捏合阈值自动 x{pinch_scale:.2f}: "
+              f"{pinch_closed_px:.0f}px / {pinch_open_px:.0f}px")
     desired_u, desired_v = int(round(cx)), int(round(cy))   # 期望掌心点 = 画面中心
 
     print("初始化手掌检测...")
