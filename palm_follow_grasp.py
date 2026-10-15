@@ -102,6 +102,19 @@ DEADBAND_HYSTERESIS = 1.5     # 死区迟滞：进入死区后，误差要超过
                               # 才重新启动——防止误差在死区边界反复穿入穿出
 DEPTH_OE_MIN_CUTOFF = 1.0     # 深度通道 One Euro 参数：静止时压低 z3d 抖动
 DEPTH_OE_BETA = 0.02          # （手快速靠近/远离时自动放开滤波）
+Z3D_MAX_RATE = 0.05           # 深度限速 (m/帧)：参照无效时的最后防线
+Z3D_MAX_JUMP = 0.08           # 深度跳变剔除阈值 (m)：单帧 |Δz| 超过此值
+                              # 视为误检帧丢弃（手 16ms 内不可能移动 8cm）
+
+# 伸展度增益调度：手臂前伸越多，J1 杠杆臂越长、整臂刚度越低，
+# 同样增益在伸展位姿会超出稳定裕度（前伸后停靠大振荡的根源）。
+# TCP 水平半径 ≤ REACH_SOFT_START 时参数原样，到 REACH_SOFT_END
+# 线性衰减到 REACH_MIN_SCALE，超过后保持 REACH_MIN_SCALE。
+REACH_SOFT_START = 0.25       # 开始衰减的水平伸展半径 (m)
+REACH_SOFT_END = 0.40         # 衰减到底的半径 (m)
+REACH_MIN_SCALE = 0.60        # 最深伸展时停靠段指令的保留比例
+REACH_DOCK_DIST = 0.20        # 停靠段半径 (m)：误差小于此值才开始衰减，
+                              # 巡航段（误差大）不衰减、全速跟手
 
 CAMERA_FPS = 30               # 相机帧率；Gemini2 支持 640x480@60，
                               # 高速跟随建议 --fps 60（感知延迟砍半）
@@ -115,12 +128,17 @@ SMOOTH_ALPHA = 0.38
 # 方向反转时清除速度平滑的「惯性」：手突然反向快移时，若不清除，
 # 平滑后的指令仍维持原方向 → 手臂先反向冲一下再拉回
 REVERSAL_FAST_RESPONSE = True
+MAX_ACCEL = 2.0               # 末端速度指令加速度上限 (m/s^2)，启停梯形化
+REVERSAL_ACCEL_BOOST = 1.8    # 方向反转时的加速度额度倍数
 
 # 工作空间虚拟墙（基座系，米）——按实际桌面环境设置
 WORKSPACE_MIN = np.array([-0.40, -0.10, 0.03])
 WORKSPACE_MAX = np.array([ 0.40,  0.40, 0.60])
 
 LOST_HOLD_FRAMES = 15         # 连续丢手超过 15 个控制周期 → 保持不动
+COAST_FRAMES = 6              # 丢失后按最后速度外推目标的帧数（120ms @50Hz）
+COAST_DECAY = 0.90            # 外推速度逐帧衰减系数（防爆冲）
+COAST_MAX_VEL = 0.35          # 外推速度限幅 (m/s)：防前馈污染带跑
 
 
 # ─── 命令行与配置 ────────────────────────────────────────────
@@ -232,8 +250,10 @@ def apply_follow_cfg(cfg):
     global POSITION_DEADBAND, DEADBAND_HYSTERESIS, ORIENTATION_DEADBAND
     global VEL_FEEDFORWARD, FF_SMOOTH, FF_MAX_VEL, FF_MIN_SPEED, FF_TAPER_DIST
     global SMOOTH_ALPHA, REVERSAL_FAST_RESPONSE
-    global DEPTH_OE_MIN_CUTOFF, DEPTH_OE_BETA
+    global MAX_ACCEL, REVERSAL_ACCEL_BOOST
+    global DEPTH_OE_MIN_CUTOFF, DEPTH_OE_BETA, Z3D_MAX_JUMP
     global K_ORIENTATION, MAX_VEL_JOINT, MAX_VEL_ANGULAR
+    global REACH_SOFT_START, REACH_SOFT_END, REACH_MIN_SCALE, REACH_DOCK_DIST
     global WORKSPACE_MIN, WORKSPACE_MAX
     fcfg = cfg["follow"]
     POSITION_DEADBAND = float(fcfg["position_deadband"])
@@ -246,11 +266,19 @@ def apply_follow_cfg(cfg):
     FF_TAPER_DIST = float(fcfg["ff_taper_dist"])
     SMOOTH_ALPHA = float(fcfg["smooth_alpha"])
     REVERSAL_FAST_RESPONSE = bool(fcfg["reversal_fast_response"])
+    MAX_ACCEL = float(fcfg.get("max_accel", 2.0))
+    REVERSAL_ACCEL_BOOST = float(fcfg.get("reversal_accel_boost", 1.8))
     DEPTH_OE_MIN_CUTOFF = float(fcfg["depth_oe_min_cutoff"])
     DEPTH_OE_BETA = float(fcfg["depth_oe_beta"])
+    Z3D_MAX_JUMP = float(fcfg.get("z3d_max_jump", Z3D_MAX_JUMP))
     K_ORIENTATION = float(fcfg["k_orientation"])
     MAX_VEL_JOINT = float(fcfg["max_vel_joint"])
     MAX_VEL_ANGULAR = float(fcfg["max_vel_angular"])
+    # 伸展度增益调度（旧 yaml 没有这四个键时用代码默认值）
+    REACH_SOFT_START = float(fcfg.get("reach_soft_start", REACH_SOFT_START))
+    REACH_SOFT_END = float(fcfg.get("reach_soft_end", REACH_SOFT_END))
+    REACH_MIN_SCALE = float(fcfg.get("reach_min_scale", REACH_MIN_SCALE))
+    REACH_DOCK_DIST = float(fcfg.get("reach_dock_dist", REACH_DOCK_DIST))
     ws = cfg["workspace"]
     WORKSPACE_MIN = np.array(ws["min"], dtype=np.float64)
     WORKSPACE_MAX = np.array(ws["max"], dtype=np.float64)
@@ -515,11 +543,20 @@ def main():
     # ── 伺服控制线程（50Hz；--no-arm 时不启动）────────────
     stop_ctrl = threading.Event()
     actual_velocity = [np.zeros(6)]
+    prev_cmd_vel = [np.zeros(3)]          # 上周期下发的速度指令（加速度限制参照）
     lost_counter = [0]
     prev_target_cam = [None]            # 上一周期掌心目标（前馈用）
     target_vel_f = [np.zeros(3)]        # 平滑后的目标速度估计（相机系）
     in_deadband = [False]               # 死区迟滞状态（True=已收敛到死区内）
+    coast_offset = [np.zeros(3)]        # 丢失外推的累计位移（相机系）
+    coast_vel = [np.zeros(3)]           # 丢失瞬间的目标速度（外推用）
+    coast_err = [1e9]                   # 丢失瞬间的误差（大误差禁止外推）
+    near_wall = [True]                  # 上一周期 TCP 是否贴近虚拟墙
+    reach_r_now = [0.0]                 # 上一周期水平伸展半径
     depth_oe = OneEuroFilter(DEPTH_OE_MIN_CUTOFF, DEPTH_OE_BETA)  # 深度滤波
+    last_valid_depth = [0.0]    # 上一帧有效深度（跳变剔除的参照）
+    z3d_reject_count = [0]      # 连续跳变剔除帧数（防锁死：≥15 帧放行）
+    reacq_buf = [[]]            # 参照无效时的恢复校验缓冲（3 帧一致性）
     ctrl_thread = None
 
     def servo_control_loop():
@@ -536,6 +573,33 @@ def main():
                 lost_counter[0] += 1
             else:
                 lost_counter[0] = 0
+
+            # ── 丢失外推（滑行）：运动模糊掉检通常只有 2~6 帧。
+            # 按丢失瞬间的目标速度继续外推目标 ≤6 帧(120ms)，速度逐帧衰减。
+            # 安全约束（log(15) 撞墙事故的教训）：
+            #  1) 外推速度限幅 0.35m/s——恢复瞬间的目标跳变会污染前馈
+            #     速度估计，不限幅会朝幻影目标冲出去；
+            #  2) 接近虚拟墙（<5cm）或手臂伸展（>reach_soft_start）时
+            #     禁止外推——这些区域没有容错余量；
+            #  3) 外推只在误差较小时启用（跟丢的是"移动中的手"，
+            #     误差大说明目标本身可疑）。
+            if visible:
+                coast_offset[0][:] = 0.0
+                cv = target_vel_f[0].copy()
+                cvn = float(np.linalg.norm(cv))
+                if cvn > COAST_MAX_VEL:
+                    cv *= COAST_MAX_VEL / cvn
+                coast_vel[0] = cv
+                coast_err[0] = float(np.linalg.norm(
+                    target_cam - np.array([0.0, 0.0, desired_depth]))) \
+                    if target_cam is not None else 1e9
+            elif (target_cam is not None and 0 < lost_counter[0] <= COAST_FRAMES
+                    and coast_err[0] < 0.15
+                    and not near_wall[0] and reach_r_now[0] <= REACH_SOFT_START):
+                coast_offset[0] += coast_vel[0] * CTRL_RATE
+                coast_vel[0] *= COAST_DECAY
+            if target_cam is not None and lost_counter[0] > 0:
+                target_cam = target_cam + coast_offset[0]
 
             if following and target_cam is not None and lost_counter[0] <= LOST_HOLD_FRAMES:
                 try:
@@ -556,6 +620,7 @@ def main():
                         robot.move_to_joints(HOME_JOINT_POS, speed_deg_s=12.0,
                                              wait=True, timeout=30.0)
                         actual_velocity[0] = np.zeros(6)
+                        prev_cmd_vel[0][:] = 0.0
                         with lock:
                             control_status["error"] = "已自动回 HOME"
                         continue
@@ -581,10 +646,14 @@ def main():
                     # 消除纯反馈跟随的高速滞后（手快臂慢的根源之一）
                     if VEL_FEEDFORWARD > 0.0:
                         if prev_target_cam[0] is not None:
-                            tv = (target_cam - prev_target_cam[0]) / CTRL_RATE
-                            tv = np.clip(tv, -FF_MAX_VEL, FF_MAX_VEL)
-                            target_vel_f[0] = (FF_SMOOTH * tv
-                                               + (1 - FF_SMOOTH) * target_vel_f[0])
+                            # 目标跳变守卫：恢复/误检导致单周期目标位移
+                            # >6cm 时，本帧的速度估计是纯污染，跳过更新
+                            # （否则假速度会被记住，下次掉检时被外推放大）
+                            if np.linalg.norm(target_cam - prev_target_cam[0]) < 0.06:
+                                tv = (target_cam - prev_target_cam[0]) / CTRL_RATE
+                                tv = np.clip(tv, -FF_MAX_VEL, FF_MAX_VEL)
+                                target_vel_f[0] = (FF_SMOOTH * tv
+                                                   + (1 - FF_SMOOTH) * target_vel_f[0])
                         prev_target_cam[0] = target_cam.copy()
                         # 静止门控：手不动时目标速度估计≈纯噪声
                         # （深度抖动 /CTRL_RATE 会被放大成 0.2+ m/s 假速度），
@@ -606,6 +675,25 @@ def main():
                     # J1 指令长期顶在限速上（非线性饱和），与延迟叠加形成
                     # 极限环振荡；tanh 让接近上限时增益平滑衰减
                     v_cam[:3] = max_vel_cart * np.tanh(v_cam[:3] / max_vel_cart)
+
+                    # 伸展度增益调度：手臂前伸越多，J1 杠杆臂越长、整臂刚度
+                    # 越低，收缩位姿刚好的增益在伸展位姿会超出稳定裕度
+                    # （前伸较多时停靠大振荡的根源）。
+                    # 只衰减停靠段（误差 ≤ REACH_DOCK_DIST）：巡航段（误差大、
+                    # 追赶手）保持全速，避免伸展区"不跟手"。
+                    reach_r = float(np.hypot(tcp_pos[0], tcp_pos[1]))
+                    reach_r_now[0] = reach_r
+                    reach_scale = 1.0
+                    if reach_r > REACH_SOFT_START:
+                        dock = float(np.clip(
+                            1.0 - pos_err_norm / REACH_DOCK_DIST, 0.0, 1.0))
+                        reach_scale = float(np.clip(
+                            1.0 - (1.0 - REACH_MIN_SCALE)
+                            * (reach_r - REACH_SOFT_START)
+                            / max(REACH_SOFT_END - REACH_SOFT_START, 1e-6),
+                            REACH_MIN_SCALE, 1.0))
+                        v_cam[:3] *= 1.0 - (1.0 - reach_scale) * dock
+
                     angular_world = (K_ORIENTATION * ori_err
                                      if np.linalg.norm(ori_err) > ORIENTATION_DEADBAND
                                      else np.zeros(3))
@@ -618,6 +706,24 @@ def main():
 
                     # 速度平滑
                     actual_velocity[0] += (v_cam - actual_velocity[0]) * SMOOTH_ALPHA
+
+                    # ── 加速度限制（启停梯形化）──
+                    # EMA 只平滑数值、不限变化率：启动/刹停瞬间指令仍在
+                    # 1-2 个周期内跳到目标值，对关节等效阶跃冲击
+                    # （log17 抖动主因：joint_speed 在 0 与 2-3 rad/s
+                    # 之间反复弹跳，每次跳变激发一次结构振动）。
+                    # 限制每周期速度增量 ≤ MAX_ACCEL×CTRL_RATE，启停变斜坡；
+                    # 方向反转时给 BOOST 倍额度，保住纠错响应速度
+                    dv_cmd = actual_velocity[0][:3] - prev_cmd_vel[0]
+                    accel_cap = MAX_ACCEL
+                    if np.dot(actual_velocity[0][:3], prev_cmd_vel[0]) < 0:
+                        accel_cap *= REVERSAL_ACCEL_BOOST
+                    max_dv = accel_cap * CTRL_RATE
+                    dv_norm = float(np.linalg.norm(dv_cmd))
+                    if dv_norm > max_dv:
+                        actual_velocity[0][:3] = (prev_cmd_vel[0]
+                                                  + dv_cmd * (max_dv / dv_norm))
+                    prev_cmd_vel[0] = actual_velocity[0][:3].copy()
 
                     # 相机系 → TCP 系 → 世界系
                     v_tcp = camera_velocity_to_tcp(actual_velocity[0], T_tcp_camera)
@@ -634,6 +740,10 @@ def main():
                         elif tcp_pos[ax] >= WORKSPACE_MAX[ax] and v_world[ax] > 0:
                             v_world[ax] = 0.0
                             wall_touch = True
+                    # 距墙 <5cm 视为贴墙（丢失外推的安全禁区）
+                    near_wall[0] = bool(
+                        np.any(tcp_pos < WORKSPACE_MIN + 0.05)
+                        or np.any(tcp_pos > WORKSPACE_MAX - 0.05))
 
                     # 可操作度自适应阻尼（奇异保护）
                     manip = compute_manipulability(J_robot)
@@ -653,7 +763,11 @@ def main():
                     robot.joint_vel_cmd(joint_vel)   # 第 7 通道自动携带夹爪目标角
                     with lock:
                         control_status["joint_speed"] = float(np.linalg.norm(joint_vel))
-                        control_status["error"] = ("贴墙滑动中" if wall_touch else "")
+                        _status = "贴墙滑动中" if wall_touch else ""
+                        if reach_scale < 0.95:
+                            _status += ("" if not _status else " ") + \
+                                f"伸展衰减x{reach_scale:.2f}"
+                        control_status["error"] = _status
                         control_status["active"] = True
 
                 except Exception as exc:
@@ -666,9 +780,13 @@ def main():
                 # hold() 每周期重发 7 通道指令，夹爪目标角随之下发，
                 # 因此 --no-follow 模式下捏合夹爪依然实时生效。
                 actual_velocity[0] = np.zeros(6)
+                prev_cmd_vel[0][:] = 0.0
                 prev_target_cam[0] = None           # 前馈状态复位
                 target_vel_f[0] = np.zeros(3)
                 in_deadband[0] = False              # 重新启动跟随时重新收敛
+                coast_offset[0][:] = 0.0            # 外推状态一并复位
+                coast_vel[0][:] = 0.0
+                coast_err[0] = 1e9
                 robot.hold()
                 with lock:
                     control_status["joint_speed"] = 0.0
@@ -710,13 +828,65 @@ def main():
             if track is not None and track['lost'] == 0:
                 ui, vi = int(round(track['u'])), int(round(track['v']))
                 depth_m = get_median_depth(depth_raw, depth_scale, ui, vi)
+                # 深度跳变剔除：BS 模式 + MediaPipe 误检会让单帧 z3d 跳到
+                # 0.8~1.0m（实测），直接打进伺服就是一次猛冲（整体抖动
+                # 的主因）。手一帧（16ms）物理上不可能移动 8cm，
+                # 超阈值视为无效帧：不更新 3D 目标（等效于本帧手掌丢失），
+                # 也不喂给滤波器（避免污染 One Euro 状态）。
+                # 防锁死：真尖峰只有 1~2 帧，连续多帧超阈值才说明
+                # 参照已过时。阈值定 15 帧（0.25s）：真实快速贴近/远离
+                # 每帧只有几毫米变化，永远碰不到 8cm 阈值；定太低会被
+                # "掌心空洞读到背景"这类连续假深度（如 0.4→0.94m）骗开
+                if depth_m > 0 and last_valid_depth[0] > 0 and \
+                        abs(depth_m - last_valid_depth[0]) > Z3D_MAX_JUMP:
+                    z3d_reject_count[0] += 1
+                    if z3d_reject_count[0] < 15:
+                        depth_m = 0.0
+                    # 连续 ≥15 帧：认定为参照彻底过时，放行并重置参照
+                else:
+                    z3d_reject_count[0] = 0
+                # 恢复校验（log(16) 撞墙事故的修复）：参照无效时
+                # （长丢失重置后/首次启动），限速器和跳变剔除都不设防，
+                # 第一帧假深度（如 0.765m 背景）会直接打穿到墙上。
+                # 要求连续 3 帧读数互相一致（max-min ≤ 跳变阈值）才接受，
+                # 取中位数建参照。只发生在长丢失恢复时，代价 50ms；
+                # 短暂模糊掉检参照保留，完全不受影响。
+                if depth_m > 0 and last_valid_depth[0] == 0:
+                    reacq_buf[0].append(depth_m)
+                    if len(reacq_buf[0]) > 3:
+                        reacq_buf[0].pop(0)
+                    if len(reacq_buf[0]) == 3 and \
+                            max(reacq_buf[0]) - min(reacq_buf[0]) <= Z3D_MAX_JUMP:
+                        depth_m = float(np.median(reacq_buf[0]))
+                    else:
+                        depth_m = 0.0   # 校验未通过，本帧视为无效
                 if depth_m > 0:
+                    # 深度限速（仿真验证：恢复尖峰归零）：真实手掌在 60fps
+                    # 下纵向每帧最多移动 ~1cm，单帧 |Δz| 超过 5cm 必然是
+                    # 误检。跳变剔除在参照重置后（长丢失恢复）不设防，
+                    # 限速是最后防线——0.4→0.88m 的假深度被钳成缓坡
+                    if last_valid_depth[0] > 0:
+                        depth_m = float(np.clip(
+                            depth_m,
+                            last_valid_depth[0] - Z3D_MAX_RATE,
+                            last_valid_depth[0] + Z3D_MAX_RATE))
                     # 深度通道滤波：(u,v) 有 One Euro，但深度一直是裸值——
                     # 静止时 z3d 抖动主要来自这里。One Euro 静止时强滤波，
                     # 手快速靠近/远离时自动放开，不影响纵向跟随速度
                     depth_m = depth_oe(depth_m)
+                    last_valid_depth[0] = depth_m
                     track['x3d'], track['y3d'], track['z3d'] = pixel_to_3d(
                         track['u'], track['v'], depth_m, fx, fy, cx, cy)
+                else:
+                    track['z3d'] = 0.0
+            elif track is None or track['lost'] >= 30:
+                # 长时间（≥30帧≈0.5s）真正丢失才重置深度参照；
+                # 短暂丢失（运动模糊等 1~29 帧）保留参照，让跳变剔除
+                # 在重新捕获瞬间继续生效——否则恢复帧的假深度会
+                # 绕过门控直接打进伺服，造成 joint_speed 突刺
+                last_valid_depth[0] = 0.0
+                z3d_reject_count[0] = 0
+                reacq_buf[0].clear()
 
             with lock:
                 if track is not None and track['lost'] == 0 and track['z3d'] > 0:
@@ -729,8 +899,16 @@ def main():
                         current_target_cam[0] = None
 
             # ── 捏合 → 夹爪（与跟随共用同一次检测结果）──
+            # 可见性门控（log19 修复）：跟踪器外推帧/深度无效帧的
+            # 捏合距离是纯噪声（实测 24~201px 乱跳），若此时夹爪
+            # 跟着开合并抓着东西会直接掉落。夹爪与跟随共用同一个
+            # 可见性判据（lost==0 且 z3d 有效），不可见就冻结在
+            # 最后一次目标角
+            with lock:
+                pinch_visible = palm_visible[0]
             pinch_pts = None
-            if grasp_cfg["gripper"]["enabled"] and landmarks is not None:
+            if (grasp_cfg["gripper"]["enabled"] and landmarks is not None
+                    and pinch_visible):
                 pinch_px, p1, p2 = pinch_distance_px(landmarks, color_image.shape)
                 pinch_px_now[0] = pinch_px
                 pinch_pts = (p1, p2)

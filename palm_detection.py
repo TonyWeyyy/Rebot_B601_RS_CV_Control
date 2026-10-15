@@ -36,8 +36,8 @@ MAX_LOST_FRAMES = 8         # 与原项目一致：丢失 8 帧内保持上一�
 SMOOTH_ALPHA = 0.4          # 指数平滑系数（越小越平滑）
 NUM_HANDS = 1               # 只跟一只手，避免左右手跳变
 
-MIN_DETECTION_CONFIDENCE = 0.6
-MIN_TRACKING_CONFIDENCE = 0.5
+MIN_DETECTION_CONFIDENCE = 0.5
+MIN_TRACKING_CONFIDENCE = 0.4   # 调低：运动模糊帧也能勉强跟上，减少快挥掉检
 
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "config", "hand_landmarker.task")
@@ -173,16 +173,20 @@ def get_median_depth(depth_raw, depth_scale, u, v, patch=DEPTH_PATCH):
     在 (u,v) 邻域取中值深度（米）。
     depth_raw: uint16 深度图（已对齐到彩色）
     无效/超量程返回 0.0
+
+    BS 高帧率模式下掌心小窗口常出现深度空洞（实测表现为 palm 可见
+    但 z3d=0，手臂顿挫）：采样窗口逐级扩大 patch → 2x → 3x，
+    只有最大窗口仍无效才放弃本帧。
     """
     h, w = depth_raw.shape
-    x0, x1 = max(0, u - patch), min(w, u + patch + 1)
-    y0, y1 = max(0, v - patch), min(h, v + patch + 1)
-    window = depth_raw[y0:y1, x0:x1].astype(np.float32) * depth_scale
-
-    valid = window[(window >= MIN_DEPTH_M) & (window <= MAX_DEPTH_M)]
-    if valid.size < 5:      # 有效点太少说明在边缘/遮挡处，不可信
-        return 0.0
-    return float(np.median(valid))
+    for p in (patch, patch * 2, patch * 3):
+        x0, x1 = max(0, u - p), min(w, u + p + 1)
+        y0, y1 = max(0, v - p), min(h, v + p + 1)
+        window = depth_raw[y0:y1, x0:x1].astype(np.float32) * depth_scale
+        valid = window[(window >= MIN_DEPTH_M) & (window <= MAX_DEPTH_M)]
+        if valid.size >= 5:     # 有效点太少说明在边缘/遮挡处，不可信
+            return float(np.median(valid))
+    return 0.0
 
 
 def pixel_to_3d(u, v, depth_m, fx, fy, cx, cy):
