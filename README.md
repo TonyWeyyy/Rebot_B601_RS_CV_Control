@@ -85,19 +85,19 @@ git clone https://github.com/Seeed-Projects/reBotArm_control_py.git  # URDF
 ### 2. CAN 总线（每次插拔 USB-CAN 后都要执行）
 
 ```bash
-#套件里是 PCAN-USB，通常应该直接出现 can0 或 can1
+#1. 套件里是 PCAN-USB，通常应该直接出现 can0 或 can1
 sudo modprobe peak_usb
 ip -br link
 
-#如果出现 can0，再设置 bitrate
+#2. 如果出现 can0，再设置 bitrate
 sudo ip link set can0 down 2>/dev/null
 sudo ip link set can0 type can bitrate 1000000
 sudo ip link set can0 up
 
-# 1. 把 ROS 路径从环境变量里剔除
+#3. 把 ROS 路径从环境变量里剔除
 export PYTHONPATH=$(echo $PYTHONPATH | tr ':' '\n' | grep -v /opt/ros | paste -sd:)
 export LD_LIBRARY_PATH=$(echo $LD_LIBRARY_PATH | tr ':' '\n' | grep -v /opt/ros | paste -sd:)
-# 2. 验证加载的是 conda 环境里的 pinocchio
+#4. 验证加载的是 conda 环境里的 pinocchio
 python -c "import pinocchio as pin; print(pin.__version__, pin.__file__)"
 ```
 
@@ -116,7 +116,7 @@ python palm_follow_grasp.py --no-gripper --gain 1.5 --max-vel 0.10
 # 第 3 步：完整模式
 python palm_follow_grasp.py
 
-
+# 如若机械臂故障，先关闭电源重启，等电源响声停止后，清除电机故障指令
 motorbridge run --vendor robstride --channel can0 --motor-id 1 --feedback-id 0xFD --mode clear-error
 ```
 

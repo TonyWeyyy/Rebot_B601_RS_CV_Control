@@ -44,24 +44,48 @@ MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 
 class PalmDetector:
-    """MediaPipe 手掌检测器（VIDEO 模式，利用跨帧跟踪更稳）"""
+    """MediaPipe 手掌检测器（VIDEO 模式，利用跨帧跟踪更稳）
 
-    def __init__(self):
+    backend: "auto"（优先 GPU，失败回退 CPU）/ "gpu" / "cpu"
+    GPU delegate 依赖 OpenGL ES/EGL，桌面独显 Linux 一般可用；
+    推理从 CPU XNNPACK ~10ms 降到 GPU ~3-5ms。
+    """
+
+    def __init__(self, backend="auto"):
         if not os.path.exists(MODEL_PATH):
             raise FileNotFoundError(
                 f"未找到模型文件 {MODEL_PATH}\n"
                 "请下载 hand_landmarker.task 放到 config/ 目录：\n"
                 "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
                 "hand_landmarker/float16/1/hand_landmarker.task")
+        backend = str(backend).lower()
+        try_gpu = backend in ("auto", "gpu")
+        self.backend = "cpu"
+        if try_gpu:
+            try:
+                self.detector = self._create(
+                    mp_python.BaseOptions.Delegate.GPU)
+                self.backend = "gpu"
+            except Exception as exc:
+                if backend == "gpu":
+                    raise
+                print(f"[检测器] GPU 初始化失败（{exc}），回退 CPU")
+        if self.backend == "cpu":
+            self.detector = self._create(
+                mp_python.BaseOptions.Delegate.CPU)
+        print(f"[检测器] 推理后端: {self.backend.upper()}")
+        self._timestamp_ms = 0
+
+    def _create(self, delegate):
         options = mp_vision.HandLandmarkerOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
+            base_options=mp_python.BaseOptions(
+                model_asset_path=MODEL_PATH, delegate=delegate),
             running_mode=mp_vision.RunningMode.VIDEO,
             num_hands=NUM_HANDS,
             min_hand_detection_confidence=MIN_DETECTION_CONFIDENCE,
             min_hand_presence_confidence=0.5,
             min_tracking_confidence=MIN_TRACKING_CONFIDENCE)
-        self.detector = mp_vision.HandLandmarker.create_from_options(options)
-        self._timestamp_ms = 0
+        return mp_vision.HandLandmarker.create_from_options(options)
 
     def detect(self, color_bgr):
         """

@@ -101,7 +101,7 @@ GRIPPER_SOFT_LIMIT_DEG = (-100.0, 400.0)    # 角度硬限幅（兜底保护；
                                             # 且应落在本范围内）
 
 # 控制周期（位置目标积分步长）
-CTRL_DT = 0.02   # 50Hz 对跟随足够；rebot_control 内部以 200Hz 平滑执行
+CTRL_DT = 0.02   # 仅作 dt 钳制参照；实际积分用墙上时钟，主循环 100Hz 下行为不变
 
 
 # ─────────────────────────────────────────────────────────────
@@ -117,7 +117,12 @@ class _ArmIO:
             sys.path.insert(0, REBOT_CONTROL_PATH)
         from rebot import ReBotRSMITController
         self.arm = ReBotRSMITController()
-        self.arm.start(enable_esc=True)         # start 内部自动 connect；Esc 触发平滑回零
+        # enable_esc=False：SDK 的 Esc/SIGINT 拦截会在主线程内阻塞数秒
+        # 执行回零（视觉窗口冻结"卡死"的根源），且与主程序的清理路径
+        # 竞争（二次 Ctrl+C 半途失能电机、相机管道被二次关闭）。
+        # 退出统一由 palm_follow_grasp 的 q/Esc/Ctrl+C 路径处理，
+        # 最终同样调用本类的 stop()（回零→保持→失能），安全性不变。
+        self.arm.start(enable_esc=False)        # start 内部自动 connect
         # 安全速度包络（度/秒）；第 7 项为夹爪
         self.arm.set_max_speeds(np.rad2deg(MAX_JOINT_SPEED).tolist()
                                 + [GRIPPER_SPEED_DEG_S])

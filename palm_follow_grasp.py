@@ -84,7 +84,9 @@ ORIENTATION_DEADBAND = np.deg2rad(2.0)
 MAX_VEL_CART = 0.30           # 最大末端线速度 (m/s)，首次调试建议 0.10
 MAX_VEL_ANGULAR = 1.20        # 最大角速度 (rad/s)
 MAX_VEL_JOINT = 1.20          # 最大关节速度 (rad/s)，适配层还有第二道限幅
-CTRL_RATE = 0.02              # 控制周期 20ms (50Hz)
+CTRL_RATE = 0.01              # 控制周期 10ms (100Hz)：指令量化延迟减半
+                              # 注意：下面三个常量由 CTRL_RATE 推导（时间制），
+                              # 改频率时无需手改，安全时长不会随频率变化
 
 # 目标速度前馈：纯误差反馈的跟随必有滞后（滞后 ≈ 目标速度/增益），
 # 手移动越快手臂落后越多。估计掌心目标速度并前馈叠加。0 = 关闭。
@@ -135,9 +137,9 @@ REVERSAL_ACCEL_BOOST = 1.8    # 方向反转时的加速度额度倍数
 WORKSPACE_MIN = np.array([-0.40, -0.10, 0.03])
 WORKSPACE_MAX = np.array([ 0.40,  0.40, 0.60])
 
-LOST_HOLD_FRAMES = 15         # 连续丢手超过 15 个控制周期 → 保持不动
-COAST_FRAMES = 6              # 丢失后按最后速度外推目标的帧数（120ms @50Hz）
-COAST_DECAY = 0.90            # 外推速度逐帧衰减系数（防爆冲）
+LOST_HOLD_FRAMES = round(0.30 / CTRL_RATE)   # 连续丢手 0.30s → 保持不动
+COAST_FRAMES = round(0.12 / CTRL_RATE)       # 丢失外推窗口 0.12s
+COAST_DECAY = 0.90 ** (CTRL_RATE / 0.02)     # 每 20ms 等效衰减 0.90（防爆冲）
 COAST_MAX_VEL = 0.35          # 外推速度限幅 (m/s)：防前馈污染带跑
 
 
@@ -167,6 +169,9 @@ def parse_args():
                    default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                         "config", "grasp.yaml"),
                    help="捏合→夹爪映射配置文件路径")
+    p.add_argument("--detector-backend", default="auto",
+                   choices=["auto", "gpu", "cpu"],
+                   help="手掌检测推理后端：auto=优先GPU失败回退CPU（默认）")
     p.add_argument("--no-follow", action="store_true",
                    help="仅捏合夹爪：手臂保持不动（此模式无需手眼标定）")
     p.add_argument("--no-gripper", action="store_true",
@@ -456,7 +461,7 @@ def main():
     desired_u, desired_v = int(round(cx)), int(round(cy))   # 期望掌心点 = 画面中心
 
     print("初始化手掌检测...")
-    detector = PalmDetector()
+    detector = PalmDetector(backend=args.detector_backend)
     tracker = PalmTracker()
 
     # ── 机械臂 ──
@@ -508,7 +513,7 @@ def main():
               f"张开 {pinch_open_px:.0f}px → {gripper_open_deg:.1f}°"
               f"  滤波={pinch_filter_mode}"
               + ("  [手臂运动时冻结]" if hold_while_moving else ""))
-    print("操作: g/空格 启停跟随 | q 退出 | Esc 急停回零")
+    print("操作: g/空格 启停跟随 | q/Esc/Ctrl+C 退出并安全回零")
     print("=" * 60 + "\n")
 
     # ── 键盘监听 ────────────────────────────────────────────
@@ -536,6 +541,8 @@ def main():
         except AttributeError:
             if key == pynput_kb.Key.space:
                 toggle_tracking()
+            elif key == pynput_kb.Key.esc:
+                quit_flag[0] = True    # Esc = 退出并安全回零（统一退出路径）
 
     kb_listener = pynput_kb.Listener(on_press=on_press)
     kb_listener.start()
@@ -809,12 +816,40 @@ def main():
 
     fps = 0.0
     t_prev_frame = time.time()
+    ms_grab = [0.0]   # get_frames 耗时 EMA (ms)
+    ms_det = [0.0]    # 手掌识别耗时 EMA (ms)
 
     try:
+        last_frame_time = time.time()
         while not quit_flag[0]:
+            _t0 = time.perf_counter()
             color_image, depth_raw, depth_scale = cam.get_frames()
+            _t1 = time.perf_counter()
             if color_image is None:
+                # 无帧分支（USB 抖动/超时）：必须继续泵 GUI 事件，
+                # 否则 waitKey 长期不执行，窗口被系统判"未响应"（卡死）
+                if not args.headless:
+                    cv2.waitKey(1)
+                time.sleep(0.002)   # 防空转拉满 CPU
+                # 帧看门狗：连续 2 秒无有效帧 → 判定相机掉线，自动重连
+                # （手腕线束随机械臂弯折，USB 瞬断后 SDK 不会自愈）
+                if time.time() - last_frame_time > 2.0:
+                    print("\n[相机] 超过 2 秒无有效帧，尝试断开重连...")
+                    try:
+                        cam.stop()
+                    except Exception:
+                        pass
+                    time.sleep(1.0)
+                    try:
+                        cam = Gemini2Camera(fps=camera_fps)
+                        last_valid_depth[0] = 0.0   # 深度参照重建（走重抓校验）
+                        reacq_buf[0].clear()
+                        print("[相机] 重连成功")
+                    except Exception as exc:
+                        print(f"[相机] 重连失败（{exc}），2 秒后重试...")
+                    last_frame_time = time.time()
                 continue
+            last_frame_time = time.time()
 
             # 帧率统计（EMA）
             t_now = time.time()
@@ -823,6 +858,10 @@ def main():
             t_prev_frame = t_now
 
             u, v, landmarks = detector.detect(color_image)
+            _t2 = time.perf_counter()
+            # 耗时统计（EMA，毫秒）：取帧（相机等待+USB传输）/ 识别
+            ms_grab[0] = 0.9 * ms_grab[0] + 0.1 * (_t1 - _t0) * 1000
+            ms_det[0] = 0.9 * ms_det[0] + 0.1 * (_t2 - _t1) * 1000
             track = tracker.update((u, v) if u is not None else None)
 
             if track is not None and track['lost'] == 0:
@@ -899,16 +938,16 @@ def main():
                         current_target_cam[0] = None
 
             # ── 捏合 → 夹爪（与跟随共用同一次检测结果）──
-            # 可见性门控（log19 修复）：跟踪器外推帧/深度无效帧的
-            # 捏合距离是纯噪声（实测 24~201px 乱跳），若此时夹爪
-            # 跟着开合并抓着东西会直接掉落。夹爪与跟随共用同一个
-            # 可见性判据（lost==0 且 z3d 有效），不可见就冻结在
-            # 最后一次目标角
-            with lock:
-                pinch_visible = palm_visible[0]
+            # 新鲜度门控（log19 修复 + log21 修正）：
+            # 跟踪器外推帧的捏合距离是纯噪声（实测 24~201px 乱跳），
+            # 必须冻结；但捏合是 2D 测量、与深度无关——深度失效帧
+            # （z3d=0）的捏合值依然准确，不能一并冻结，否则夹爪在
+            # 近距/侧倾等深度易丢的场景表现得"没有反应"。
+            # 因此门控只要求关键点是本帧实测（lost==0），不看深度。
+            pinch_fresh = (track is not None and track['lost'] == 0)
             pinch_pts = None
             if (grasp_cfg["gripper"]["enabled"] and landmarks is not None
-                    and pinch_visible):
+                    and pinch_fresh):
                 pinch_px, p1, p2 = pinch_distance_px(landmarks, color_image.shape)
                 pinch_px_now[0] = pinch_px
                 pinch_pts = (p1, p2)
@@ -958,7 +997,8 @@ def main():
                 _tcp = control_status.get("tcp", None)
                 print(f"[DBG] fps={fps:4.1f}  palm=({det})  visible={_vis} "
                       f"following={_fol}  joint_speed={_spd:.3f}  "
-                      f"{pinch_info}  tcp={_tcp}  err={_err}")
+                      f"{pinch_info}  tcp={_tcp}  err={_err}  "
+                      f"延迟ms(取帧/识别)={ms_grab[0]:.0f}/{ms_det[0]:.0f}")
 
             # ── 可视化 ──
             if not args.headless:
@@ -1014,22 +1054,27 @@ def main():
                 time.sleep(0.005)   # headless：让出 CPU，等待键盘事件
 
     except KeyboardInterrupt:
-        print("\n程序被中断")
+        print("\n程序被中断（Ctrl+C），走统一退出路径...")
     finally:
         stop_ctrl.set()
         if ctrl_thread is not None:
             ctrl_thread.join(timeout=1.0)
         kb_listener.stop()
         detector.close()
-        if not args.headless:
-            cv2.destroyAllWindows()
-        cam.stop()
         if robot is not None:
             print("机械臂保持当前位置...")
             robot.hold()
             time.sleep(0.3)
-            # 安全停机：缓慢回零 → 确认到位 → 才失能（防止自由下落）
+            # 安全停机：缓慢回零 → 确认到位 → 才失能（防止自由下落）。
+            # 这几秒主线程被占用、视觉窗口不刷新是正常现象，勿重复按键
+            print("正在安全回零（约3秒），窗口短暂无响应属正常现象，请勿重复按键...")
             robot.stop()
+        if not args.headless:
+            cv2.destroyAllWindows()
+        try:
+            cam.stop()
+        except Exception:
+            pass    # 相机可能已被上游断开，清理幂等
         print("程序退出")
 
 
