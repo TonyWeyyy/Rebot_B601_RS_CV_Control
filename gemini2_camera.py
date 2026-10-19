@@ -27,7 +27,8 @@ from pyorbbecsdk import (
 
 
 class Gemini2Camera:
-    def __init__(self, width=640, height=480, fps=30, align_to_color=True):
+    def __init__(self, width=640, height=480, fps=30, align_to_color=True,
+                 color_exposure_ms=0.0):
         self.width = width
         self.height = height
 
@@ -147,26 +148,108 @@ class Gemini2Camera:
 
         # 深度 scale 在首帧读取（见 get_frames）
         self.depth_scale = None
+        self.dropped_frames = 0   # latest_only 排空丢弃的帧组数（DBG 诊断用）
 
         # 预热，丢弃前几帧
         print("[Gemini2] 预热相机...")
         for _ in range(30):
             self.pipeline.wait_for_frames(100)
 
+        # ---- 彩色手动曝光（可选）：压运动模糊 ----
+        # 60fps 下自动曝光在室内常顶到 ~16ms 满帧曝光，快速挥手时
+        # 手部拖影严重 → MediaPipe 整帧掉检（palm=None，log29 剩余
+        # 丢失事件的主因之一）。手动压到 5~8ms 模糊减半，检测找回率
+        # 明显提升。代价：画面变暗（曝光短进光少），对检测无影响，
+        # 但暗光环境下可能反而掉检——所以默认关闭，按需开启。
+        #
+        # 单位自校准（log30 全黑的修复）：Gemini 2 彩色曝光寄存器的
+        # 单位语义不明确——自动曝光模式下读到的原始值与手动写入值
+        # 并非同一尺度，按读数反推单位不可靠（实测 6ms 写成 60 个
+        # 单位 → 画面全黑）。改为「试写 + 实测亮度」闭环：
+        # 按 100μs/10μs/1μs 三种假设依次写入目标毫秒数，
+        # 画面亮度 ≥ 自动曝光基准的 25% 即接受；三档都太暗则
+        # 恢复自动曝光并放弃。
+        if color_exposure_ms and color_exposure_ms > 0:
+            try:
+                from pyorbbecsdk import OBPropertyID
+                device = self.pipeline.get_device()
+
+                def _grab_brightness(discard=6, take=2):
+                    """丢 discard 帧等曝光生效，再取 take 帧的最大亮度 (0~255)。
+                    取最大而非平均：预热刚结束时可能夹黑帧（log31 基准
+                    测成 0），平均会被拉低；亮度评估要的是"有效帧的水平"。"""
+                    vals = []
+                    for i in range(discard + take):
+                        c, _, _ = self.get_frames()
+                        if c is not None and i >= discard:
+                            vals.append(float(c.mean()))
+                    return float(max(vals)) if vals else 0.0
+
+                auto_brightness = _grab_brightness()   # 自动曝光基准
+                if auto_brightness < 10.0:
+                    # 基准帧全黑（相机刚启动同步抖动）：用固定参考值，
+                    # 保证 25% 阈值仍然有意义
+                    auto_brightness = 80.0
+                    print("[Gemini2] 自动曝光基准帧过暗，按参考亮度 80 校准")
+                device.set_bool_property(
+                    OBPropertyID.OB_PROP_COLOR_AUTO_EXPOSURE_BOOL, False)
+                ok = False
+                for us_per_unit in (100, 10, 1):
+                    units = max(1, int(round(
+                        color_exposure_ms * 1000 / us_per_unit)))
+                    device.set_int_property(
+                        OBPropertyID.OB_PROP_COLOR_EXPOSURE_INT, units)
+                    bri = _grab_brightness()
+                    print(f"[Gemini2] 曝光试写 {units}（按 {us_per_unit}μs/单位）"
+                          f"→ 亮度 {bri:.0f}（自动基准 {auto_brightness:.0f}）")
+                    # 接受阈值要严（log32 的误判教训）：目标曝光与自动
+                    # 曝光接近（10ms vs 12ms）时，正确单位的亮度应在基准
+                    # 的 ~80%；单位猜错一档差 10 倍曝光，亮度只剩零头。
+                    # 25% 阈值曾把 1ms 误判成 10ms（画面全暗）。
+                    if bri >= max(25.0, 0.40 * auto_brightness):
+                        print(f"[Gemini2] 手动彩色曝光生效: "
+                              f"{color_exposure_ms}ms = {units} 单位；"
+                              f"画面变暗属正常现象")
+                        ok = True
+                        break
+                    print(f"[Gemini2]   → 亮度不足基准 40%，单位假设错误，换下一档")
+                if not ok:
+                    device.set_bool_property(
+                        OBPropertyID.OB_PROP_COLOR_AUTO_EXPOSURE_BOOL, True)
+                    print("[Gemini2] 三档单位都太暗，已恢复自动曝光。"
+                          "环境光可能不足，不建议用手动曝光")
+            except Exception as e:
+                print(f"[Gemini2] 手动曝光设置失败({e})，保持自动曝光")
+
         print(f"[Gemini2] 相机就绪  内参: fx={self.fx:.2f} fy={self.fy:.2f} "
               f"cx={self.cx:.2f} cy={self.cy:.2f}")
 
-    def get_frames(self):
+    def get_frames(self, latest_only=True):
         """
         返回 (color_bgr, depth_raw, depth_scale)：
             color_bgr  : HxWx3 uint8 BGR 图
             depth_raw  : HxW uint16 深度原始值（已对齐到 color）
             depth_scale: float，米 = depth_raw * depth_scale
         失败返回 (None, None, None)
+
+        latest_only=True（默认）：取到一帧后排空 SDK 队列，只保留最新帧组。
+        处理速度慢于相机帧率时（如检测耗时上涨，log27 识别 3ms→12ms），
+        帧会在队列里积压——取帧 1ms 拿到的其实是几百 ms 前的旧帧，
+        延迟越积越大（「跟随不上」的隐形来源）。排空后处理慢就自动跳帧：
+        实际帧率降下来，但每一帧都是最新的，延迟有界不增长。
         """
         frames = self.pipeline.wait_for_frames(100)
         if frames is None:
             return None, None, None
+        if latest_only:
+            # 非阻塞轮询把队列里更晚到的帧组全部取出，只留最后一组
+            # （被跳过的帧组不做 MJPG 解码，几乎零成本）
+            while True:
+                newer = self.pipeline.wait_for_frames(0)
+                if newer is None:
+                    break
+                frames = newer
+                self.dropped_frames += 1
 
         color_frame = frames.get_color_frame()
         depth_frame = frames.get_depth_frame()

@@ -155,6 +155,87 @@ OE_MIN_CUTOFF = 1.0         # 静止稳定性：越小越稳
 OE_BETA = 0.02              # 高速响应：越大越快（太大会把噪声当运动）
 
 
+class LKPalmBridge:
+    """检测失败帧的光流桥接（检测+跟踪混合架构）。
+
+    MediaPipe 因运动模糊整帧掉检时，用 Lucas-Kanade 金字塔光流追踪
+    掌心周围 3×3 点阵，产出估计掌心位置继续喂 PalmTracker——
+    短暂掉检不再触发丢失保持（快速挥手丢手的主要兜底）。
+    只桥接、不替代检测，三道保险：
+      1) 检测成功帧立刻用真实掌心重置点阵，桥接永不带偏目标；
+      2) 连续桥接超 max_frames（默认 15 帧≈0.25s）自动放弃，
+         回退原有丢失流程（防漂移累积）；
+      3) 单帧位移 > max_step_px 或有效跟踪点 <5 → 放弃本帧。
+    纯 cv2 主库实现（calcOpticalFlowPyrLK），不依赖 opencv-contrib。
+    桥接帧无 MediaPipe 关键点 → 捏合门控自然冻结夹爪，无风险。
+    """
+
+    def __init__(self, enable=True, max_frames=15, box_half=45,
+                 max_step_px=90.0):
+        self.enable = bool(enable)
+        self.max_frames = int(max_frames)
+        self.box_half = int(box_half)
+        self.max_step_px = float(max_step_px)
+        self._prev_gray = None
+        self._pts = None          # 上一帧 3×3 点阵 (N,1,2) float32
+        self._tracked = 0         # 已连续桥接帧数
+
+    def reset(self):
+        self._prev_gray = None
+        self._pts = None
+        self._tracked = 0
+
+    def _seed(self, gray, uv):
+        u, v = float(uv[0]), float(uv[1])
+        h, w = gray.shape[:2]
+        b = self.box_half
+        pts = [[float(x), float(y)]
+               for y in (v - b // 2, v, v + b // 2)
+               for x in (u - b // 2, u, u + b // 2)
+               if 5 < x < w - 5 and 5 < y < h - 5]
+        self._pts = (np.array(pts, dtype=np.float32).reshape(-1, 1, 2)
+                     if len(pts) >= 5 else None)
+
+    def update(self, color_bgr, det_uv):
+        """det_uv: 本帧 MediaPipe 检测 (u,v) 或 None。
+
+        返回 (u, v, source)，source ∈ {'det', 'lk', None}；
+        'lk' = 本帧来自光流桥接（无关键点）。
+        """
+        if not self.enable:
+            return (*det_uv, 'det') if det_uv is not None else (None, None, None)
+        gray = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2GRAY)
+        out_u, out_v, src = None, None, None
+        if det_uv is not None:
+            self._seed(gray, det_uv)      # 真实掌心重置点阵
+            out_u, out_v, src = float(det_uv[0]), float(det_uv[1]), 'det'
+            self._tracked = 0
+        elif self._pts is not None and self._tracked < self.max_frames \
+                and self._prev_gray is not None:
+            pts2, st, _ = cv2.calcOpticalFlowPyrLK(
+                self._prev_gray, gray, self._pts, None,
+                winSize=(25, 25), maxLevel=2)
+            if pts2 is not None:
+                st = st.reshape(-1).astype(bool)
+                good_new = pts2.reshape(-1, 2)[st]
+                good_old = self._pts.reshape(-1, 2)[st]
+                if good_new.shape[0] >= 5:
+                    step = float(np.median(
+                        np.linalg.norm(good_new - good_old, axis=1)))
+                    if step <= self.max_step_px:
+                        out_u = float(np.median(good_new[:, 0]))
+                        out_v = float(np.median(good_new[:, 1]))
+                        src = 'lk'
+                        self._tracked += 1
+                        self._pts = good_new.reshape(-1, 1, 2).astype(np.float32)
+        if src != 'lk':
+            self._tracked = 0
+        if src is None:
+            self._pts = None              # 桥接失败：等下次检测重新播种
+        self._prev_gray = gray
+        return out_u, out_v, src
+
+
 class PalmTracker:
     """掌心点跨帧追踪器（对应原项目 CircleTracker，单目标版）"""
 

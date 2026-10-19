@@ -162,16 +162,18 @@ python palm_follow_grasp.py --follow-cfg my.yaml   # 换一份配置文件
 
 ## 调参：跟随（config/follow.yaml）
 
-每个参数在 yaml 里都有行内注释，这里给"按症状调"的速查：
+每个参数在 yaml 里都有行内注释，这里给"按症状调"的速查（新架构）：
 
 | 症状 | 改哪个 | 方向 |
 | --- | --- | --- |
-| 静止时仍微抖 | `depth_oe_min_cutoff` → `position_deadband` | 1.0→0.7→0.5 ／ 0.015→0.020 |
-| 误差在死区边缘反复启动 | `deadband_hysteresis` | 1.5→2.0 |
-| 到位后回摆几下才停 | `ff_taper_dist` → `vel_feedforward` → `smooth_alpha` | 0.07→0.10 ／ 0.7→0.5 ／ 0.38→0.55 |
-| 左右快移振荡、先反向 | `gain_x`（或命令行 `--gain-x`） | 1.8→1.4→1.2 |
-| 高速跟不上手 | `fps` 60 → `max_vel` → 适配层 `MAX_JOINT_SPEED` | 按 README「提升跟随速度与精度」节顺序来 |
-| 跟随太肉 | `vel_feedforward` 0.7→0.8，`smooth_alpha` 0.38→0.5 | 出现超前摆动就退回 |
+| 停手后振荡（含伸展位） | `kf_ff_deadband_on` → `kf_hold_tol` → `kf_lead_ms` | 0.11→0.13 ／ 0.03→0.04 ／ 10→6 |
+| 停手后上下小幅振荡 | `position_deadband`（须 > BS 深度噪声 ±20mm） | 0.017→0.022→0.025 |
+| 死区状态边界闪烁（停手瞬间一抽一抽） | `kf_ff_exit_frames` | 5→7（起步略钝可降回） |
+| 跟随偏肉 | `gain` → `smooth_alpha` → `kf_q` | 2.2→2.35 ／ 0.45→0.48 ／ 1.5→1.8 |
+| 跟随发冲、关节速度频繁冲 2~3 | `kf_q` → `smooth_alpha` | 2.0→1.5 ／ 0.52→0.45 |
+| 静止时仍有微抖 | `depth_oe_min_cutoff` → `position_deadband` | 1.0→0.7→0.5 ／ →0.025 |
+| 丢手偏多 | 先补光、确认 `color_exposure_ms: 6.0`；手别挥出画面 | 硬件手段优先于参数 |
+| 老架构（`kf_enable: false`）回摆/振荡 | `ff_taper_dist` → `vel_feedforward` → `smooth_alpha` | 0.07→0.10 ／ 0.7→0.5 ／ 0.38→0.55 |
 
 注意：`max_vel`（末端线速度）和适配层 `MAX_JOINT_SPEED`（关节限速）是两道串联的墙，
 只提末端限速而关节限速不动，左右跟随不会有任何变化——先提 J1。
@@ -272,3 +274,76 @@ python palm_follow_grasp.py --follow-cfg my.yaml   # 换一份配置文件
 - 硬件参数参考 [Seeed reBot Arm B601-RS 官方 Wiki](https://wiki.seeedstudio.com/rebot_arm_b601_rs_mit_control/)
 
 MIT License.
+
+## 新/老伺服架构切换
+
+`config/follow.yaml` 中 `kf_enable` 一个键即可切换，重启脚本生效：
+
+- `kf_enable: true` —— 新架构（卡尔曼恒速滤波）：速度估计更干净，可叠加
+  lead 外推（`kf_lead_ms`）与静止目标锁存（`kf_hold_tol`），跟随更跟手；
+- `kf_enable: false` —— 老架构（帧间差分+EMA）：无 lead、无锁存，
+  运动风格更温润，`ff_smooth` / `ff_min_speed` / `ff_taper_dist` 生效。
+
+两套架构共用全部安全机制（软墙 / 伸展衰减 / 加速度限制 / 丢失外推 /
+深度保护链），切换不影响安全性。全部可调参数均在 follow.yaml 内；
+yaml 末尾【老架构配套参数组】注释里保留了一套实测稳定的老架构参数。
+
+## 本版升级技术要点（最终版）
+
+按实机日志逐轮迭代出的新架构完整技术栈：
+
+1. **卡尔曼恒速滤波 + lead 外推**（`kf_q/kf_r/kf_lead_ms`）
+   滤波位置 + 速度 × lead 作为伺服目标，补偿视觉链路 ~30ms 延迟，
+   高速跟手不拖后；异步 predict/update，检测掉帧时纯外推。
+
+2. **静止判定三件套**（修停手振荡）
+   - 速度死区带回差：`kf_ff_deadband_off/on`（0.06/0.13 m/s），
+     残余假速度低于下沿才进静止，超过上沿才回运动；
+   - 跳出确认帧：`kf_ff_exit_frames=7`，须连续 7 周期越过上沿才
+     恢复运动，杜绝死区边界状态闪烁引起的停手一抽一抽；
+   - 静止目标锁存：`kf_hold_tol=0.04`，手停时目标钉死在锁存点，
+     观测噪声完全隔离；手慢拖时锁存点以 0.06 m/s 限速平滑跟随。
+
+3. **伸展衰减 EMA 平滑**（`reach_att_tau`）
+   伸展衰减增益不再逐帧跳变（曾是伸展位极限环振荡的根因），
+   按 τ≈0.15s 平滑过渡。
+
+4. **深度冻结帧跳过 KF 更新**
+   深度无效、z 用占位值的帧只做 predict 不做 update，
+   防止占位深度把滤波器状态拉飞。
+
+5. **重获目标强化**
+   连续丢手 ≥30 帧后重获目标须 5 帧一致（原 3 帧），且深度超过
+   `distance + 0.25m` 的一律判为背景拒绝（修背景深度被当手、
+   手臂冲向墙壁的问题）。
+
+6. **检测+光流混合跟踪**（`hybrid_track_*`）
+   MediaPipe 单帧漏检时，以上一帧掌心为种子做 LK 光流桥接
+   （3×3 点阵，≤15 帧，单帧位移 ≤90px 防飞点），桥接帧自动冻结
+   夹爪（landmarks 缺失），短丢手不再触发保持-重启的顿挫。
+
+7. **相机帧率结论**
+   `tools/enumerate_camera_modes.py` 枚举确认 Gemini 2 彩色/深度
+   均 60fps 硬顶（彩色 1280x720@60、深度 640x400@60），
+   提帧率这条路已封死，延迟优化只能走 lead 外推。
+
+8. **自适应过程噪声 Q**（`kf_adapt_*`，**本机默认关闭**）
+   按创新（观测-预测偏差）动态放大 Q：加速段更信观测、平稳段回基准。
+   实测在暗曝光高噪声环境下测量噪声会误触发，反而变冲——
+   低噪声环境（补光充足/自动曝光）可开 `kf_adapt_enable: true` 试，
+   参考 `kf_adapt_ref 0.10 / max 2.5 / decay 0.85`。
+
+9. **曝光进 yaml**（`color_exposure_ms`，命令行 `--color-exposure` 可覆盖）
+   手动曝光压运动模糊：6ms 配合补光是实测最佳点；
+   4ms 更暗、MediaPipe 丢失明显增多，不建议。
+
+**最终调定参数**（实机 9 轮日志迭代收敛，适合：60fps BS 深度 +
+6ms 手动曝光 + 补光的环境）：
+
+```
+distance 0.35 | gain 2.35 / gain_x 2.4 | max_vel 0.50 | max_vel_joint 1.50
+kf_enable true | kf_q 1.5 | kf_r 0.004 | kf_lead_ms 8.0
+死区 off/on 0.06/0.13 | exit_frames 7 | hold_tol 0.04
+position_deadband 0.022 | smooth_alpha 0.48 | color_exposure_ms 6.0
+kf_adapt_enable false | hybrid_track_enable true
+```
