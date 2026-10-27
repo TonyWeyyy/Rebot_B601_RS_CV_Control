@@ -13,15 +13,59 @@
 > 日常调参只改 `config/follow.yaml`（跟随）和 `config/grasp.yaml`（夹爪）两个文件；
 > 命令行参数临时覆盖。完整的技术原理与踩坑记录见 [技术手册.md](技术手册.md)。
 
+## 最终版升级：运动更跟手，静止不再被 lead 推动
+
+本版保留 v6 已验证有效的帧序号、单调时间戳 KF、真实 dt、深度冻结修复和
+陈旧目标看门狗，并根据两组实机 A/B 结果重做 lead 控制。主入口、相机、标定、
+MIT 控制、单 CAN 主机、J7 第 7 通道及安全回零方式不变。
+
+1. **自适应 lead 三重门控**：额外 lead 由“KF 速度、剩余误差、速度/误差方向”
+   共同决定。明确运动时恢复预测；低速和近目标自动衰减；反向纠偏立即清零。
+   撤权时间常数 15ms、恢复时间常数 25ms，避免静止边界 `0↔15ms` 拍打。
+2. **年龄补偿与额外 lead 分离**：目标为 `KF位置 + 速度×age + 速度×lead×权重`。
+   关闭额外 lead 不会误删观测年龄补偿；静止锁存、冻结、跳变剔除和丢手仍优先。
+3. **默认采用实机稳定基线**：`kf_fast_start_enable: false`，同时恢复
+   `kf_lead_ms: 8.0` 并启用门控，不再用永久关闭 lead 换取静止稳定。
+4. **水平径向工作空间**：在三轴软墙之外保留 `hypot(X,Y) ≤ 0.42m` 安全约束，
+   只削水平向外速度，保留向内、切向和全部 Z 运动；不像三维球墙那样在高姿态
+   过度压缩空间。超出水平半径再 5cm 自动回 HOME。
+5. **启动前配置校验**：非有限数、危险速度/增益、错误 lead 阈值、失效看门狗、
+   非法工作空间或超过 0.42m 的半径，会在相机和机械臂初始化之前直接报错。
+6. **诊断增强**：DBG 显示 `实际lead/原始lead`、权重 `w`、KF 速度 `kv`、
+   门控误差 `e` 和锁存 `latch`，可直接判断静止时是谁在推目标。
+
+实机确认静止稳定后，本修订版将 lead 全量介入距离由 55mm 提前到 45mm、恢复
+时间常数由 40ms 缩短到 25ms；静止阈值、反向清零、增益和速度上限均不变。
+离线验证结果为：**21 项单元测试通过**；完整假硬件主程序通过
+“静止→移动→回中心停手”，末段连续 15 个控制周期关节指令为零，统一安全停止
+被调用。离线测试不替代实机低速验收。
+
+稳定回退组合（保留其他修复，仅关闭额外 lead 和快速解锁）：
+
+```yaml
+kf_fast_start_enable: false
+kf_lead_ms: 0
+```
+
+`kf_lead_adaptive: false` 仅用于复现旧 lead 行为，不建议实机使用。
+不要为排查晃动关闭深度保护、软墙或安全回零。
+
+离线验证（不连接相机/CAN）：
+
+```bash
+python tools/test_servo_upgrades.py
+python tools/offline_smoke_test.py
+```
+
 ## 合并时的关键设计
 
 1. **夹爪改走机械臂控制器的第 7 通道**（最重要）
    旧 gripper 项目自己开一个 motorbridge 连接直连电机 7；若与跟随程序同时跑，
    两个 CAN 主机会在 can0 上争抢电机 7。合并后夹爪目标角由
-   `rebot_adapter.set_gripper_deg()` 设置，随 rebot_control 的 50Hz 关节指令
+   `rebot_adapter.set_gripper_deg()` 设置，随 rebot_control 的 100Hz 关节指令
    一同下发，单一 CAN 主机，从根上避免总线冲突。
    - 夹爪角度单位统一为**度**（rebot_control 约定），不再做弧度换算。
-   - 夹爪最大速度由适配层统一设为 150°/s（原 30°/s 太慢，捏合跟不上）。
+   - 夹爪最大速度由适配层统一设为 500°/s，角度软限幅仍为 -100° ~ +400°。
 
 2. **一次检测，两处复用**
    掌心（9 号关键点）用于跟随，拇指尖(4)—食指尖(8) 距离用于夹爪，
@@ -43,6 +87,7 @@ rebot_palm_follow_grasp/
 ├── gemini2_camera.py              相机层（Orbbec SDK，RGB+深度硬件对齐）
 ├── palm_detection.py              检测层（掌心跟踪 + 捏合距离，共用一次检测）
 ├── rebot_adapter.py               机械臂适配层（速度伺服 + FK/雅可比 + J7 夹爪通道）
+├── servo_timing.py                时间戳/真实dt/自适应lead/水平径向软墙工具
 │
 ├── config/                        所有配置与标定产物
 │   ├── follow.yaml                ★ 跟随伺服参数（距离/增益/死区/前馈/虚拟墙，调参改这里）
@@ -62,7 +107,9 @@ rebot_palm_follow_grasp/
 │   ├── handeye_joint_calib.py     手眼+关节零位联合标定（精度最高，推荐）
 │   ├── hand_eye_solver.py         手眼标定求解器（OpenCV 5.0 移除了 calibrateHandEye）
 │   ├── calib_diagnose.py          标定体检（不标定，只定位问题）
-│   └── camera_intrinsic_check.py  相机内参核对
+│   ├── camera_intrinsic_check.py  相机内参核对
+│   ├── test_servo_upgrades.py     升级逻辑离线单元测试
+│   └── offline_smoke_test.py      假相机/假机械臂完整主程序冒烟测试
 │
 ├── requirements.txt
 ├── 技术手册.md                     项目全部技术与技巧汇总（感知/标定/控制/稳定性/安全）
@@ -131,6 +178,12 @@ python palm_follow_grasp.py --gain-x 1.4      # 水平跟随增益（左右振�
 
 操作：`g`/空格 启停跟随，`q` 退出，`Esc` 急停回零。
 
+**最终版首次实机验收**：先用上面的 `--no-gripper --gain 1.5 --max-vel 0.10`。
+清空工作区并准备随时按 q；依次做静止 30 秒、慢速同向移动、匀速移动、
+急停、换向、短时丢手和贴墙返回。确认低速全部正常后再用默认参数。
+静止时 DBG 的 `lead` 应回到 0；若仍晃，直接采用上面的稳定回退组合，
+不要继续提高增益或速度。任何改参一次只改一项并重新做静止与急停测试。
+
 ### 4. 标定（环境变动后才需要重做）
 
 ```bash
@@ -166,7 +219,7 @@ python palm_follow_grasp.py --follow-cfg my.yaml   # 换一份配置文件
 
 | 症状 | 改哪个 | 方向 |
 | --- | --- | --- |
-| 停手后振荡（含伸展位） | `kf_ff_deadband_on` → `kf_hold_tol` → `kf_lead_ms` | 0.11→0.13 ／ 0.03→0.04 ／ 10→6 |
+| 停手后振荡（含伸展位） | 先确认 `kf_lead_adaptive: true`；仍晃用稳定回退 `kf_lead_ms: 0` | 再查 DBG 的 `w/kv/e/latch`，不要先提增益 |
 | 停手后上下小幅振荡 | `position_deadband`（须 > BS 深度噪声 ±20mm） | 0.017→0.022→0.025 |
 | 死区状态边界闪烁（停手瞬间一抽一抽） | `kf_ff_exit_frames` | 5→7（起步略钝可降回） |
 | 跟随偏肉 | `gain` → `smooth_alpha` → `kf_q` | 2.2→2.35 ／ 0.45→0.48 ／ 1.5→1.8 |
@@ -259,7 +312,7 @@ python palm_follow_grasp.py --follow-cfg my.yaml   # 换一份配置文件
 
 - [ ] 底座固定、相机支架拧紧、线缆有余量
 - [ ] CAN 已配置（1 Mbps）、电机温度正常
-- [ ] 虚拟墙参数已按实际桌面修改
+- [ ] 三轴虚拟墙已按实际桌面修改；`workspace.max_radius` 不超过 0.42m
 - [ ] 首次/改参后：`--no-arm` → `--no-follow` → `--no-gripper` 低速 → 完整模式
 - [ ] Esc 急停有效（rebot_control 内置，触发平滑回零）
 - [ ] 工作半径内无人；**眼睛看机械臂，不看屏幕**
@@ -292,9 +345,9 @@ yaml 末尾【老架构配套参数组】注释里保留了一套实测稳定的
 
 按实机日志逐轮迭代出的新架构完整技术栈：
 
-1. **卡尔曼恒速滤波 + lead 外推**（`kf_q/kf_r/kf_lead_ms`）
-   滤波位置 + 速度 × lead 作为伺服目标，补偿视觉链路 ~30ms 延迟，
-   高速跟手不拖后；异步 predict/update，检测掉帧时纯外推。
+1. **卡尔曼恒速滤波 + 自适应 lead 外推**（`kf_q/kf_r/kf_lead_*`）
+   目标是滤波位置 + 速度×观测年龄 + 速度×额外lead×权重。速度、距离和方向
+   三重门控让巡航保留延迟补偿，停手、近目标和反向纠偏时收回额外提前量。
 
 2. **静止判定三件套**（修停手振荡）
    - 速度死区带回差：`kf_ff_deadband_off/on`（0.06/0.13 m/s），
@@ -343,6 +396,8 @@ yaml 末尾【老架构配套参数组】注释里保留了一套实测稳定的
 ```
 distance 0.35 | gain 2.35 / gain_x 2.4 | max_vel 0.50 | max_vel_joint 1.50
 kf_enable true | kf_q 1.5 | kf_r 0.004 | kf_lead_ms 8.0
+kf_lead_adaptive true | lead near/full 0.022/0.045 | attack/release 0.025/0.015
+kf_fast_start_enable false | workspace.max_radius 0.42（仅水平X/Y）
 死区 off/on 0.06/0.13 | exit_frames 7 | hold_tol 0.04
 position_deadband 0.022 | smooth_alpha 0.48 | color_exposure_ms 6.0
 kf_adapt_enable false | hybrid_track_enable true
