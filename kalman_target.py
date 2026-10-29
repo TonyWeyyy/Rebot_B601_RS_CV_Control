@@ -32,9 +32,14 @@ import numpy as np
 class KalmanTarget3D:
     """恒速模型卡尔曼滤波：掌心 3D 位置/速度估计（异步 predict/update）。"""
 
-    def __init__(self, q=20.0, r=4e-4):
+    def __init__(self, q=20.0, r=4e-4, r_xy=None, r_z=None):
         self.q = float(q)   # 过程噪声：手的加速度能力 (m/s^2)^2（白噪声加速度谱密度）
-        self.r = float(r)   # 观测噪声方差 (m^2)：单帧掌心 3D 位置噪声，σ≈2cm → 4e-4
+        self.r = float(r)   # 标量回退参数，保留旧调用兼容性
+        xy = self.r if r_xy is None else float(r_xy)
+        zz = self.r if r_z is None else float(r_z)
+        self.r_vector = np.array([xy, xy, zz], dtype=np.float64)
+        if not np.all(np.isfinite(self.r_vector)) or np.any(self.r_vector <= 0.0):
+            raise ValueError("KF 观测噪声方差必须为有限正数")
         self.x = np.zeros(6)              # [px,py,pz, vx,vy,vz]
         self.P = np.eye(6)
         self.P[3:, 3:] *= 10.0            # 速度初值不确定性给大些，收敛更快
@@ -58,11 +63,16 @@ class KalmanTarget3D:
         dt2 = dt * dt
         dt3 = dt2 * dt
         Q = np.zeros((6, 6))
-        q = self.q * self.q_scale     # 自适应：加速段放大过程噪声，快速跟手
+        scale = np.asarray(self.q_scale, dtype=np.float64)
+        if scale.ndim == 0:
+            scale = np.full(3, float(scale))
+        if scale.shape != (3,) or not np.all(np.isfinite(scale)):
+            raise ValueError("KF 自适应 Q 倍率必须为有限标量或三维向量")
+        q = self.q * scale              # 标量旧逻辑与 XYZ 分轴新逻辑共用
         for i in range(3):
-            Q[i, i] = dt3 / 3.0 * q
-            Q[i, i + 3] = Q[i + 3, i] = dt2 / 2.0 * q
-            Q[i + 3, i + 3] = dt * q
+            Q[i, i] = dt3 / 3.0 * q[i]
+            Q[i, i + 3] = Q[i + 3, i] = dt2 / 2.0 * q[i]
+            Q[i + 3, i + 3] = dt * q[i]
         return F, Q
 
     def predict(self, dt):
@@ -81,7 +91,7 @@ class KalmanTarget3D:
             self.initialized = True
             return
         self.predict(dt)
-        S = self.H @ self.P @ self.H.T + np.eye(3) * self.r
+        S = self.H @ self.P @ self.H.T + np.diag(self.r_vector)
         K = self.P @ self.H.T @ np.linalg.inv(S)
         self.x += K @ (meas - self.H @ self.x)
         self.P = (np.eye(6) - K @ self.H) @ self.P

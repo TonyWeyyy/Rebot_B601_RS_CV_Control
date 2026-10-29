@@ -149,6 +149,8 @@ class Gemini2Camera:
         # 深度 scale 在首帧读取（见 get_frames）
         self.depth_scale = None
         self.dropped_frames = 0   # latest_only 排空丢弃的帧组数（DBG 诊断用）
+        self._last_frame_timestamp_s = None
+        self._timestamp_source = ""
 
         # 预热，丢弃前几帧
         print("[Gemini2] 预热相机...")
@@ -224,6 +226,31 @@ class Gemini2Camera:
         print(f"[Gemini2] 相机就绪  内参: fx={self.fx:.2f} fy={self.fy:.2f} "
               f"cx={self.cx:.2f} cy={self.cy:.2f}")
 
+    @staticmethod
+    def _read_timestamp_seconds(frame):
+        """兼容不同 pyorbbecsdk2 版本；通用接口按 SDK 的毫秒约定换算。"""
+        candidates = (
+            ("get_timestamp_us", 1e-6), ("get_time_stamp_us", 1e-6),
+            ("get_timestamp_ns", 1e-9), ("get_time_stamp_ns", 1e-9),
+            ("get_timestamp", 1e-3), ("get_time_stamp", 1e-3),
+        )
+        for name, scale in candidates:
+            method = getattr(frame, name, None)
+            if not callable(method):
+                continue
+            try:
+                value = float(method())
+                if np.isfinite(value) and value >= 0.0:
+                    return value * scale, f"{name}×{scale:g}"
+            except Exception:
+                # 某些 SDK 的 OBError 并非 RuntimeError；时间能力失败不得中断取流。
+                continue
+        return None, ""
+
+    def get_last_frame_timing(self):
+        """返回最近成功帧的硬件秒时间戳和来源；不改变 get_frames 三元组接口。"""
+        return self._last_frame_timestamp_s, self._timestamp_source
+
     def get_frames(self, latest_only=True):
         """
         返回 (color_bgr, depth_raw, depth_scale)：
@@ -254,7 +281,15 @@ class Gemini2Camera:
         color_frame = frames.get_color_frame()
         depth_frame = frames.get_depth_frame()
         if color_frame is None or depth_frame is None:
+            self._last_frame_timestamp_s = None
             return None, None, None
+        timestamp_s, source = self._read_timestamp_seconds(color_frame)
+        if timestamp_s is None:
+            timestamp_s, source = self._read_timestamp_seconds(depth_frame)
+        self._last_frame_timestamp_s = timestamp_s
+        if source and source != self._timestamp_source:
+            self._timestamp_source = source
+            print(f"[Gemini2] 帧硬件时间接口: {source}")
 
         # 彩色：MJPG 解码为 BGR
         if color_frame.get_format() == OBFormat.MJPG:
