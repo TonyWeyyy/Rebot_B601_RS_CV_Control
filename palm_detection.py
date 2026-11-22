@@ -126,6 +126,12 @@ class OneEuroFilter:
         self.dx_prev = 0.0
         self.t_prev = None
 
+    def reset(self):
+        """清除滤波器历史状态（长丢手重置或相机重连后避免旧值拖拽）。"""
+        self.x_prev = None
+        self.dx_prev = 0.0
+        self.t_prev = None
+
     @staticmethod
     def _alpha(cutoff, dt):
         tau = 1.0 / (2.0 * np.pi * cutoff)
@@ -273,7 +279,8 @@ class PalmTracker:
         return self.track
 
 
-def get_median_depth(depth_raw, depth_scale, u, v, patch=DEPTH_PATCH):
+def get_median_depth(depth_raw, depth_scale, u, v, patch=DEPTH_PATCH,
+                     ref_depth=0.0, max_jump=0.08):
     """
     在 (u,v) 邻域取中值深度（米）。
     depth_raw: uint16 深度图（已对齐到彩色）
@@ -282,6 +289,9 @@ def get_median_depth(depth_raw, depth_scale, u, v, patch=DEPTH_PATCH):
     BS 高帧率模式下掌心小窗口常出现深度空洞（实测表现为 palm 可见
     但 z3d=0，手臂顿挫）：采样窗口逐级扩大 patch → 2x → 3x，
     只有最大窗口仍无效才放弃本帧。
+    当提供有效的上一帧参考深度 ref_depth (>0) 时，若窗口跨过手掌边缘混入
+    远端背景墙像素，但窗口内仍存在 ≥5 个与 ref_depth 连续的前景手掌像素，
+    则优先对前景像素取中值，显著降低高速挥手时的边缘假跳变率。
     """
     h, w = depth_raw.shape
     for p in (patch, patch * 2, patch * 3):
@@ -290,6 +300,10 @@ def get_median_depth(depth_raw, depth_scale, u, v, patch=DEPTH_PATCH):
         window = depth_raw[y0:y1, x0:x1].astype(np.float32) * depth_scale
         valid = window[(window >= MIN_DEPTH_M) & (window <= MAX_DEPTH_M)]
         if valid.size >= 5:     # 有效点太少说明在边缘/遮挡处，不可信
+            if ref_depth > 0.0 and max_jump > 0.0:
+                fg = valid[np.abs(valid - ref_depth) <= max_jump]
+                if fg.size >= 5:
+                    return float(np.median(fg))
             return float(np.median(valid))
     return 0.0
 

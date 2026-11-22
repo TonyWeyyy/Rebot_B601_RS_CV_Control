@@ -13,7 +13,58 @@
 > 日常调参只改 `config/follow.yaml`（跟随）和 `config/grasp.yaml`（夹爪）两个文件；
 > 命令行参数临时覆盖。完整的技术原理与踩坑记录见 [技术手册.md](技术手册.md)。
 
-## 最终版本 v10.0（CV-only）
+## 最新版本 v11.0（伸展稳停 + 高速追赶定版）
+
+本版基于实机高频日志（B601-RS + Orbbec Gemini 2，60fps / 100Hz 伺服）针对**伸展态停手晃动**与**中远距追手速度**进行了系统升级，现已实机验收并定版（对应配置文件 `config/follow_v11.yaml`，已同步至默认 `config/follow.yaml`）。
+
+### 核心升级行为
+
+- **延迟+低通匹配自运动补偿（`DelayedTwistCompensator`）**：按实测 `140ms` 执行器/视觉滞后 + `75ms` KF 速度观测滞后对齐扣除相机自运动（停靠段附带 `±40ms` 延迟容错半窗），根除大滞后相位反转引发的自运动假速度放大；
+- **刹车回弹冷静窗（`PostBrakeSettleGuard`）**：机械臂刹停后按时间制开启冷静窗（近中区 `0.22s`，满伸展 `0.32s`），窗内屏蔽伸展悬臂弹性回弹与视觉尾流引起的误解锁，并在 65% 窗长处做一次 KF 残速清理与重锚；真实大幅挥手仍可通过高门槛直通立即响应；
+- **伸展度平滑调度与非对称起步（`compute_reach_schedule` + `reach_release_tau`）**：近中区（`r ≤ 0.24m`）全速无衰减；前伸区（`0.24~0.38m`）对停靠速度、正向前馈、额外 lead 与刹车加速度平滑收紧（`reach_att_tau=0.15s`），而手掌拉远重新追手时按 `reach_release_tau=0.04s` 快速放开限速，兼顾伸展稳停与迅捷起步；
+- **分轴闭环自激振荡阻尼器（`OscillationDamper`）**：专杀 `1.2~2.5Hz` MIT 共振极限环——需连续 3 次共振带过零才触发阻尼（单程追赶、快速单/双次折返零误触），单轴误差 `≥15cm` 主动大追手时立即清连击并 4 倍速释放；一旦检测到真共振，即时切掉振荡轴正向前馈/lead/Q 放大并削减 45% 比例增益；
+- **大误差非线性追赶增益（`far_gain_boost=0.35`）与分组巡航限速（`joint_vel_grouped_cruise=true`）**：仅在误差 `>8cm` 且手掌同向远离、无振荡、非深伸展时补偿 `tanh` 压缩，并启用 `[J1, J5] / [J2, J3, J4, J6]` 分组限速消除水平/竖直互相拖慢；`≤8cm` 小信号停靠与共振区增益 0 变化；
+- **平滑进死区 & 前景优先深度中值**：高速冲入死区时走 `EMA + max_accel` 斜坡平顺刹停，避免阶跃急刹激发悬臂回弹；深度采样在保留完整四层深度保护链的前提下过滤背景跳变像素；
+- **安全红线全部保留**：单一 CAN 主机、`return_to_zero=True, wait=True` 安全回零、水平 `hypot(X,Y) ≤ 0.42m` 软墙、`MAX_JOINT_SPEED = 2.0 rad/s` 双保险、四层深度保护与时间推导常量。
+
+### v11.0 参数摘要
+
+| 参数 | v11.0 最终值 | 说明 |
+| --- | --- | --- |
+| `distance` | `0.40m` | 期望相机到掌心距离 |
+| `gain / gain_x` | `2.55 / 2.02` | 竖直/深度增益、水平偏航增益 |
+| `far_gain_boost` | `0.35` | `>8cm` 同向追赶非线性增益上限（`≤8cm` 保持 0 变化） |
+| `max_vel / max_vel_joint / max_vel_angular` | `0.70m/s / 2.00rad/s / 1.85rad/s` | 末端线速、关节速度、角速度上限 |
+| `joint_vel_grouped_cruise` | `true` | 非伸展非振荡远距巡航分组限速 |
+| `max_accel / reversal_accel_boost / reversal_residual_scale` | `3.30m/s² / 2.00 / 0.18` | 加速度限幅与干脆换向 |
+| `smooth_alpha` | `0.50` | 速度指令 EMA 平滑系数 |
+| `kf_q / kf_r_xy / kf_r_z` | `1.80 / 0.0023 / 0.0038` | CV 卡尔曼基准噪声 |
+| `kf_lead_ms / kf_lead_max_ms` | `8.0ms / 15.0ms` | 真实手速 `_kv` 门控自适应动态 lead |
+| `kf_axis_adapt_ref_xy / max_xy / confirm` | `0.032 / 1.75 / 2` | 连续 2 帧同向确认分轴自适应 Q |
+| `kf_ff_deadband_off / on / exit_frames / stop_delay_s` | `0.06 / 0.130 / 5 / 0.04s` | 静止/运动滞回与换向防误停顿 |
+| `self_motion_delay_s / lpf_tau_s / local_window_s` | `0.14s / 0.075s / 0.04s` | 延迟+低通匹配自运动补偿 |
+| `post_brake_settle_s / post_brake_ext_extra_s` | `0.22s / 0.10s` | 刹车回弹冷静窗（满伸展 0.32s） |
+| `reach_soft_start / end / min_scale / dock_dist` | `0.24 / 0.38 / 0.46 / 0.25m` | 伸展度增益调度 |
+| `reach_att_tau / reach_release_tau` | `0.15s / 0.04s` | 停靠平顺收紧 / 追手快速释放 |
+| `osc_confirm_reversals / osc_large_err_release / osc_gain_cut` | `3 / 0.15m / 0.45` | 分轴共振阻尼与大追赶自动释放 |
+| `ff_cruise_support / depth_oe_beta` | `0.30 / 0.45` | 远距巡航前馈支撑、深度 One Euro 响应 |
+
+完整参数以 `config/follow_v11.yaml`（与 `config/follow.yaml` 同步）为准；可随时用 `--follow-cfg config/follow_v10.yaml` 回退至 v10.0。
+
+### 离线验证与实机基线
+
+```bash
+python3 tools/test_servo_upgrades.py    # 72 项单元测试全部通过
+python3 tools/offline_smoke_test.py     # 正常/故障、--no-gripper 打开、eye-in-hand 静止、多版本回退配置校验
+python3 tools/analyze_servo_log.py logs/servo_时间.csv --json
+```
+
+- 实机验收（`200632`）：运动段峰值单轴速度中位数 `1.85 rad/s`（大误差段 `56.8%` 触及 `2.0 rad/s` 上限），P95 跟随误差 `0.211m`，静止残余关节速度 P95 为 `0.000 rad/s`；
+- 当前已知物理边界：全轴统一 `2.0 rad/s` 下，轻负载手腕 `J4` 在大误差追赶段饱和占比 `30.2%`（其中 `16.1%` 单独拖慢大臂 `J2/J3`），且底层位置斜坡存在约 `140~160ms` 闭环滞后；后续 L1/L2 进阶优化将在 `develop` 分支开展。
+
+---
+
+## 历史版本 v10.0（CV-only）
 
 这版是实机验收后的最终版本，只保留恒速 CV 卡尔曼模型，不再包含 Singer。
 

@@ -171,7 +171,7 @@ palm_module.PalmDetector = FakeDetector
 palm_module.PalmTracker = FakeTracker
 palm_module.OneEuroFilter = FakeOneEuro
 palm_module.LKPalmBridge = FakeBridge
-palm_module.get_median_depth = lambda depth, scale, u, v: 0.35
+palm_module.get_median_depth = lambda depth, scale, u, v, *args, **kwargs: 0.35
 palm_module.pixel_to_3d = lambda u, v, z, fx, fy, cx, cy: (
     (u - cx) * z / fx, (v - cy) * z / fy, z)
 palm_module.draw_palm = lambda *args, **kwargs: None
@@ -207,6 +207,15 @@ main_module.ActualFeedbackSampler = TrackedFeedbackSampler
 valid_cfg = main_module.load_follow_cfg(
     os.path.join(ROOT, "config", "follow.yaml"))
 main_module.validate_follow_cfg(valid_cfg)
+FAKE_DEPTH = float(valid_cfg["follow"]["distance"])
+palm_module.get_median_depth = lambda depth, scale, u, v, *args, **kwargs: FAKE_DEPTH
+main_module.get_median_depth = palm_module.get_median_depth
+v10_cfg = main_module.load_follow_cfg(
+    os.path.join(ROOT, "config", "follow_v10.yaml"))
+main_module.validate_follow_cfg(v10_cfg)
+v11_cfg = main_module.load_follow_cfg(
+    os.path.join(ROOT, "config", "follow_v11.yaml"))
+main_module.validate_follow_cfg(v11_cfg)
 fallback_cfg = main_module.load_follow_cfg(
     os.path.join(ROOT, "config", "follow_v7.1_fallback.yaml"))
 main_module.validate_follow_cfg(fallback_cfg)
@@ -265,7 +274,27 @@ for key, value in (("kf_r_xy", 0.0), ("kf_slow_follow_speed", 0.07),
                    ("reversal_residual_scale", 1.1),
                    ("static_velocity_hold_speed", 0.0),
                    ("static_velocity_hold_speed", 0.09),
-                   ("static_velocity_hold_delay_s", 0.11)):
+                   ("static_velocity_hold_delay_s", 0.11),
+                   ("self_motion_delay_s", 0.30),
+                   ("self_motion_lpf_tau_s", -0.01),
+                   ("self_motion_local_window_s", 0.15),
+                   ("ff_cruise_support", 0.95),
+                   ("post_brake_settle_s", 0.60),
+                   ("post_brake_ext_extra_s", 0.40),
+                   ("kf_ff_stop_delay_s", 0.20),
+                   ("osc_err_thresh", 0.001),
+                   ("osc_min_half_s", 0.50),
+                   ("osc_gain_cut", 0.90),
+                   ("osc_decay_tau_s", 0.02),
+                   ("reach_ff_min_scale", 0.10),
+                   ("reach_lead_min_scale", 1.20),
+                   ("reach_accel_min_scale", 0.10),
+                   ("reach_deadband_on_boost", 1.50),
+                   ("reach_fast_start_boost", -0.10),
+                   ("reach_release_tau", 0.005),
+                   ("far_gain_boost", 0.80),
+                   ("osc_confirm_reversals", 1),
+                   ("osc_large_err_release", 0.05)):
     invalid = copy.deepcopy(valid_cfg)
     invalid["follow"][key] = value
     try:
@@ -382,7 +411,7 @@ print(f"OFFLINE_NO_GRIPPER_OPEN_OK: gripper={open_robot.gripper:.1f}°, "
 # 静止手掌会因相机自运动而移动；验证不会重新进入运动/锁存极限环。
 class EyeInHandDetector:
     world_x = 0.10
-    world_z = 0.35
+    world_z = FAKE_DEPTH
 
     def __init__(self, *args, **kwargs):
         pass

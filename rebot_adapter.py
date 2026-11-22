@@ -217,8 +217,12 @@ class RebotAdapter:
         self._last_cmd_time = now
 
         if dq_rad is not None:
-            dq = np.clip(np.asarray(dq_rad, dtype=np.float64),
-                         -MAX_JOINT_SPEED, MAX_JOINT_SPEED)
+            dq = np.asarray(dq_rad, dtype=np.float64)
+            ratios = np.abs(dq) / MAX_JOINT_SPEED
+            max_ratio = float(np.max(ratios)) if dq.size else 0.0
+            if max_ratio > 1.0:
+                dq = dq / max_ratio
+            dq = np.clip(dq, -MAX_JOINT_SPEED, MAX_JOINT_SPEED)
             self._q_target = self._q_target + dq * dt
             # 软限位：撞到边界就把目标钉在边界上，防止积分饱和
             self._q_target = np.clip(self._q_target, self.q_min, self.q_max)
