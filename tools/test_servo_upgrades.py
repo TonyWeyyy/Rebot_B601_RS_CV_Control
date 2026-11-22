@@ -14,8 +14,13 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from servo_timing import (AdaptiveLeadGate, FastStartGate, SlowFollowGate,
                           CameraTimestampCalibrator, AxisProcessNoiseGate,
-                          StaticVelocityHold, adaptive_feedforward_scale,
+                          StaticVelocityHold, DelayedTwistCompensator,
+                          PostBrakeSettleGuard, OscillationDamper,
+                          compute_reach_schedule,
+                          adaptive_feedforward_scale,
+                          apply_axis_reversal_damping, scale_joint_velocities,
                           camera_twist_from_tcp, compensate_palm_velocity,
+                          compensate_palm_velocity_delayed,
                           camera_point_to_world, world_point_to_camera,
                           scaled_alpha, scaled_decay, horizontal_radial_soft_wall,
                           measurement_age, dynamic_lead_seconds)
@@ -87,6 +92,19 @@ class EyeInHandCompensationTests(unittest.TestCase):
             twist[:3] + np.cross(twist[3:], palm))
         compensated = compensate_palm_velocity(observed, twist, palm)
         np.testing.assert_allclose(compensated, hand_velocity, atol=1e-12)
+
+    def test_delayed_camera_twist_history_cancels_lagged_stop_motion(self):
+        # 机械臂 40ms 前以 0.42 m/s 冲刺，当前周期刚进死区指令归零 (0.0 m/s)；
+        # 滞后 40ms 的视觉 KF 仍看到 -0.40 m/s 相对速度。
+        history = [
+            np.array([0.42, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            np.array([0.25, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            np.array([0.00, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        ]
+        palm = np.array([0.0, 0.0, 0.40])
+        observed = np.array([-0.40, 0.0, 0.0])
+        compensated = compensate_palm_velocity_delayed(observed, history, palm)
+        self.assertLess(float(np.linalg.norm(compensated)), 0.03)
 
     def test_camera_world_point_round_trip(self):
         def rot_z(angle):
@@ -626,6 +644,250 @@ class AdaptiveLeadTests(unittest.TestCase):
             10.0, True)
         self.assertGreater(above, below)
         self.assertLessEqual(above, 1.0)
+
+
+class JointScalingAndReversalTests(unittest.TestCase):
+    def test_joint_velocity_proportional_scaling_preserves_direction(self):
+        raw = np.array([3.0, -1.5, 0.75, 0.0, -0.3, 0.6])
+        scaled = scale_joint_velocities(raw, 1.5, grouped=False)
+        self.assertAlmostEqual(float(np.max(np.abs(scaled))), 1.5, places=12)
+        # 比例方向必须严格保持不变
+        np.testing.assert_allclose(scaled / scaled[0], raw / raw[0], atol=1e-12)
+        # 分组解耦模式：水平偏航组 [J1, J5] 饱和时绝不拖慢竖直俯仰组 [J2, J3, J4, J6]
+        grouped_in = np.array([3.0, 1.0, -0.8, -0.2, -3.0, 0.1])
+        grouped_out = scale_joint_velocities(grouped_in, 1.5, grouped=True)
+        np.testing.assert_allclose(grouped_out[[0, 4]], [1.5, -1.5], atol=1e-12)
+        np.testing.assert_allclose(grouped_out[[1, 2, 3, 5]],
+                                   grouped_in[[1, 2, 3, 5]], atol=1e-12)
+        within = np.array([0.8, -1.2, 0.5, 0.0, 0.1, -0.3])
+        np.testing.assert_allclose(scale_joint_velocities(within, 1.5), within)
+        np.testing.assert_array_equal(
+            scale_joint_velocities(np.array([np.nan, 1.0, 0.0]), 1.5),
+            np.zeros(3))
+
+    def test_per_axis_reversal_damps_reversing_axis_without_hurting_orthogonal_axis(self):
+        v_target = np.array([-0.40, 0.50, 0.0])
+        actual = np.array([0.40, 0.45, 0.0])
+        prev = np.array([0.40, 0.45, 0.0])
+        new_act, new_prev, reversing = apply_axis_reversal_damping(
+            v_target, actual, prev, residual_scale=0.20, enabled=True)
+        self.assertTrue(reversing)
+        # X 轴反向：actual 与 prev 均按比例收缩，避免 prev 把 actual 重新拉回满速
+        self.assertAlmostEqual(new_act[0], 0.08, places=12)
+        self.assertAlmostEqual(new_prev[0], 0.24, places=12)
+        # Y 轴同向巡航：丝毫不受 X 轴换向牵连
+        self.assertAlmostEqual(new_act[1], 0.45, places=12)
+        self.assertAlmostEqual(new_prev[1], 0.45, places=12)
+
+
+class DelayedTwistCompensatorTests(unittest.TestCase):
+    def test_cancels_delayed_1_67hz_oscillation_without_phase_inversion(self):
+        # 模拟 1.67Hz 振荡下机械臂相机速度经 100ms 延迟 + 80ms 一阶低通进入 KF 速度
+        comp = DelayedTwistCompensator(delay_s=0.10, lpf_tau_s=0.08,
+                                       local_window_s=0.04)
+        dt = 0.01
+        omega = 2.0 * np.pi * 1.67
+        palm = np.array([0.0, 0.0, 0.40])
+        lpf_true = 0.0
+        alpha = 1.0 - np.exp(-dt / 0.08)
+        raw_hist = []
+        matched_res = []
+        naive_res = []
+        for k in range(300):
+            t = k * dt
+            vx_cmd = 0.45 * np.sin(omega * t)
+            raw_hist.append(vx_cmd)
+            vx_del = raw_hist[k - 10] if k >= 10 else 0.0
+            lpf_true += (vx_del - lpf_true) * alpha
+            # 静止手掌在相机系看到的滞后速度 = -lpf_true
+            obs_kv = np.array([-lpf_true, 0.0, 0.0])
+            twist_now = np.array([vx_cmd, 0.0, 0.0, 0.0, 0.0, 0.0])
+            comp.push(twist_now, t, dt)
+            if k >= 80:
+                kv_matched = comp.compensate(obs_kv, palm, now=t, near_stop=False)
+                kv_naive = compensate_palm_velocity(obs_kv, twist_now, palm)
+                matched_res.append(abs(kv_matched[0]))
+                naive_res.append(abs(kv_naive[0]))
+        # 零延迟补偿因相位反转反而把静止自运动残影放大（0.37 > 原始均值 0.29）；
+        # 延迟+低通匹配补偿应精确抵消至接近 0
+        self.assertGreater(float(np.mean(naive_res)), 0.35)
+        self.assertLess(float(np.mean(matched_res)), 1e-6)
+
+    def test_constant_moving_hand_survives_cruise_compensation(self):
+        comp = DelayedTwistCompensator(delay_s=0.10, lpf_tau_s=0.08,
+                                       local_window_s=0.04)
+        palm = np.array([0.0, 0.0, 0.40])
+        twist = np.array([0.40, 0.0, 0.0, 0.0, 0.0, 0.0])
+        for k in range(80):
+            comp.push(twist, k * 0.01, 0.01)
+        # 手掌以 0.40 m/s 匀速移动且机械臂以 0.40 m/s 同步追随 → 相机系相对速度=0
+        kv = comp.compensate(np.zeros(3), palm, now=0.79, near_stop=False)
+        self.assertGreater(kv[0], 0.38)
+
+    def test_near_stop_local_window_absorbs_extended_lag_drift(self):
+        # 伸展态实际滞后比标称多 30ms（130ms vs 100ms），near_stop 局部窗应能抵消
+        comp = DelayedTwistCompensator(delay_s=0.10, lpf_tau_s=0.08,
+                                       local_window_s=0.04)
+        palm = np.array([0.0, 0.0, 0.40])
+        dt = 0.01
+        raw_hist = []
+        lpf_ext = 0.0
+        alpha = 1.0 - np.exp(-dt / 0.08)
+        for k in range(60):
+            t = k * dt
+            vx = 0.50 if k < 35 else 0.0
+            raw_hist.append(vx)
+            vx_del = raw_hist[k - 13] if k >= 13 else 0.0
+            lpf_ext += (vx_del - lpf_ext) * alpha
+            comp.push(np.array([vx, 0.0, 0.0, 0.0, 0.0, 0.0]), t, dt)
+        obs = np.array([-lpf_ext, 0.0, 0.0])
+        kv = comp.compensate(obs, palm, now=0.59, near_stop=True)
+        self.assertLess(float(np.linalg.norm(kv)), 0.03)
+
+    def test_invalid_inputs_and_reset_fail_safe(self):
+        comp = DelayedTwistCompensator()
+        comp.push(np.array([np.nan, 0.0, 0.0, 0.0, 0.0, 0.0]), 0.01, 0.01)
+        kv = comp.compensate(np.array([0.1, 0.0, 0.0]), np.zeros(3), now=0.01)
+        np.testing.assert_allclose(kv, [0.1, 0.0, 0.0])
+        comp.reset()
+        self.assertEqual(len(comp._buf), 0)
+        with self.assertRaises(ValueError):
+            DelayedTwistCompensator(delay_s=-0.01)
+
+
+class PostBrakeSettleGuardTests(unittest.TestCase):
+    def test_fresh_start_has_no_cooldown_and_brake_triggers_window(self):
+        guard = PostBrakeSettleGuard(base_settle_s=0.22, ext_extra_s=0.08)
+        self.assertFalse(guard.in_cooldown(0.0))
+        self.assertFalse(guard.in_cooldown(1.0))
+        guard.update(0.01, 0.80)
+        self.assertTrue(guard.in_cooldown(0.0))
+        # 停稳 0.15s 后仍在冷静窗内，但应触发一次 KF 重锚
+        reanchored = 0
+        for _ in range(15):
+            guard.update(0.01, 0.0)
+            if guard.consume_kf_reanchor(0.0):
+                reanchored += 1
+        self.assertEqual(reanchored, 1)
+        self.assertTrue(guard.in_cooldown(0.0))
+        # 冷静窗内唤醒速度门槛被抬高，防止 70ms 后回弹假速度炸开锁存
+        self.assertGreater(guard.effective_unlock_threshold(0.13, 0.0), 0.25)
+        # 再过 0.10s（总计 0.25s）：近区退出冷静窗，但满伸展（0.30s）仍在冷静窗
+        for _ in range(10):
+            guard.update(0.01, 0.0)
+        self.assertFalse(guard.in_cooldown(0.0))
+        self.assertTrue(guard.in_cooldown(1.0))
+        self.assertAlmostEqual(guard.effective_unlock_threshold(0.13, 0.0), 0.13)
+
+
+class ReachScheduleTests(unittest.TestCase):
+    def test_near_workspace_preserves_full_performance(self):
+        sched = compute_reach_schedule(reach_r=0.20, pos_err_norm=0.05)
+        self.assertEqual(sched["ext_ratio"], 0.0)
+        self.assertEqual(sched["vel_att_target"], 1.0)
+        self.assertEqual(sched["ff_scale"], 1.0)
+        self.assertEqual(sched["lead_scale"], 1.0)
+        self.assertEqual(sched["accel_scale"], 1.0)
+        self.assertEqual(sched["deadband_on_scale"], 1.0)
+        self.assertEqual(sched["fast_start_dist_scale"], 1.0)
+
+    def test_full_extension_softens_docking_and_preserves_far_cruise(self):
+        dock = compute_reach_schedule(reach_r=0.38, pos_err_norm=0.05)
+        far = compute_reach_schedule(reach_r=0.38, pos_err_norm=0.30)
+        self.assertAlmostEqual(dock["ext_ratio"], 1.0)
+        self.assertLess(dock["vel_att_target"], 0.65)
+        self.assertAlmostEqual(far["vel_att_target"], 1.0)  # 大误差远距追赶不限速
+        self.assertAlmostEqual(dock["ff_scale"], 0.50)
+        self.assertAlmostEqual(dock["lead_scale"], 0.30)
+        self.assertAlmostEqual(dock["accel_scale"], 0.65)
+        self.assertAlmostEqual(dock["deadband_on_scale"], 1.35)
+        self.assertAlmostEqual(dock["fast_start_dist_scale"], 1.40)
+
+    def test_nonfinite_inputs_fall_back_to_neutral(self):
+        sched = compute_reach_schedule(reach_r=float("nan"), pos_err_norm=0.1)
+        self.assertEqual(sched["vel_att_target"], 1.0)
+        self.assertEqual(sched["ext_ratio"], 0.0)
+
+
+class OscillationDamperTests(unittest.TestCase):
+    def test_single_move_single_reversal_and_slow_wave_never_trigger(self):
+        damper = OscillationDamper(err_thresh=0.018, min_half_s=0.14,
+                                   max_half_s=0.42, decay_tau_s=0.55)
+        # 单程运动 + 单次折返：最多 1 次过零，绝不触发
+        for k in range(100):
+            t = k * 0.01
+            err_x = 0.10 if t < 0.30 else -0.10
+            levels = damper.update(np.array([err_x, 0.0, 0.0]), t, 0.01)
+            np.testing.assert_array_equal(levels, np.zeros(3))
+        # 正常慢速来回挥手（0.7Hz，半周期 0.71s > 0.42s）：绝不触发
+        damper.reset()
+        for k in range(300):
+            t = k * 0.01
+            err_x = 0.12 * np.sin(2.0 * np.pi * 0.7 * t)
+            levels = damper.update(np.array([err_x, 0.0, 0.0]), t, 0.01)
+            np.testing.assert_array_equal(levels, np.zeros(3))
+
+        # 单程运动 + 快速两连折返（仅 2 次过零，< confirm_reversals=3）：绝不误触发
+        damper.reset()
+        for k in range(120):
+            t = k * 0.01
+            if t < 0.25:
+                err_x = 0.08
+            elif t < 0.50:
+                err_x = -0.08
+            elif t < 0.75:
+                err_x = 0.08
+            else:
+                err_x = 0.005
+            levels = damper.update(np.array([err_x, 0.0, 0.0]), t, 0.01)
+            np.testing.assert_array_equal(levels, np.zeros(3))
+
+    def test_large_error_chase_releases_oscillation_damper(self):
+        damper = OscillationDamper(err_thresh=0.018, min_half_s=0.14,
+                                   max_half_s=0.42, decay_tau_s=0.55,
+                                   confirm_reversals=3,
+                                   large_err_release=0.15)
+        # 先用 1.7Hz 中幅极限环拉起阻尼
+        for k in range(110):
+            t = k * 0.01
+            err_x = 0.08 * np.sin(2.0 * np.pi * 1.7 * t)
+            damper.update(np.array([err_x, 0.0, 0.0]), t, 0.01)
+        self.assertGreaterEqual(damper.levels[0], 0.5)
+        # 随后人手大幅主动拉远（|err| >= 0.15m），连击清零且 0.25s 内迅速释放阻尼
+        for k in range(110, 145):
+            damper.update(np.array([0.20, 0.0, 0.0]), k * 0.01, 0.01)
+        self.assertEqual(damper.streak[0], 0)
+        self.assertLess(damper.levels[0], 0.12)
+
+    def test_1_7hz_limit_cycle_triggers_rapidly_only_on_oscillating_axis(self):
+        damper = OscillationDamper(err_thresh=0.018, min_half_s=0.14,
+                                   max_half_s=0.42, decay_tau_s=0.55)
+        max_x = 0.0
+        max_y = 0.0
+        for k in range(120):
+            t = k * 0.01
+            err_x = 0.08 * np.sin(2.0 * np.pi * 1.7 * t)
+            levels = damper.update(np.array([err_x, 0.10, 0.0]), t, 0.01)
+            max_x = max(max_x, float(levels[0]))
+            max_y = max(max_y, float(levels[1]))
+        self.assertGreaterEqual(max_x, 0.65)
+        self.assertEqual(max_y, 0.0)  # 正交巡航轴丝毫不受影响
+
+    def test_decays_after_settling_and_handles_invalid_inputs(self):
+        damper = OscillationDamper(decay_tau_s=0.30)
+        for k in range(100):
+            t = k * 0.01
+            damper.update(np.array([0.08 * np.sin(2.0 * np.pi * 1.7 * t), 0.0, 0.0]), t, 0.01)
+        self.assertGreater(damper.levels[0], 0.5)
+        # 振荡停止后应平滑衰减回 0
+        for k in range(100, 260):
+            damper.update(np.array([0.005, 0.0, 0.0]), k * 0.01, 0.01)
+        self.assertLess(damper.levels[0], 0.05)
+        # 异常输入安全清零
+        out = damper.update(np.array([np.nan, 0.0, 0.0]), 3.0, 0.01)
+        np.testing.assert_array_equal(out, np.zeros(3))
+        with self.assertRaises(ValueError):
+            OscillationDamper(min_half_s=0.5, max_half_s=0.3)
 
 
 if __name__ == "__main__":

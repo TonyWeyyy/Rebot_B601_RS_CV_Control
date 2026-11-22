@@ -117,6 +117,35 @@ def compensate_palm_velocity(observed_velocity, camera_twist_camera,
     return observed + twist[:3] + np.cross(twist[3:], palm)
 
 
+def compensate_palm_velocity_delayed(observed_velocity, camera_twist_history,
+                                     palm_position_camera):
+    """延迟对齐的相机自运动补偿：匹配视觉+KF 链路 30~60ms 群延迟。
+
+    机械臂高速接近静止手掌并进入死区瞬间，当前周期的关节指令速度已降为 0，
+    但视觉 KF 输出的 _kv_raw 仍反映 30~60ms 前机械臂冲刺引起的画面相对速度。
+    在最近若干控制周期的相机 twist 历史窗口中选取残差范数最小的补偿结果，
+    可精确抵消滞后的相机自运动残影，防止停靠瞬间因相位错位无法进入静止锁存。
+    """
+    try:
+        observed = np.asarray(observed_velocity, dtype=np.float64)
+    except (TypeError, ValueError):
+        return np.zeros(3)
+    if observed.shape != (3,) or not np.all(np.isfinite(observed)):
+        return np.zeros(3)
+    if not camera_twist_history:
+        return observed.copy()
+    best_vec = None
+    best_norm = float("inf")
+    for twist in camera_twist_history:
+        candidate = compensate_palm_velocity(
+            observed, twist, palm_position_camera)
+        norm = float(np.linalg.norm(candidate))
+        if norm < best_norm:
+            best_norm = norm
+            best_vec = candidate
+    return best_vec if best_vec is not None else observed.copy()
+
+
 def camera_point_to_world(point_camera, tcp_position, tcp_rotation,
                           T_tcp_camera):
     """相机系点 → 世界系点；无效输入返回零向量。"""
@@ -524,3 +553,402 @@ def adaptive_feedforward_scale(error_vector, target_velocity, base_taper_dist,
                           / max(speed_ref - onset, 1e-6), 0.0, 1.0))
     taper = base + (max_taper - base) * blend
     return min(old_scale, min(1.0, error_norm / taper)), taper, approach_speed
+
+
+def scale_joint_velocities(joint_vel, max_speed, grouped=False):
+    """关节速度等比例限幅：任一关节超限时整体按比例缩放，保持笛卡尔运动方向。
+
+    默认 grouped=False 对全臂 6 轴统一等比例缩放，既严格保持 J @ dq 的三维运动
+    方向与手腕姿态协同，又限制斜向合成总动能，防止高速斜向停靠时过冲晃动。
+    """
+    dq = np.asarray(joint_vel, dtype=np.float64)
+    if dq.ndim != 1 or dq.size == 0 or not np.all(np.isfinite(dq)):
+        return np.zeros_like(dq, dtype=np.float64) if dq.ndim == 1 else np.zeros(6)
+    limit = np.asarray(max_speed, dtype=np.float64)
+    if limit.ndim == 0:
+        limit = np.full(dq.shape, float(limit), dtype=np.float64)
+    if (limit.shape != dq.shape or not np.all(np.isfinite(limit))
+            or np.any(limit <= 0.0)):
+        return np.zeros_like(dq)
+    ratios = np.abs(dq) / limit
+    if grouped and dq.shape == (6,):
+        out = dq.copy()
+        for group in ([0, 4], [1, 2, 3, 5]):
+            group_ratio = float(np.max(ratios[group]))
+            if group_ratio > 1.0:
+                out[group] /= group_ratio
+        return out
+    max_ratio = float(np.max(ratios))
+    if max_ratio > 1.0:
+        return dq / max_ratio
+    return dq.copy()
+
+
+def apply_axis_reversal_damping(v_target, actual_vel, prev_cmd_vel,
+                                residual_scale, enabled=True):
+    """分轴独立换向惯性衰减：同步收缩 EMA 与加速度限制器过零前的旧方向残速。
+
+    解决两个问题：
+    1) 三维整体点积在画圆/斜向变向时，单轴反向会被正交同向轴掩盖，或反过来
+       连累正交巡航轴被无辜减速；改为 X/Y/Z 分轴独立判定 `v_target[i]*actual[i] < 0`。
+    2) 原先只衰减 actual_vel 而不衰减 prev_cmd_vel，导致后续 slew-rate 限制器
+       直接以未衰减的 prev_cmd_vel 覆盖 actual_vel，使 residual_scale 形同虚设。
+       现在对换向轴同步将 prev_cmd_vel 在同号制动方向上收缩，既消除 ~100ms
+       换向滞后，又保证过零后的反向起步仍严格受加速度上限约束。
+    """
+    target = np.asarray(v_target, dtype=np.float64)
+    actual = np.asarray(actual_vel, dtype=np.float64).copy()
+    prev = np.asarray(prev_cmd_vel, dtype=np.float64).copy()
+    if (target.shape != (3,) or actual.shape != (3,) or prev.shape != (3,)
+            or not np.all(np.isfinite(target))
+            or not np.all(np.isfinite(actual))
+            or not np.all(np.isfinite(prev))):
+        return np.zeros(3), np.zeros(3), False
+    scale = float(np.clip(residual_scale, 0.0, 1.0))
+    rev_cmd_mask = (target * prev) < 0.0
+    any_reversing = bool(np.any(rev_cmd_mask) or np.dot(target, prev) < 0.0)
+    if not enabled:
+        return actual, prev, any_reversing
+    rev_act_mask = (target * actual) < 0.0
+    if np.any(rev_act_mask):
+        actual[rev_act_mask] *= scale
+    if np.any(rev_cmd_mask):
+        # 制动段将加速度限制基准向零温和收缩，避免把已衰减的 actual 重新拉回满速旧值
+        prev_brake_scale = 0.5 * (1.0 + scale)
+        prev[rev_cmd_mask] *= prev_brake_scale
+    return actual, prev, any_reversing
+
+
+class DelayedTwistCompensator:
+    """延迟+低通匹配的眼在手上相机自运动补偿器。
+
+    实机闭环中，指令关节速度经 200Hz 斜坡、MIT 电机跟踪、相机曝光/USB 与
+    MediaPipe/OneEuro 产生 ~100ms 传输滞后，再经卡尔曼速度状态产生 ~80~90ms
+    观测滞后。直接用当前周期的相机 twist 抵消滞后的 KF 速度，在 1.5~2Hz 摆动下
+    会出现 >120° 相位反转，把静止手掌的自运动残影反而放大近一倍。
+
+    利用线性时不变系统“先低通再延迟 == 先延迟再低通”的交换律：
+    每周期先把相机 twist 过一阶低通（匹配 KF 速度滞后）并写入带时间戳的环形缓冲；
+    - 巡航段只取 exact `now - delay_s` 单点查表（相位严格对齐，不误杀匀速移动手掌）；
+    - 接近停靠/静止段在 `delay_s ± local_window_s` 窄局部窗口内取最小残差，
+      兼容伸展态 MIT 延迟略增的漂移。
+    """
+
+    def __init__(self, delay_s=0.10, lpf_tau_s=0.08, local_window_s=0.04,
+                 max_history_s=0.50):
+        self.delay_s = float(delay_s)
+        self.lpf_tau_s = float(lpf_tau_s)
+        self.local_window_s = float(local_window_s)
+        if (not math.isfinite(self.delay_s) or self.delay_s < 0.0
+                or not math.isfinite(self.lpf_tau_s) or self.lpf_tau_s < 0.0
+                or not math.isfinite(self.local_window_s)
+                or self.local_window_s < 0.0):
+            raise ValueError("自运动延迟/低通/窗口参数必须为有限非负数")
+        self.max_history_s = max(
+            float(max_history_s), self.delay_s + self.local_window_s + 0.15)
+        self._lpf = np.zeros(6, dtype=np.float64)
+        self._buf = []   # [(t_s, lpf_twist_6d), ...]
+        self._last_t = None
+
+    def reset(self):
+        self._lpf[:] = 0.0
+        self._buf.clear()
+        self._last_t = None
+
+    def push(self, camera_twist, now, dt):
+        try:
+            twist = np.asarray(camera_twist, dtype=np.float64)
+            t_now = float(now)
+            step = float(dt)
+        except (TypeError, ValueError):
+            twist = np.zeros(6, dtype=np.float64)
+            t_now = 0.0 if self._last_t is None else self._last_t + 0.01
+            step = 0.01
+        if twist.shape != (6,) or not np.all(np.isfinite(twist)):
+            twist = np.zeros(6, dtype=np.float64)
+        if not math.isfinite(t_now):
+            t_now = 0.0 if self._last_t is None else self._last_t + 0.01
+        if not math.isfinite(step) or step <= 0.0:
+            step = 0.01
+        if self._last_t is not None and t_now < self._last_t - 0.5:
+            self.reset()
+        elif self._last_t is not None and t_now <= self._last_t:
+            t_now = self._last_t + max(step, 1e-4)
+
+        if self.lpf_tau_s <= 1e-4:
+            self._lpf = twist.copy()
+        else:
+            alpha = 1.0 - math.exp(-step / self.lpf_tau_s)
+            self._lpf += (twist - self._lpf) * alpha
+
+        self._buf.append((t_now, self._lpf.copy()))
+        self._last_t = t_now
+        cutoff = t_now - self.max_history_s
+        while len(self._buf) > 2 and self._buf[1][0] < cutoff:
+            self._buf.pop(0)
+        return self._lpf.copy()
+
+    def sample(self, target_time):
+        if not self._buf:
+            return np.zeros(6, dtype=np.float64)
+        t_q = float(target_time)
+        if not math.isfinite(t_q):
+            return np.zeros(6, dtype=np.float64)
+        # 早于复位起点时机械臂处于静止，返回零 twist 而非首帧值
+        if t_q < self._buf[0][0]:
+            return np.zeros(6, dtype=np.float64)
+        if t_q >= self._buf[-1][0]:
+            return self._buf[-1][1].copy()
+        # 缓冲区很小（~40-50 点），线性倒序查找即可（查询多靠近尾部）
+        for idx in range(len(self._buf) - 1, 0, -1):
+            t1, v1 = self._buf[idx]
+            t0, v0 = self._buf[idx - 1]
+            if t0 <= t_q <= t1:
+                span = t1 - t0
+                if span <= 1e-9:
+                    return v1.copy()
+                ratio = (t_q - t0) / span
+                return v0 + (v1 - v0) * ratio
+        return np.zeros(6, dtype=np.float64)
+
+    def compensate(self, observed_velocity, palm_position_camera, now=None,
+                   near_stop=False):
+        try:
+            observed = np.asarray(observed_velocity, dtype=np.float64)
+        except (TypeError, ValueError):
+            return np.zeros(3, dtype=np.float64)
+        if observed.shape != (3,) or not np.all(np.isfinite(observed)):
+            return np.zeros(3, dtype=np.float64)
+        if not self._buf:
+            return observed.copy()
+        t_ref = self._last_t if now is None else float(now)
+        if not math.isfinite(t_ref):
+            t_ref = self._last_t
+
+        if not near_stop or self.local_window_s <= 1e-4:
+            matched_twist = self.sample(t_ref - self.delay_s)
+            return compensate_palm_velocity(
+                observed, matched_twist, palm_position_camera)
+
+        # 停靠/低速段在标称延迟 ± local_window_s 的窄窗口内取 5 个采样点容错
+        offsets = (-self.local_window_s, -0.5 * self.local_window_s, 0.0,
+                   0.5 * self.local_window_s, self.local_window_s)
+        best_vec = None
+        best_norm = float("inf")
+        for off in offsets:
+            d = max(0.0, self.delay_s + off)
+            twist = self.sample(t_ref - d)
+            candidate = compensate_palm_velocity(
+                observed, twist, palm_position_camera)
+            norm = float(np.linalg.norm(candidate))
+            if norm < best_norm:
+                best_norm = norm
+                best_vec = candidate
+        return best_vec if best_vec is not None else observed.copy()
+
+
+class PostBrakeSettleGuard:
+    """刹车停稳后的物理回弹冷静窗（时间制，不依赖硬编码 tick 数）。
+
+    指令关节速度降到 <= speed_thresh 后，真实 MIT 机械臂与视觉/KF 链路仍有
+    150~220ms 的残余滑移与伸展悬臂弹性回弹。冷静窗内屏蔽低中幅值假速度，
+    防止刹车后精确 70ms 自解锁；同时保留高门槛直通通道，真实大幅挥手仍能
+    立即响应。
+    """
+
+    def __init__(self, base_settle_s=0.22, ext_extra_s=0.08,
+                 kf_reanchor_ratio=0.65, override_speed_mult=2.2,
+                 override_min_dist=0.050, speed_thresh=0.05):
+        self.base_settle_s = max(0.0, float(base_settle_s))
+        self.ext_extra_s = max(0.0, float(ext_extra_s))
+        self.kf_reanchor_ratio = float(np.clip(kf_reanchor_ratio, 0.1, 1.0))
+        self.override_speed_mult = max(1.0, float(override_speed_mult))
+        self.override_min_dist = max(0.0, float(override_min_dist))
+        self.speed_thresh = max(0.0, float(speed_thresh))
+        self.time_since_moving = float("inf")
+        self._reanchored_this_stop = True
+
+    def reset(self):
+        # 初始/重新启动时不在冷静期，保证首次起步无延迟
+        self.time_since_moving = float("inf")
+        self._reanchored_this_stop = True
+
+    def update(self, dt, joint_speed):
+        dt = float(dt) if (math.isfinite(dt) and dt > 0.0) else 0.0
+        speed = float(joint_speed) if math.isfinite(joint_speed) else 0.0
+        if speed > self.speed_thresh:
+            self.time_since_moving = 0.0
+            self._reanchored_this_stop = False
+        elif math.isfinite(self.time_since_moving):
+            self.time_since_moving += dt
+
+    def settle_duration(self, ext_ratio=0.0):
+        ext = float(np.clip(ext_ratio, 0.0, 1.0)) if math.isfinite(ext_ratio) else 0.0
+        return self.base_settle_s + self.ext_extra_s * ext
+
+    def in_cooldown(self, ext_ratio=0.0):
+        dur = self.settle_duration(ext_ratio)
+        return dur > 0.0 and self.time_since_moving < dur
+
+    def consume_kf_reanchor(self, ext_ratio=0.0):
+        """物理刹车尾段过去约 65% 冷静窗时触发一次 KF 残速清理与起点重锚。"""
+        dur = self.settle_duration(ext_ratio)
+        if dur <= 0.0 or self._reanchored_this_stop:
+            return False
+        if self.time_since_moving >= dur * self.kf_reanchor_ratio:
+            self._reanchored_this_stop = True
+            return True
+        return False
+
+    def effective_unlock_threshold(self, deadband_on, ext_ratio=0.0):
+        base = max(0.0, float(deadband_on))
+        if self.in_cooldown(ext_ratio):
+            return base * self.override_speed_mult
+        return base
+
+    def effective_fast_start_dist(self, fast_start_dist, ext_ratio=0.0):
+        base = max(0.0, float(fast_start_dist))
+        if self.in_cooldown(ext_ratio):
+            return max(base * 1.5, self.override_min_dist)
+        return base
+
+
+def compute_reach_schedule(reach_r, pos_err_norm, soft_start=0.24,
+                           soft_end=0.38, min_scale=0.48, dock_dist=0.25,
+                           ff_min_scale=0.50, lead_min_scale=0.30,
+                           accel_min_scale=0.65, deadband_on_boost=0.35,
+                           fast_start_boost=0.40):
+    """基于水平伸展半径的平滑稳定调度（近/中区全为 1.0，伸展区临界阻尼化）。
+
+    机械臂前伸时等效惯量 I ∝ r^2 增大、刚度下降且 MIT 滞后增加：
+    在保留大误差远距追赶能力的同时，随伸展度平滑衰减停靠速度、前馈、lead 与
+    最大加速度，并适度抬高静止防误唤醒门槛，防止伸展悬臂回弹引起往复晃动。
+    """
+    if (not math.isfinite(reach_r) or not math.isfinite(pos_err_norm)
+            or not math.isfinite(soft_start) or not math.isfinite(soft_end)):
+        return {
+            "ext_ratio": 0.0, "vel_att_target": 1.0, "ff_scale": 1.0,
+            "lead_scale": 1.0, "accel_scale": 1.0,
+            "deadband_on_scale": 1.0, "fast_start_dist_scale": 1.0,
+        }
+    span = max(float(soft_end) - float(soft_start), 1e-6)
+    ext_linear = float(np.clip((float(reach_r) - float(soft_start)) / span,
+                               0.0, 1.0))
+    ext_s = _smoothstep(ext_linear)
+    dock = float(np.clip(1.0 - max(0.0, float(pos_err_norm))
+                         / max(float(dock_dist), 1e-6), 0.0, 1.0))
+    min_s = float(np.clip(min_scale, 0.1, 1.0))
+    vel_att_target = 1.0 - (1.0 - min_s) * ext_s * dock
+    ff_s = 1.0 - (1.0 - float(np.clip(ff_min_scale, 0.1, 1.0))) * ext_s
+    lead_s = 1.0 - (1.0 - float(np.clip(lead_min_scale, 0.0, 1.0))) * ext_s
+    accel_s = 1.0 - (1.0 - float(np.clip(accel_min_scale, 0.2, 1.0))) * ext_s
+    db_scale = 1.0 + max(0.0, float(deadband_on_boost)) * ext_s
+    fs_scale = 1.0 + max(0.0, float(fast_start_boost)) * ext_s
+    return {
+        "ext_ratio": ext_s,
+        "vel_att_target": float(vel_att_target),
+        "ff_scale": float(ff_s),
+        "lead_scale": float(lead_s),
+        "accel_scale": float(accel_s),
+        "deadband_on_scale": float(db_scale),
+        "fast_start_dist_scale": float(fs_scale),
+    }
+
+
+class OscillationDamper:
+    """分轴闭环自激振荡检测与阻尼抑制器（专杀 1.2~2.5Hz 极限环，不伤正常快跟）。
+
+    原理：单程高速追赶（0 次换向）、单次快速折返（1~2 次换向）、大误差主动
+    追赶（|err| >= large_err_release）及正常人类慢挥手（半周期 > max_half_s）
+    均不会误触发，osc_level 恒为 0，零速度损耗；一旦某轴中小误差连续
+    ≥confirm_reversals 次在 [min_half_s, max_half_s]（机械臂 MIT 共振带）
+    内过零反转，该轴 osc_level 迅速拉起至 0.7~1.0，即时撤除该轴正向前馈与
+    额外 lead、封锁 Q 放大并削减比例增益，1 个半周期内将自激极限环压死。
+    """
+
+    def __init__(self, err_thresh=0.018, min_half_s=0.14, max_half_s=0.42,
+                 decay_tau_s=0.55, confirm_reversals=3,
+                 large_err_release=0.15, enabled=True):
+        self.err_thresh = float(err_thresh)
+        self.min_half_s = float(min_half_s)
+        self.max_half_s = float(max_half_s)
+        self.decay_tau_s = float(decay_tau_s)
+        self.confirm_reversals = int(confirm_reversals)
+        self.large_err_release = float(large_err_release)
+        self.enabled = bool(enabled)
+        if (not math.isfinite(self.err_thresh) or self.err_thresh <= 0.0
+                or not math.isfinite(self.min_half_s) or self.min_half_s <= 0.0
+                or not math.isfinite(self.max_half_s)
+                or self.max_half_s <= self.min_half_s
+                or not math.isfinite(self.decay_tau_s)
+                or self.decay_tau_s <= 0.0
+                or self.confirm_reversals < 2
+                or not math.isfinite(self.large_err_release)
+                or self.large_err_release <= self.err_thresh):
+            raise ValueError("振荡阻尼器阈值/周期/确认次数/衰减常数不合法")
+        self.last_sign = np.zeros(3, dtype=int)
+        self.last_flip_t = np.full(3, -1e9, dtype=np.float64)
+        self.streak = np.zeros(3, dtype=int)
+        self.levels = np.zeros(3, dtype=np.float64)
+
+    def reset(self):
+        self.last_sign[:] = 0
+        self.last_flip_t[:] = -1e9
+        self.streak[:] = 0
+        self.levels[:] = 0.0
+
+    def update(self, error_vec, now, dt, active=True):
+        if not self.enabled or not active:
+            self.reset()
+            return self.levels.copy()
+        try:
+            err = np.asarray(error_vec, dtype=np.float64)
+            t_now = float(now)
+            step = float(dt)
+        except (TypeError, ValueError):
+            self.reset()
+            return self.levels.copy()
+        if (err.shape != (3,) or not np.all(np.isfinite(err))
+                or not math.isfinite(t_now) or not math.isfinite(step)):
+            self.reset()
+            return self.levels.copy()
+
+        step_pos = max(step, 0.0)
+        decay = math.exp(-step_pos / self.decay_tau_s)
+        fast_decay = math.exp(-step_pos / max(self.decay_tau_s * 0.25, 0.05))
+        for ax in range(3):
+            v = float(err[ax])
+            if abs(v) >= self.large_err_release:
+                # 误差拉开到大追赶区间，说明是人手主动大幅移动而非原地极限环：
+                # 清零反转连击并以 4 倍速释放残留阻尼，避免拖慢主动追手。
+                self.levels[ax] *= fast_decay
+                self.streak[ax] = 0
+                sign = 1 if v > 0.0 else -1
+                if self.last_sign[ax] != sign:
+                    self.last_sign[ax] = sign
+                    self.last_flip_t[ax] = t_now
+                continue
+            self.levels[ax] *= decay
+            if abs(v) < self.err_thresh:
+                continue
+            sign = 1 if v > 0.0 else -1
+            if self.last_sign[ax] == 0:
+                self.last_sign[ax] = sign
+                self.last_flip_t[ax] = t_now
+            elif sign != self.last_sign[ax]:
+                half_p = t_now - self.last_flip_t[ax]
+                if self.min_half_s <= half_p <= self.max_half_s:
+                    self.streak[ax] += 1
+                    if self.streak[ax] >= self.confirm_reversals:
+                        self.levels[ax] = min(1.0, self.levels[ax] + 0.70)
+                else:
+                    self.streak[ax] = 0
+                self.last_sign[ax] = sign
+                self.last_flip_t[ax] = t_now
+            elif t_now - self.last_flip_t[ax] > self.max_half_s * 1.4:
+                self.streak[ax] = 0
+        self.levels[self.levels < 0.02] = 0.0
+        return self.levels.copy()
+
+
+

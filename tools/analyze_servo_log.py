@@ -117,33 +117,37 @@ def summarize(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("log", type=Path)
+    parser.add_argument("log", type=Path, nargs="+", help="一个或多个 servo CSV 日志文件")
     parser.add_argument("--json", action="store_true", help="输出 JSON 便于 A/B 脚本处理")
     args = parser.parse_args()
-    result = summarize(args.log)
+    results = [summarize(p) for p in args.log]
     if args.json:
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        payload = results[0] if len(results) == 1 else results
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
-    print(f"日志: {result['file']}")
-    print(f"样本: {result['samples']}，时长: {result['duration_s']:.2f}s，"
-          f"跟随/运动/锁存: {result['active_samples']}/{result['moving_samples']}/{result['static_samples']}")
-    print(f"运动误差 median/p95: {result['moving_error_median_m']} / {result['moving_error_p95_m']} m")
-    print(f"稳态静止(扣除0.30s停靠)关节速度 p95: {result['static_joint_speed_p95_rad_s']} rad/s，"
-          f">0.05 比例: {result['static_nonzero_ratio']}")
-    print(f"停手稳定时间 median: {result['stop_settle_median_s']} s（{result['stop_settle_events']} 次）")
-    print(f"观测年龄/处理/控制计算 p95: {result['obs_age_p95_ms']} / "
-          f"{result['processing_p95_ms']} / {result['control_work_p95_ms']} ms")
-    print(f"控制超时比例: {result['overrun_ratio']:.4f}，慢速通道样本: {result['slow_follow_samples']}，"
-          f"静止保持样本: {result['static_hold_samples']}")
-    print(f"硬件时间使用比例: {result['hardware_time_ratio']}，错误: {result['errors']}")
-    print(f"实际反馈: 有效日志行/独立样本 {result['feedback_valid_rows']}/"
-          f"{result['feedback_samples']}，同步读取 p95: {result['feedback_read_p95_ms']} ms")
-    print(f"采样点六轴最大跟踪误差 median/p95/max: "
-          f"{result['feedback_tracking_median_rad']} / "
-          f"{result['feedback_tracking_p95_rad']} / "
-          f"{result['feedback_tracking_max_rad']} rad")
-    if result["feedback_samples"]:
-        print("注意：低频反馈用于观察跟踪误差趋势，不能据此精确测量执行延迟。")
+    for idx, result in enumerate(results):
+        if idx > 0:
+            print("-" * 60)
+        print(f"日志: {result['file']}")
+        print(f"样本: {result['samples']}，时长: {result['duration_s']:.2f}s，"
+              f"跟随/运动/锁存: {result['active_samples']}/{result['moving_samples']}/{result['static_samples']}")
+        print(f"运动误差 median/p95: {result['moving_error_median_m']} / {result['moving_error_p95_m']} m")
+        print(f"稳态静止(扣除0.30s停靠)关节速度 p95: {result['static_joint_speed_p95_rad_s']} rad/s，"
+              f">0.05 比例: {result['static_nonzero_ratio']}")
+        print(f"停手稳定时间 median: {result['stop_settle_median_s']} s（{result['stop_settle_events']} 次）")
+        print(f"观测年龄/处理/控制计算 p95: {result['obs_age_p95_ms']} / "
+              f"{result['processing_p95_ms']} / {result['control_work_p95_ms']} ms")
+        print(f"控制超时比例: {result['overrun_ratio']:.4f}，慢速通道样本: {result['slow_follow_samples']}，"
+              f"静止保持样本: {result['static_hold_samples']}")
+        print(f"硬件时间使用比例: {result['hardware_time_ratio']}，错误: {result['errors']}")
+        print(f"实际反馈: 有效日志行/独立样本 {result['feedback_valid_rows']}/"
+              f"{result['feedback_samples']}，同步读取 p95: {result['feedback_read_p95_ms']} ms")
+        print(f"采样点六轴最大跟踪误差 median/p95/max: "
+              f"{result['feedback_tracking_median_rad']} / "
+              f"{result['feedback_tracking_p95_rad']} / "
+              f"{result['feedback_tracking_max_rad']} rad")
+        if result["feedback_samples"]:
+            print("注意：低频反馈用于观察跟踪误差趋势，不能据此精确测量执行延迟。")
 
 
 if __name__ == "__main__":
