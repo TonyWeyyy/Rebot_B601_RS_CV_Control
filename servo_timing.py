@@ -2,6 +2,7 @@
 """视觉伺服的时间与状态切换工具（纯计算，无硬件依赖）。"""
 
 import math
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -897,9 +898,21 @@ class OscillationDamper:
         self.streak[:] = 0
         self.levels[:] = 0.0
 
-    def update(self, error_vec, now, dt, active=True):
-        if not self.enabled or not active:
+    def update(self, error_vec, now, dt, active=True, hard_reset=False):
+        if not self.enabled or hard_reset:
             self.reset()
+            return self.levels.copy()
+        if not active:
+            # 短暂停手/锁存/深度冻结期间只做平滑衰减而不清零连击记忆：
+            # 避免 100ms 短暂回弹误解锁后连击归零、被迫多晃 3~4 个半周期。
+            # 若静止持续超过 max_half_s * 1.4，下一次激活时 half_p 超窗会自动清零。
+            try:
+                step = max(float(dt), 0.0)
+            except (TypeError, ValueError):
+                step = 0.0
+            if math.isfinite(step) and step > 0.0:
+                self.levels *= math.exp(-step / self.decay_tau_s)
+                self.levels[self.levels < 0.02] = 0.0
             return self.levels.copy()
         try:
             err = np.asarray(error_vec, dtype=np.float64)
@@ -949,6 +962,367 @@ class OscillationDamper:
                 self.streak[ax] = 0
         self.levels[self.levels < 0.02] = 0.0
         return self.levels.copy()
+
+
+def _so3_log(R):
+    """SO(3) 对数映射：旋转矩阵 -> 3D 轴角向量。"""
+    trace = float(np.clip((np.trace(R) - 1.0) * 0.5, -1.0, 1.0))
+    theta = math.acos(trace)
+    if theta < 1e-6:
+        return 0.5 * np.array([
+            R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]],
+            dtype=np.float64)
+    if math.pi - theta < 1e-3:
+        S = (R + np.eye(3)) * 0.5
+        axis = np.array([
+            math.sqrt(max(float(S[0, 0]), 0.0)),
+            math.sqrt(max(float(S[1, 1]), 0.0)),
+            math.sqrt(max(float(S[2, 2]), 0.0))], dtype=np.float64)
+        axis[1] = math.copysign(axis[1], float(R[0, 1] + R[1, 0]))
+        axis[2] = math.copysign(axis[2], float(R[0, 2] + R[2, 0]))
+        n = float(np.linalg.norm(axis))
+        return np.zeros(3) if n < 1e-9 else theta * (axis / n)
+    scale = theta / (2.0 * math.sin(theta))
+    return scale * np.array([
+        R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]],
+        dtype=np.float64)
+
+
+def _so3_exp(w):
+    """SO(3) 指数映射：3D 轴角向量 -> 旋转矩阵（Rodrigues 公式）。"""
+    theta = float(np.linalg.norm(w))
+    if theta < 1e-8:
+        K = np.array([[0.0, -w[2], w[1]],
+                      [w[2], 0.0, -w[0]],
+                      [-w[1], w[0], 0.0]], dtype=np.float64)
+        return np.eye(3) + K + 0.5 * (K @ K)
+    a = w / theta
+    K = np.array([[0.0, -a[2], a[1]],
+                  [a[2], 0.0, -a[0]],
+                  [-a[1], a[0], 0.0]], dtype=np.float64)
+    return np.eye(3) + math.sin(theta) * K + (1.0 - math.cos(theta)) * (K @ K)
+
+
+def _so3_interp(R0, R1, u):
+    """SO(3) 测地线球面插值：u=0 -> R0, u=1 -> R1。"""
+    u = float(np.clip(u, 0.0, 1.0))
+    if u <= 0.0:
+        return R0.copy()
+    if u >= 1.0:
+        return R1.copy()
+    w = _so3_log(R0.T @ R1)
+    return R0 @ _so3_exp(u * w)
+
+
+class CameraPoseHistory:
+    """带时间戳与一阶低通的相机世界位姿环形缓冲（L1 世界系 KF + Smith 预估器用）。
+
+    - push() 记录每个 100Hz 控制周期下发的相机世界位姿 (p_cam, R_cam)，并同步维护
+      低通平滑位姿 (p_lpf, R_lpf) 以匹配物理 MIT 二阶机电上升时间。
+    - lookup(t_query, use_lpf=True) 按线性+SO(3) 测地插值查表，把相机系 3D 掌心观测
+      对齐到成像时刻 `meas_time - pose_delay_s` 投影至基座世界系，从几何上精确消除
+      eye-in-hand 相机自运动。
+    - blended_pose(t_now, delay_s, smith_blend) 在历史滞后位姿与当前最新指令位姿间
+      插值，反投影世界系估计回相机系作为 Smith 预估控制误差，天然吸收 140ms 在途指令
+      并保持静态重力下垂零稳态偏差。
+    """
+
+    def __init__(self, lpf_tau_s=0.04, max_history_s=0.60):
+        self.lpf_tau_s = float(lpf_tau_s)
+        self.max_history_s = float(max_history_s)
+        if (not math.isfinite(self.lpf_tau_s) or self.lpf_tau_s < 0.0
+                or not math.isfinite(self.max_history_s)
+                or self.max_history_s <= 0.05):
+            raise ValueError("相机位姿历史缓冲参数不合法")
+        self._buf = []   # [(t, p_raw, R_raw, p_lpf, R_lpf), ...]
+        self._p_lpf = None
+        self._R_lpf = None
+        self._last_t = None
+
+    def reset(self):
+        self._buf.clear()
+        self._p_lpf = None
+        self._R_lpf = None
+        self._last_t = None
+
+    def has_data(self):
+        return len(self._buf) > 0
+
+    def push(self, now, tcp_pos, tcp_rot, T_tcp_camera, dt=0.01):
+        try:
+            t_now = float(now)
+            step = float(dt)
+            p_tcp = np.asarray(tcp_pos, dtype=np.float64)
+            R_tcp = np.asarray(tcp_rot, dtype=np.float64)
+            T_tc = np.asarray(T_tcp_camera, dtype=np.float64)
+        except (TypeError, ValueError):
+            return False
+        if (not math.isfinite(t_now) or not math.isfinite(step)
+                or p_tcp.shape != (3,) or R_tcp.shape != (3, 3)
+                or T_tc.shape != (4, 4)
+                or not np.all(np.isfinite(p_tcp))
+                or not np.all(np.isfinite(R_tcp))
+                or not np.all(np.isfinite(T_tc))):
+            return False
+        if step <= 0.0:
+            step = 0.01
+        if self._last_t is not None and t_now < self._last_t - 0.5:
+            self.reset()
+        elif self._last_t is not None and t_now <= self._last_t:
+            t_now = self._last_t + max(step, 1e-4)
+
+        p_raw = p_tcp + R_tcp @ T_tc[:3, 3]
+        R_raw = R_tcp @ T_tc[:3, :3]
+        if self._p_lpf is None or self.lpf_tau_s <= 1e-4:
+            self._p_lpf = p_raw.copy()
+            self._R_lpf = R_raw.copy()
+        else:
+            alpha = 1.0 - math.exp(-step / self.lpf_tau_s)
+            self._p_lpf = self._p_lpf + (p_raw - self._p_lpf) * alpha
+            self._R_lpf = _so3_interp(self._R_lpf, R_raw, alpha)
+
+        self._buf.append((t_now, p_raw.copy(), R_raw.copy(),
+                          self._p_lpf.copy(), self._R_lpf.copy()))
+        self._last_t = t_now
+        cutoff = t_now - self.max_history_s
+        while len(self._buf) > 2 and self._buf[1][0] < cutoff:
+            self._buf.pop(0)
+        return True
+
+    def latest(self, use_lpf=False):
+        if not self._buf:
+            return None, None
+        item = self._buf[-1]
+        if use_lpf:
+            return item[3].copy(), item[4].copy()
+        return item[1].copy(), item[2].copy()
+
+    def lookup(self, t_query, use_lpf=True):
+        if not self._buf:
+            return None, None
+        p_idx, r_idx = (3, 4) if use_lpf else (1, 2)
+        tq = float(t_query) if math.isfinite(float(t_query)) else self._buf[-1][0]
+        if tq <= self._buf[0][0]:
+            return self._buf[0][p_idx].copy(), self._buf[0][r_idx].copy()
+        if tq >= self._buf[-1][0]:
+            return self._buf[-1][p_idx].copy(), self._buf[-1][r_idx].copy()
+        for i in range(len(self._buf) - 1, 0, -1):
+            t1 = self._buf[i][0]
+            t0 = self._buf[i - 1][0]
+            if t0 <= tq <= t1:
+                u = (tq - t0) / max(t1 - t0, 1e-9)
+                p = self._buf[i - 1][p_idx] + (
+                    self._buf[i][p_idx] - self._buf[i - 1][p_idx]) * u
+                R = _so3_interp(self._buf[i - 1][r_idx], self._buf[i][r_idx], u)
+                return p, R
+        return self._buf[-1][p_idx].copy(), self._buf[-1][r_idx].copy()
+
+    def blended_pose(self, t_now, delay_s, smith_blend):
+        """在滞后位姿 (t_now - delay_s) 与最新位姿 (t_now) 之间按 smith_blend 插值。"""
+        if not self._buf:
+            return None, None
+        blend = float(np.clip(smith_blend, 0.0, 1.0)) if math.isfinite(smith_blend) else 0.0
+        p_now, R_now = self.latest(use_lpf=False)
+        if blend >= 1.0 or delay_s <= 1e-4:
+            return p_now, R_now
+        p_del, R_del = self.lookup(float(t_now) - max(0.0, float(delay_s)), use_lpf=True)
+        if blend <= 0.0:
+            return p_del, R_del
+        p = p_del + (p_now - p_del) * blend
+        R = _so3_interp(R_del, R_now, blend)
+        return p, R
+
+
+def compute_orientation_cruise_weight(pos_err_norm, ori_err_norm,
+                                      min_weight=0.40, start_err=0.08,
+                                      full_err=0.18,
+                                      ori_soft_max_rad=math.radians(10.0),
+                                      active=True):
+    """大误差巡航段姿态软优先级权重（L1-B：释放被 J4 拖慢的大臂速度）。
+
+    - 停靠/静止段（pos_err_norm <= start_err）或未激活时恒返 1.0（完全刚性保持姿态）；
+    - 大误差高速追赶段平滑下调至 min_weight，减少 J4 强行抵消 J2+J3 的速度占用；
+    - 当姿态偏差接近 ori_soft_max_rad 时平滑拉回 1.0，确保相机绝不过度偏转丢手。
+    """
+    if not active:
+        return 1.0
+    try:
+        pe = float(pos_err_norm)
+        oe = float(ori_err_norm)
+        mw = float(min_weight)
+        se = float(start_err)
+        fe = float(full_err)
+        omax = float(ori_soft_max_rad)
+    except (TypeError, ValueError):
+        return 1.0
+    if (not all(math.isfinite(x) for x in (pe, oe, mw, se, fe, omax))
+            or mw >= 1.0 or omax <= 1e-4):
+        return 1.0
+    mw = float(np.clip(mw, 0.15, 1.0))
+    if pe <= se or oe >= omax:
+        return 1.0
+    pos_t = float(np.clip((pe - se) / max(fe - se, 1e-6), 0.0, 1.0))
+    pos_s = _smoothstep(pos_t)
+    # 姿态偏离超过软上限的一半时，平滑撤销让权，保护视野
+    ori_t = float(np.clip((oe - 0.5 * omax) / max(0.5 * omax, 1e-6), 0.0, 1.0))
+    ori_guard = 1.0 - _smoothstep(ori_t)
+    return float(1.0 - (1.0 - mw) * pos_s * ori_guard)
+
+
+def compute_weighted_damped_pseudoinverse(J, row_weights, damping=0.01):
+    """行加权阻尼最小二乘伪逆：求解 min ||W (J dq - v)||^2 + lambda^2 ||dq||^2。
+
+    当 row_weights 全为 1.0 时与标准阻尼伪逆数学恒等。
+    """
+    J_arr = np.asarray(J, dtype=np.float64)
+    w = np.asarray(row_weights, dtype=np.float64)
+    if (J_arr.ndim != 2 or w.shape != (J_arr.shape[0],)
+            or not np.all(np.isfinite(J_arr))
+            or not np.all(np.isfinite(w)) or np.any(w <= 0.0)):
+        return np.zeros((J_arr.shape[1], J_arr.shape[0]), dtype=np.float64)
+    m = J_arr.shape[0]
+    J_w = w[:, None] * J_arr
+    JJT = J_w @ J_w.T
+    d = float(damping) if (math.isfinite(float(damping)) and damping > 0.0) else 0.01
+    try:
+        inv_term = np.linalg.inv(JJT + (d ** 2) * np.eye(m))
+    except np.linalg.LinAlgError:
+        inv_term = np.linalg.inv(JJT + ((d * 10.0) ** 2) * np.eye(m))
+    return (J_w.T @ inv_term) * w[None, :]
+
+
+def consensus_velocity(v_world_cam, v_twist_cam):
+    """双估计器保守共识速度（世界系 KF 与延迟低通 Twist 补偿器的逐轴交集）。
+
+    - 真实人手移动时，世界系 KF 速度与自运动补偿速度方向一致、幅值相近，完整保留追手速度；
+    - 机械臂急停回弹或 1.7~2.0Hz 欠阻尼共振时，单点查表的世界系 KF 可能漏出 0.3~0.5m/s
+      假速度，而带 ±40ms 局部容错窗的 Twist 补偿器已将其压至近零；逐轴取同向较小幅值
+      （异向直接置零）可同时保留两套观测器的抗自运动优势，彻底根除停手二次误解锁。
+    """
+    try:
+        a = np.asarray(v_world_cam, dtype=np.float64)
+        b = np.asarray(v_twist_cam, dtype=np.float64)
+    except (TypeError, ValueError):
+        return np.zeros(3, dtype=np.float64)
+    if (a.shape != (3,) or b.shape != (3,)
+            or not np.all(np.isfinite(a)) or not np.all(np.isfinite(b))):
+        return np.zeros(3, dtype=np.float64)
+    out = np.zeros(3, dtype=np.float64)
+    for ax in range(3):
+        va, vb = float(a[ax]), float(b[ax])
+        if va * vb > 0.0:
+            out[ax] = math.copysign(min(abs(va), abs(vb)), va)
+    return out
+
+
+def apply_joint_limit_cushion(q_now, joint_vel, q_min, q_max, margin_rad=0.08):
+    """关节软限位缓冲：接近 q_min/q_max 最后 margin_rad 内平滑收紧外推速度。
+
+    防止 J3/J4 高速顶死适配层硬截断（例如 q4 撞 +1.40rad 软墙时造成 10° 突变俯仰冲击），
+    离开限位方向的速度完全不衰减。
+    """
+    try:
+        q = np.asarray(q_now, dtype=np.float64)
+        dq = np.asarray(joint_vel, dtype=np.float64).copy()
+        lo = np.asarray(q_min, dtype=np.float64)
+        hi = np.asarray(q_max, dtype=np.float64)
+        margin = float(margin_rad)
+    except (TypeError, ValueError):
+        return np.zeros(6, dtype=np.float64), False
+    if (q.ndim != 1 or dq.shape != q.shape or lo.shape != q.shape
+            or hi.shape != q.shape or not np.all(np.isfinite(q))
+            or not np.all(np.isfinite(dq)) or not np.all(np.isfinite(lo))
+            or not np.all(np.isfinite(hi)) or not math.isfinite(margin)
+            or margin <= 0.0):
+        return np.zeros_like(dq) if dq.ndim == 1 else np.zeros(6), False
+    cushioned = False
+    for i in range(q.size):
+        if dq[i] > 0.0:
+            rem = hi[i] - q[i]
+            if rem < margin:
+                dq[i] *= float(np.clip(rem / margin, 0.0, 1.0))
+                cushioned = True
+        elif dq[i] < 0.0:
+            rem = q[i] - lo[i]
+            if rem < margin:
+                dq[i] *= float(np.clip(rem / margin, 0.0, 1.0))
+                cushioned = True
+    return dq, cushioned
+
+
+def compute_roi_box(frame_w, frame_h, center_uv, prev_box=None,
+                    scale=0.68, min_size=288, margin_ratio=0.26):
+    """计算带迟滞死区的方形 ROI 裁剪框 (x0, y0, x1, y1)，用于加速 MediaPipe 推理。
+
+    - 掌心仍处于上一帧 ROI 内部安全边距（margin_ratio）以内时，保持原裁剪框完全不动，
+      避免每帧微移裁剪框干扰 MediaPipe VIDEO 模式内部跨帧跟踪；
+    - 掌心靠近边缘时重新以掌心居中并钳位到画面边界内；
+    - center_uv 无效或裁剪边长接近全图短边时返回 None（走全图推理）。
+    """
+    try:
+        w = int(frame_w)
+        h = int(frame_h)
+        sc = float(scale)
+        ms = int(min_size)
+        mr = float(margin_ratio)
+    except (TypeError, ValueError):
+        return None
+    if (w <= 0 or h <= 0 or center_uv is None
+            or not math.isfinite(sc) or not math.isfinite(mr)):
+        return None
+    try:
+        u, v = float(center_uv[0]), float(center_uv[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not (math.isfinite(u) and math.isfinite(v)):
+        return None
+
+    short_side = min(w, h)
+    size = min(short_side, max(ms, int(round(short_side * float(np.clip(sc, 0.45, 0.90))))))
+    size = size - (size % 2)
+    if size <= 0 or size >= short_side - 8:
+        return None
+
+    if prev_box is not None and len(prev_box) == 4:
+        px0, py0, px1, py1 = (int(prev_box[0]), int(prev_box[1]),
+                              int(prev_box[2]), int(prev_box[3]))
+        if (0 <= px0 < px1 <= w and 0 <= py0 < py1 <= h
+                and (px1 - px0) == size and (py1 - py0) == size):
+            margin = size * float(np.clip(mr, 0.10, 0.40))
+            if (px0 + margin <= u <= px1 - margin
+                    and py0 + margin <= v <= py1 - margin):
+                return (px0, py0, px1, py1)
+
+    half = size // 2
+    x0 = int(round(u)) - half
+    y0 = int(round(v)) - half
+    x0 = max(0, min(w - size, x0))
+    y0 = max(0, min(h - size, y0))
+    return (x0, y0, x0 + size, y0 + size)
+
+
+def remap_roi_landmarks(landmarks, roi_box, frame_w, frame_h):
+    """将 ROI 局部归一化关键点精确映射回全图归一化坐标，保证捏合距离与绘制完全一致。"""
+    if not landmarks or roi_box is None:
+        return landmarks
+    x0, y0, x1, y1 = roi_box
+    roi_w = float(x1 - x0)
+    roi_h = float(y1 - y0)
+    fw = float(frame_w)
+    fh = float(frame_h)
+    if roi_w <= 0.0 or roi_h <= 0.0 or fw <= 0.0 or fh <= 0.0:
+        return landmarks
+    z_scale = roi_w / fw
+    return [
+        SimpleNamespace(
+            x=(x0 + float(lm.x) * roi_w) / fw,
+            y=(y0 + float(lm.y) * roi_h) / fh,
+            z=float(getattr(lm, "z", 0.0)) * z_scale)
+        for lm in landmarks
+    ]
+
+
+
 
 
 

@@ -96,6 +96,34 @@ class KalmanTarget3D:
         self.x += K @ (meas - self.H @ self.x)
         self.P = (np.eye(6) - K @ self.H) @ self.P
 
+    def update_partial(self, meas_sub, H_pos, dt, r_diag=None):
+        """分轴/子空间观测更新（深度冻结期间仅用新鲜 2D 的 XY 更新，绝不污染 Z）。
+
+        meas_sub: (m,) 观测向量；H_pos: (m, 3) 位置观测矩阵；
+        未初始化时不执行更新（必须等待首帧有效完整 3D 初始化）。
+        """
+        if not self.initialized:
+            return False
+        z = np.asarray(meas_sub, dtype=np.float64)
+        Hp = np.asarray(H_pos, dtype=np.float64)
+        if (z.ndim != 1 or Hp.ndim != 2 or Hp.shape != (z.size, 3)
+                or z.size == 0 or not np.all(np.isfinite(z))
+                or not np.all(np.isfinite(Hp))):
+            return False
+        r_vec = (np.full(z.size, self.r_vector[0], dtype=np.float64)
+                 if r_diag is None else np.asarray(r_diag, dtype=np.float64))
+        if (r_vec.shape != (z.size,) or not np.all(np.isfinite(r_vec))
+                or np.any(r_vec <= 0.0)):
+            return False
+        self.predict(dt)
+        H_sub = np.zeros((z.size, 6), dtype=np.float64)
+        H_sub[:, :3] = Hp
+        S = H_sub @ self.P @ H_sub.T + np.diag(r_vec)
+        K = self.P @ H_sub.T @ np.linalg.inv(S)
+        self.x += K @ (z - H_sub @ self.x)
+        self.P = (np.eye(6) - K @ H_sub) @ self.P
+        return True
+
     def position(self):
         return self.x[:3].copy()
 

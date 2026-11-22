@@ -16,7 +16,12 @@ from servo_timing import (AdaptiveLeadGate, FastStartGate, SlowFollowGate,
                           CameraTimestampCalibrator, AxisProcessNoiseGate,
                           StaticVelocityHold, DelayedTwistCompensator,
                           PostBrakeSettleGuard, OscillationDamper,
+                          CameraPoseHistory,
                           compute_reach_schedule,
+                          compute_orientation_cruise_weight,
+                          compute_weighted_damped_pseudoinverse,
+                          consensus_velocity, apply_joint_limit_cushion,
+                          compute_roi_box, remap_roi_landmarks,
                           adaptive_feedforward_scale,
                           apply_axis_reversal_damping, scale_joint_velocities,
                           camera_twist_from_tcp, compensate_palm_velocity,
@@ -888,6 +893,225 @@ class OscillationDamperTests(unittest.TestCase):
         np.testing.assert_array_equal(out, np.zeros(3))
         with self.assertRaises(ValueError):
             OscillationDamper(min_half_s=0.5, max_half_s=0.3)
+
+
+class CameraPoseHistoryTests(unittest.TestCase):
+    def test_static_world_point_invariant_under_translating_rotating_camera(self):
+        hist = CameraPoseHistory(lpf_tau_s=0.0, max_history_s=0.60)
+        T_tc = np.eye(4)
+        T_tc[:3, 3] = np.array([0.02, -0.01, 0.05])
+        world_hand = np.array([0.35, 0.12, 0.55])
+        delay_s = 0.14
+
+        def pose_at(tau):
+            p = np.array([0.10 + 0.30 * tau, 0.05 * np.sin(3.0 * tau), 0.30])
+            ang = 0.25 * tau
+            c, s = np.cos(ang), np.sin(ang)
+            R = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+            return p, R
+
+        for k in range(50):
+            t = k * 0.01
+            p_cmd, R_cmd = pose_at(t)
+            self.assertTrue(hist.push(t, p_cmd, R_cmd, T_tc, dt=0.01))
+            if t >= delay_s + 0.02:
+                # 物理相机实际位姿落后命令 delay_s
+                p_phys, R_phys = pose_at(t - delay_s)
+                p_cam_phys = p_phys + R_phys @ T_tc[:3, 3]
+                R_cam_phys = R_phys @ T_tc[:3, :3]
+                obs_cam = R_cam_phys.T @ (world_hand - p_cam_phys)
+                p_lu, R_lu = hist.lookup(t - delay_s, use_lpf=True)
+                # 旋转矩阵必须保持正交且 det=+1
+                np.testing.assert_allclose(R_lu.T @ R_lu, np.eye(3), atol=1e-6)
+                self.assertAlmostEqual(float(np.linalg.det(R_lu)), 1.0, places=6)
+                reconstructed_world = p_lu + R_lu @ obs_cam
+                np.testing.assert_allclose(
+                    reconstructed_world, world_hand, atol=2e-3)
+
+    def test_blended_pose_interpolates_and_handles_invalid_inputs(self):
+        hist = CameraPoseHistory(lpf_tau_s=0.0, max_history_s=0.50)
+        T_tc = np.eye(4)
+        for k in range(25):
+            t = k * 0.01
+            hist.push(t, np.array([t, 0.0, 0.0]), np.eye(3), T_tc, dt=0.01)
+        p0, _ = hist.blended_pose(0.24, 0.14, 0.0)
+        p1, _ = hist.blended_pose(0.24, 0.14, 1.0)
+        pm, _ = hist.blended_pose(0.24, 0.14, 0.5)
+        self.assertAlmostEqual(p0[0], 0.10, places=4)
+        self.assertAlmostEqual(p1[0], 0.24, places=4)
+        self.assertAlmostEqual(pm[0], 0.17, places=4)
+        self.assertFalse(hist.push(0.25, np.array([np.nan, 0.0, 0.0]),
+                                   np.eye(3), T_tc, dt=0.01))
+
+
+class OrientationPriorityAndJointLimitsTests(unittest.TestCase):
+    def test_orientation_weight_relaxes_in_far_cruise_and_guards_tilt_limit(self):
+        # 停靠区或未激活：保持 1.0 刚性姿态
+        self.assertEqual(compute_orientation_cruise_weight(0.05, 0.01), 1.0)
+        self.assertEqual(compute_orientation_cruise_weight(
+            0.20, 0.01, active=False), 1.0)
+        # 大误差且小倾角：平滑下调至 min_weight=0.40
+        w_far = compute_orientation_cruise_weight(
+            0.20, np.deg2rad(2.0), min_weight=0.40,
+            ori_soft_max_rad=np.deg2rad(10.0))
+        self.assertAlmostEqual(w_far, 0.40, places=6)
+        # 倾角接近 10° 软上限：自动拉回 1.0 防止相机丢手
+        w_guard = compute_orientation_cruise_weight(
+            0.20, np.deg2rad(10.0), min_weight=0.40,
+            ori_soft_max_rad=np.deg2rad(10.0))
+        self.assertEqual(w_guard, 1.0)
+
+    def test_weighted_dls_matches_standard_at_unit_weight_and_frees_wrist(self):
+        # 构造类似 B601 的竖直+俯仰耦合雅可比：z 靠 J2/J3，俯仰由 J2+J3+J4 决定
+        J = np.eye(6, dtype=np.float64)
+        J[2, 1] = 0.25
+        J[2, 2] = 0.25
+        J[2, 2] = 0.20
+        J[4, 1] = 1.0
+        J[4, 2] = 1.0
+        J[4, 3] = 1.0
+        J[4, 4] = 0.0
+        J[3, 4] = 1.0
+        v = np.array([0.0, 0.0, 0.50, 0.0, 0.0, 0.0])
+        dq_rigid = compute_weighted_damped_pseudoinverse(
+            J, np.ones(6), damping=0.05) @ v
+        # 校验单位权重与标准伪逆恒等
+        JJT = J @ J.T
+        dq_std = J.T @ np.linalg.inv(JJT + (0.05 ** 2) * np.eye(6)) @ v
+        np.testing.assert_allclose(dq_rigid, dq_std, atol=1e-10)
+        # 降低姿态行权重后，平移速度仍高精度满足，且手腕 J4 负担下降
+        dq_soft = compute_weighted_damped_pseudoinverse(
+            J, np.array([1.0, 1.0, 1.0, 0.40, 0.40, 0.40]), damping=0.05) @ v
+        self.assertLess(abs(dq_soft[3]), abs(dq_rigid[3]))
+        self.assertAlmostEqual(float((J @ dq_soft)[2]), float((J @ dq_rigid)[2]), places=2)
+
+    def test_per_joint_vector_limits_free_wrist_without_exceeding_j2_j3(self):
+        limits = np.array([2.4, 2.0, 2.0, 2.8, 2.8, 2.2])
+        # J4=2.6, J2=1.5, J3=1.4：按统一 2.0 会把 J2/J3 砍到 1.15/1.08；按 L2 向量不限速
+        dq = np.array([1.8, 1.5, 1.4, 2.6, 1.8, 0.2])
+        scaled_l2 = scale_joint_velocities(dq, limits, grouped=False)
+        np.testing.assert_allclose(scaled_l2, dq, atol=1e-12)
+        # 一旦承重 J2 超 2.0，必须严格压回 <=2.0
+        dq_over = np.array([1.0, 2.5, 1.5, 2.6, 1.0, 0.0])
+        scaled_safe = scale_joint_velocities(dq_over, limits, grouped=False)
+        self.assertAlmostEqual(scaled_safe[1], 2.0, places=6)
+        self.assertTrue(np.all(np.abs(scaled_safe) <= limits + 1e-9))
+
+    def test_consensus_velocity_suppresses_single_estimator_leak(self):
+        # 真实运动：两估计器同向一致，取保守较小幅值
+        v_ok = consensus_velocity([0.45, -0.30, 0.10], [0.40, -0.35, 0.12])
+        np.testing.assert_allclose(v_ok, [0.40, -0.30, 0.10], atol=1e-9)
+        # 急停回弹/共振失配：一侧漏出 0.45m/s、一侧已压至 0.04m/s 或异向 -> 抑制
+        v_leak = consensus_velocity([0.45, -0.40, 0.20], [0.04, 0.15, 0.0])
+        np.testing.assert_allclose(v_leak, [0.04, 0.0, 0.0], atol=1e-9)
+        np.testing.assert_array_equal(
+            consensus_velocity([np.nan, 0.1, 0.0], [0.1, 0.1, 0.0]), np.zeros(3))
+
+    def test_joint_limit_cushion_softens_outward_and_preserves_inward(self):
+        q_min = np.array([-2.0, 0.0, 0.17, -1.40, -2.0, -2.0])
+        q_max = np.array([ 2.0, 2.0, 2.50,  1.40,  2.0,  2.0])
+        # J4 距上限 0.04rad（margin=0.08 -> 50%），J3 距下限 0.02rad（25%）
+        q_now = np.array([0.0, 1.0, 0.19, 1.36, 0.0, 0.0])
+        dq_out = np.array([1.0, 1.0, -2.0, 2.0, 0.0, 0.0])
+        out, flag = apply_joint_limit_cushion(q_now, dq_out, q_min, q_max, 0.08)
+        self.assertTrue(flag)
+        self.assertAlmostEqual(out[3], 1.0, places=6)   # 2.0 * (0.04/0.08)
+        self.assertAlmostEqual(out[2], -0.5, places=6)  # -2.0 * (0.02/0.08)
+        self.assertAlmostEqual(out[0], 1.0, places=6)
+        # 离开限位方向绝不衰减
+        dq_in = np.array([1.0, 1.0, 2.0, -2.0, 0.0, 0.0])
+        out_in, flag_in = apply_joint_limit_cushion(q_now, dq_in, q_min, q_max, 0.08)
+        self.assertFalse(flag_in)
+        np.testing.assert_allclose(out_in, dq_in, atol=1e-9)
+
+    def test_oscillation_damper_retains_memory_across_brief_stop_dip(self):
+        damper = OscillationDamper(err_thresh=0.018, min_half_s=0.14,
+                                   max_half_s=0.42, decay_tau_s=0.55,
+                                   confirm_reversals=3, large_err_release=0.15)
+        # 先产生 2 次 1.7Hz 过零反转（streak=2）
+        damper.update([0.06, 0.0, 0.0], 0.00, 0.01, active=True)
+        damper.update([-0.06, 0.0, 0.0], 0.25, 0.01, active=True)
+        damper.update([0.06, 0.0, 0.0], 0.50, 0.01, active=True)
+        self.assertEqual(damper.streak[0], 2)
+        # 短暂 100ms 停手（active=False, hard_reset=False）不得清零连击记忆
+        for k in range(10):
+            damper.update([0.01, 0.0, 0.0], 0.51 + k * 0.01, 0.01,
+                          active=False, hard_reset=False)
+        self.assertEqual(damper.streak[0], 2)
+        # 紧接着第 3 次反冲（t=0.75s，距上次翻转 0.25s）应立刻触发阻尼
+        lv = damper.update([-0.06, 0.0, 0.0], 0.75, 0.01, active=True)
+        self.assertGreaterEqual(lv[0], 0.65)
+        # hard_reset=True 必须彻底清零
+        lv_rst = damper.update([0.0, 0.0, 0.0], 0.76, 0.01,
+                               active=False, hard_reset=True)
+        self.assertEqual(damper.streak[0], 0)
+        np.testing.assert_array_equal(lv_rst, np.zeros(3))
+
+    def test_kf_partial_xy_update_tracks_xy_without_touching_frozen_z(self):
+        kf = KalmanTarget3D(q=2.0, r_xy=0.0023, r_z=0.0038)
+        # 未初始化时不得用部分观测强行初始化
+        self.assertFalse(kf.update_partial([0.1, 0.2], [[1, 0, 0], [0, 1, 0]], 0.02))
+        kf.update([0.0, 0.0, 0.40], 0.0)
+        kf.x[5] = 0.0
+        # 模拟 10 帧深度冻结期间，手掌沿 X/Y 高速移动，仅更新 XY
+        H_xy = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        for k in range(1, 11):
+            t = k * 0.02
+            ok = kf.update_partial([0.40 * t, -0.30 * t], H_xy, 0.02)
+            self.assertTrue(ok)
+        # X/Y 位置与速度已紧跟移动，Z 位置和 Z 速度丝毫未被污染
+        self.assertAlmostEqual(kf.position()[2], 0.40, places=9)
+        self.assertAlmostEqual(kf.velocity()[2], 0.0, places=9)
+        self.assertGreater(kf.position()[0], 0.06)
+        self.assertGreater(kf.velocity()[0], 0.25)
+        self.assertLess(kf.velocity()[1], -0.18)
+        # 旋转子空间（世界系相机 XY 平面）验证：沿光轴方向的深度分量保持不变
+        kf_w = KalmanTarget3D(q=2.0, r_xy=0.0023, r_z=0.0038)
+        kf_w.update([0.0, 0.0, 0.50], 0.0)
+        ang = np.deg2rad(30.0)
+        R = np.array([[np.cos(ang), 0.0, np.sin(ang)],
+                      [0.0, 1.0, 0.0],
+                      [-np.sin(ang), 0.0, np.cos(ang)]])
+        H_w = R[:, :2].T
+        opt_axis = R[:, 2]
+        z_before = float(np.dot(opt_axis, kf_w.position()))
+        self.assertTrue(kf_w.update_partial([0.10, 0.05], H_w, 0.02))
+        z_after = float(np.dot(opt_axis, kf_w.position()))
+        self.assertAlmostEqual(z_after, z_before, places=9)
+
+    def test_roi_box_hysteresis_and_exact_landmark_remapping(self):
+        # 640x480 画面下 scale=0.68 -> 约 326x326 ROI
+        box1 = compute_roi_box(640, 480, (320, 240), prev_box=None, scale=0.68)
+        self.assertIsNotNone(box1)
+        x0, y0, x1, y1 = box1
+        self.assertEqual(x1 - x0, y1 - y0)
+        self.assertLess(x1 - x0, 400)
+        # 掌心在安全死区内小幅移动：ROI 框必须完全不动，避免干扰 VIDEO 内部追踪
+        box2 = compute_roi_box(640, 480, (345, 255), prev_box=box1, scale=0.68)
+        self.assertEqual(box2, box1)
+        # 掌心逼近边缘：自动重新居中且严格钳位在画面内
+        box3 = compute_roi_box(640, 480, (610, 460), prev_box=box1, scale=0.68)
+        self.assertNotEqual(box3, box1)
+        self.assertEqual(box3[2], 640)
+        self.assertEqual(box3[3], 480)
+        self.assertIsNone(compute_roi_box(640, 480, None))
+        # ROI 关键点映射回全图归一化坐标后，像素位置与捏合距离必须与全图 100% 一致
+        roi_w = box1[2] - box1[0]
+        roi_h = box1[3] - box1[1]
+        # 假设全图某两点像素为 (300, 220) 与 (360, 250)
+        lm_a = types.SimpleNamespace(
+            x=(300.0 - box1[0]) / roi_w, y=(220.0 - box1[1]) / roi_h, z=-0.05)
+        lm_b = types.SimpleNamespace(
+            x=(360.0 - box1[0]) / roi_w, y=(250.0 - box1[1]) / roi_h, z=-0.05)
+        remapped = remap_roi_landmarks([lm_a, lm_b], box1, 640, 480)
+        self.assertAlmostEqual(remapped[0].x * 640.0, 300.0, places=6)
+        self.assertAlmostEqual(remapped[0].y * 480.0, 220.0, places=6)
+        self.assertAlmostEqual(remapped[1].x * 640.0, 360.0, places=6)
+        self.assertAlmostEqual(remapped[1].y * 480.0, 250.0, places=6)
+        pinch_px = float(np.hypot(
+            (remapped[1].x - remapped[0].x) * 640.0,
+            (remapped[1].y - remapped[0].y) * 480.0))
+        self.assertAlmostEqual(pinch_px, float(np.hypot(60.0, 30.0)), places=6)
 
 
 if __name__ == "__main__":
