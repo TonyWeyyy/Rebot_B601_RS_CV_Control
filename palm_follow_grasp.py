@@ -60,6 +60,7 @@ from servo_timing import (AdaptiveLeadGate, FastStartGate, SlowFollowGate,
                           compute_reach_schedule,
                           compute_orientation_cruise_weight,
                           compute_weighted_damped_pseudoinverse,
+                          consensus_velocity, apply_joint_limit_cushion,
                           adaptive_feedforward_scale,
                           apply_axis_reversal_damping, scale_joint_velocities,
                           camera_twist_from_tcp, compensate_palm_velocity,
@@ -1515,15 +1516,20 @@ def main():
                 near_stop_mode = bool(
                     in_deadband[0] or hold_latch[0] is not None
                     or last_joint_speed[0] < 0.35)
+                _kv_twist = (twist_comp.compensate(
+                                 _kv_raw, kf.position(), now=t0,
+                                 near_stop=near_stop_mode)
+                             if kf.initialized else _kv_raw.copy())
                 if use_world_kf and kf_world.initialized:
                     _, _R_cam_now = pose_history.latest(use_lpf=False)
-                    _kv = (_R_cam_now.T @ kf_world.velocity()
-                           if _R_cam_now is not None else np.zeros(3))
+                    _kv_world_cam = (_R_cam_now.T @ kf_world.velocity()
+                                     if _R_cam_now is not None else np.zeros(3))
+                    # 双估计器保守共识：真实追手时两套估计器同向一致、全速通过；
+                    # 急停回弹或 1.7~2.0Hz 共振时，带 ±40ms 容错窗的 _kv_twist 抑制
+                    # 单点查表世界系 KF 漏出的假速度，根除停手二次误解锁与小幅自激。
+                    _kv = consensus_velocity(_kv_world_cam, _kv_twist)
                 else:
-                    _kv = (twist_comp.compensate(
-                               _kv_raw, kf.position(), now=t0,
-                               near_stop=near_stop_mode)
-                           if kf.initialized else _kv_raw.copy())
+                    _kv = _kv_twist
                 if frozen_meas:
                     _kv[2] = 0.0
                 _kvn = float(np.linalg.norm(_kv))
@@ -1866,7 +1872,8 @@ def main():
                     osc_levels = osc_damper.update(
                         pos_err_cam, t0, dt,
                         active=(ff_moving[0] and hold_latch[0] is None
-                                and not frozen_meas))
+                                and not frozen_meas),
+                        hard_reset=(not visible))
                     osc_levels_now[0] = osc_levels
                     osc_max = float(np.max(osc_levels))
                     reach_r = float(np.hypot(tcp_pos[0], tcp_pos[1]))
@@ -1962,12 +1969,17 @@ def main():
                                             and pos_err_cam[_ax] * hand_v > 0.0
                                             and abs(hand_v) > FF_KF_DEADBAND_OFF):
                                         if use_world_kf and kf_world.initialized:
-                                            # L1 世界系纯净手速前馈：同速巡航时不衰减，
-                                            # 随停靠渐弱 ff_scale、伸展度与振荡度平滑退出。
+                                            # L1 世界系纯净手速前馈：仅在 >7.5cm 巡航区平滑切入
+                                            # （≤7.5cm 小信号停靠区为 0，杜绝 2Hz 小幅自激），
+                                            # 并随伸展度与振荡度平滑退出。
+                                            wkf_t = float(np.clip(
+                                                (pos_err_norm - 0.075) / 0.065,
+                                                0.0, 1.0))
+                                            wkf_err_gate = wkf_t * wkf_t * (3.0 - 2.0 * wkf_t)
                                             v_cam[_ax] += (
-                                                WORLD_KF_FF_GAIN * ff_scale
-                                                * ff_scale_ext * pos_ff_allow
-                                                * hand_v)
+                                                WORLD_KF_FF_GAIN * wkf_err_gate
+                                                * ff_scale * ff_scale_ext
+                                                * pos_ff_allow * hand_v)
                                         else:
                                             if pos_err_cam[_ax] * raw_v > 0.0:
                                                 eff_ff = max(
@@ -2115,8 +2127,31 @@ def main():
                         and pos_err_norm > ff_taper_now[0]
                         and ext_s < 0.5
                         and osc_max < 0.25)
+                    # L2 停靠/伸展安全限速平滑收紧：大误差追手（>8cm、非深伸展、无振荡）
+                    # 释放全量 L2 分关节限速（如 J1=2.4, J4/J5=2.8）；进入 ≤8cm 停靠区、
+                    # 深伸展或振荡抑制时平滑收回至 ≤MAX_VEL_JOINT（2.0 rad/s），降低停靠动能。
+                    l2_dock_limits = np.minimum(
+                        joint_speed_limits, MAX_VEL_JOINT)
+                    if (ff_moving[0] and hold_latch[0] is None
+                            and osc_max < 0.25 and ext_s < 0.60
+                            and pos_err_norm > 0.08):
+                        l2_t = float(np.clip(
+                            (pos_err_norm - 0.08) / 0.06, 0.0, 1.0))
+                        l2_blend = (l2_t * l2_t * (3.0 - 2.0 * l2_t)
+                                    * (1.0 - ext_s / 0.60))
+                        eff_joint_limits = (
+                            l2_dock_limits
+                            + (joint_speed_limits - l2_dock_limits) * l2_blend)
+                    else:
+                        eff_joint_limits = l2_dock_limits
                     joint_vel = scale_joint_velocities(
-                        joint_vel, joint_speed_limits, grouped=use_grouped_scale)
+                        joint_vel, eff_joint_limits, grouped=use_grouped_scale)
+                    # 关节软限位缓冲：接近 q_min/q_max 最后 ~4.6° 平滑收紧外推速度，
+                    # 避免 J3/J4 撞硬限位截断引发 10° 俯仰冲击与竖直振荡。
+                    if hasattr(robot, "q_min") and hasattr(robot, "q_max"):
+                        joint_vel, _ = apply_joint_limit_cushion(
+                            current_joints, joint_vel,
+                            robot.q_min, robot.q_max, margin_rad=0.08)
                     # 平滑进死区：高速冲入死区时走上方 EMA + max_accel 斜坡平顺刹停，
                     # 避免 2.0 rad/s → 0.0 的 10ms 阶跃急刹激发伸展悬臂弹性回弹；
                     # 仅在低速尾段或 static_hold 激活时才硬置零。

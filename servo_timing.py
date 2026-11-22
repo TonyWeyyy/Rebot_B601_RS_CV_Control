@@ -897,9 +897,21 @@ class OscillationDamper:
         self.streak[:] = 0
         self.levels[:] = 0.0
 
-    def update(self, error_vec, now, dt, active=True):
-        if not self.enabled or not active:
+    def update(self, error_vec, now, dt, active=True, hard_reset=False):
+        if not self.enabled or hard_reset:
             self.reset()
+            return self.levels.copy()
+        if not active:
+            # 短暂停手/锁存/深度冻结期间只做平滑衰减而不清零连击记忆：
+            # 避免 100ms 短暂回弹误解锁后连击归零、被迫多晃 3~4 个半周期。
+            # 若静止持续超过 max_half_s * 1.4，下一次激活时 half_p 超窗会自动清零。
+            try:
+                step = max(float(dt), 0.0)
+            except (TypeError, ValueError):
+                step = 0.0
+            if math.isfinite(step) and step > 0.0:
+                self.levels *= math.exp(-step / self.decay_tau_s)
+                self.levels[self.levels < 0.02] = 0.0
             return self.levels.copy()
         try:
             err = np.asarray(error_vec, dtype=np.float64)
@@ -1176,6 +1188,66 @@ def compute_weighted_damped_pseudoinverse(J, row_weights, damping=0.01):
     except np.linalg.LinAlgError:
         inv_term = np.linalg.inv(JJT + ((d * 10.0) ** 2) * np.eye(m))
     return (J_w.T @ inv_term) * w[None, :]
+
+
+def consensus_velocity(v_world_cam, v_twist_cam):
+    """双估计器保守共识速度（世界系 KF 与延迟低通 Twist 补偿器的逐轴交集）。
+
+    - 真实人手移动时，世界系 KF 速度与自运动补偿速度方向一致、幅值相近，完整保留追手速度；
+    - 机械臂急停回弹或 1.7~2.0Hz 欠阻尼共振时，单点查表的世界系 KF 可能漏出 0.3~0.5m/s
+      假速度，而带 ±40ms 局部容错窗的 Twist 补偿器已将其压至近零；逐轴取同向较小幅值
+      （异向直接置零）可同时保留两套观测器的抗自运动优势，彻底根除停手二次误解锁。
+    """
+    try:
+        a = np.asarray(v_world_cam, dtype=np.float64)
+        b = np.asarray(v_twist_cam, dtype=np.float64)
+    except (TypeError, ValueError):
+        return np.zeros(3, dtype=np.float64)
+    if (a.shape != (3,) or b.shape != (3,)
+            or not np.all(np.isfinite(a)) or not np.all(np.isfinite(b))):
+        return np.zeros(3, dtype=np.float64)
+    out = np.zeros(3, dtype=np.float64)
+    for ax in range(3):
+        va, vb = float(a[ax]), float(b[ax])
+        if va * vb > 0.0:
+            out[ax] = math.copysign(min(abs(va), abs(vb)), va)
+    return out
+
+
+def apply_joint_limit_cushion(q_now, joint_vel, q_min, q_max, margin_rad=0.08):
+    """关节软限位缓冲：接近 q_min/q_max 最后 margin_rad 内平滑收紧外推速度。
+
+    防止 J3/J4 高速顶死适配层硬截断（例如 q4 撞 +1.40rad 软墙时造成 10° 突变俯仰冲击），
+    离开限位方向的速度完全不衰减。
+    """
+    try:
+        q = np.asarray(q_now, dtype=np.float64)
+        dq = np.asarray(joint_vel, dtype=np.float64).copy()
+        lo = np.asarray(q_min, dtype=np.float64)
+        hi = np.asarray(q_max, dtype=np.float64)
+        margin = float(margin_rad)
+    except (TypeError, ValueError):
+        return np.zeros(6, dtype=np.float64), False
+    if (q.ndim != 1 or dq.shape != q.shape or lo.shape != q.shape
+            or hi.shape != q.shape or not np.all(np.isfinite(q))
+            or not np.all(np.isfinite(dq)) or not np.all(np.isfinite(lo))
+            or not np.all(np.isfinite(hi)) or not math.isfinite(margin)
+            or margin <= 0.0):
+        return np.zeros_like(dq) if dq.ndim == 1 else np.zeros(6), False
+    cushioned = False
+    for i in range(q.size):
+        if dq[i] > 0.0:
+            rem = hi[i] - q[i]
+            if rem < margin:
+                dq[i] *= float(np.clip(rem / margin, 0.0, 1.0))
+                cushioned = True
+        elif dq[i] < 0.0:
+            rem = q[i] - lo[i]
+            if rem < margin:
+                dq[i] *= float(np.clip(rem / margin, 0.0, 1.0))
+                cushioned = True
+    return dq, cushioned
+
 
 
 

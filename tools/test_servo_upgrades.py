@@ -20,6 +20,7 @@ from servo_timing import (AdaptiveLeadGate, FastStartGate, SlowFollowGate,
                           compute_reach_schedule,
                           compute_orientation_cruise_weight,
                           compute_weighted_damped_pseudoinverse,
+                          consensus_velocity, apply_joint_limit_cushion,
                           adaptive_feedforward_scale,
                           apply_axis_reversal_damping, scale_joint_velocities,
                           camera_twist_from_tcp, compensate_palm_velocity,
@@ -994,6 +995,56 @@ class OrientationPriorityAndJointLimitsTests(unittest.TestCase):
         scaled_safe = scale_joint_velocities(dq_over, limits, grouped=False)
         self.assertAlmostEqual(scaled_safe[1], 2.0, places=6)
         self.assertTrue(np.all(np.abs(scaled_safe) <= limits + 1e-9))
+
+    def test_consensus_velocity_suppresses_single_estimator_leak(self):
+        # 真实运动：两估计器同向一致，取保守较小幅值
+        v_ok = consensus_velocity([0.45, -0.30, 0.10], [0.40, -0.35, 0.12])
+        np.testing.assert_allclose(v_ok, [0.40, -0.30, 0.10], atol=1e-9)
+        # 急停回弹/共振失配：一侧漏出 0.45m/s、一侧已压至 0.04m/s 或异向 -> 抑制
+        v_leak = consensus_velocity([0.45, -0.40, 0.20], [0.04, 0.15, 0.0])
+        np.testing.assert_allclose(v_leak, [0.04, 0.0, 0.0], atol=1e-9)
+        np.testing.assert_array_equal(
+            consensus_velocity([np.nan, 0.1, 0.0], [0.1, 0.1, 0.0]), np.zeros(3))
+
+    def test_joint_limit_cushion_softens_outward_and_preserves_inward(self):
+        q_min = np.array([-2.0, 0.0, 0.17, -1.40, -2.0, -2.0])
+        q_max = np.array([ 2.0, 2.0, 2.50,  1.40,  2.0,  2.0])
+        # J4 距上限 0.04rad（margin=0.08 -> 50%），J3 距下限 0.02rad（25%）
+        q_now = np.array([0.0, 1.0, 0.19, 1.36, 0.0, 0.0])
+        dq_out = np.array([1.0, 1.0, -2.0, 2.0, 0.0, 0.0])
+        out, flag = apply_joint_limit_cushion(q_now, dq_out, q_min, q_max, 0.08)
+        self.assertTrue(flag)
+        self.assertAlmostEqual(out[3], 1.0, places=6)   # 2.0 * (0.04/0.08)
+        self.assertAlmostEqual(out[2], -0.5, places=6)  # -2.0 * (0.02/0.08)
+        self.assertAlmostEqual(out[0], 1.0, places=6)
+        # 离开限位方向绝不衰减
+        dq_in = np.array([1.0, 1.0, 2.0, -2.0, 0.0, 0.0])
+        out_in, flag_in = apply_joint_limit_cushion(q_now, dq_in, q_min, q_max, 0.08)
+        self.assertFalse(flag_in)
+        np.testing.assert_allclose(out_in, dq_in, atol=1e-9)
+
+    def test_oscillation_damper_retains_memory_across_brief_stop_dip(self):
+        damper = OscillationDamper(err_thresh=0.018, min_half_s=0.14,
+                                   max_half_s=0.42, decay_tau_s=0.55,
+                                   confirm_reversals=3, large_err_release=0.15)
+        # 先产生 2 次 1.7Hz 过零反转（streak=2）
+        damper.update([0.06, 0.0, 0.0], 0.00, 0.01, active=True)
+        damper.update([-0.06, 0.0, 0.0], 0.25, 0.01, active=True)
+        damper.update([0.06, 0.0, 0.0], 0.50, 0.01, active=True)
+        self.assertEqual(damper.streak[0], 2)
+        # 短暂 100ms 停手（active=False, hard_reset=False）不得清零连击记忆
+        for k in range(10):
+            damper.update([0.01, 0.0, 0.0], 0.51 + k * 0.01, 0.01,
+                          active=False, hard_reset=False)
+        self.assertEqual(damper.streak[0], 2)
+        # 紧接着第 3 次反冲（t=0.75s，距上次翻转 0.25s）应立刻触发阻尼
+        lv = damper.update([-0.06, 0.0, 0.0], 0.75, 0.01, active=True)
+        self.assertGreaterEqual(lv[0], 0.65)
+        # hard_reset=True 必须彻底清零
+        lv_rst = damper.update([0.0, 0.0, 0.0], 0.76, 0.01,
+                               active=False, hard_reset=True)
+        self.assertEqual(damper.streak[0], 0)
+        np.testing.assert_array_equal(lv_rst, np.zeros(3))
 
 
 if __name__ == "__main__":
