@@ -83,13 +83,13 @@ else:
           "请先运行 handeye_joint_calib.py")
 
 # 每关节最大速度（弧度/秒）——双保险之一（控制层也有限幅）
-# 左右跟随的速度上限 ≈ J1 限速 × 臂展，这是横向跟随的物理瓶颈。
-# 最终版为 2.0；RS06 额定转速远高于此。实机已验证 2.0，不再继续上提；
-# 若要提速需重新评估电机温度、整臂稳定性和工作空间安全。
-# 关节速度上限 (rad/s)：用户实测 [1.5,1.5,1.5,2.0,2.0,2.0] 效果最佳。
-# RS06/RS00 额定 ≈10.5 rad/s，硬件余量很大；瓶颈在视觉延迟而非电机。
-# 用户实测定案：全 2.0 效果明显优于 [1.5,1.5,1.5,2.0,2.0,2.0]（J1-J3 不憋屈）。
-MAX_JOINT_SPEED = np.array([2.0, 2.0, 2.0, 2.0, 2.0, 2.0])
+# 默认全轴保守为 2.0 rad/s；开启 L2 分关节差异化限速时，由控制层在初始化时通过
+# set_joint_speed_limits() 下发，但一律强制钳位在 HARD_MAX_JOINT_SPEED 安全包络内：
+# - 承重抗重力关节 J2/J3 严禁超过 2.0 rad/s（防堵转、防重臂过冲）；
+# - 水平偏航底座 J1（无重力负载）硬上限 2.5 rad/s；
+# - 轻负载手腕 RS00 电机 J4/J5（额定 ~10.5 rad/s）硬上限 3.0 rad/s，J6 硬上限 2.5 rad/s。
+MAX_JOINT_SPEED = np.array([2.0, 2.0, 2.0, 2.0, 2.0, 2.0], dtype=np.float64)
+HARD_MAX_JOINT_SPEED = np.array([2.5, 2.0, 2.0, 3.0, 3.0, 2.5], dtype=np.float64)
 
 # ── 夹爪（J7）参数 ──────────────────────────────────────────
 # J7 与 6 个关节共用同一条 CAN 总线、同一个 rebot_control 控制器，
@@ -183,6 +183,20 @@ class RebotAdapter:
         q_now = self.get_current_pos()
         self._q_target = q_now.copy()
         self._last_cmd_time = time.time()
+        self._max_joint_speed = MAX_JOINT_SPEED.copy()
+
+    def set_joint_speed_limits(self, limits_rad):
+        """设置分关节速度上限（弧度/秒），强制钳位至 HARD_MAX_JOINT_SPEED 硬包络。"""
+        arr = np.asarray(limits_rad, dtype=np.float64)
+        if arr.ndim == 0:
+            arr = np.full(6, float(arr), dtype=np.float64)
+        if arr.shape != (6,) or not np.all(np.isfinite(arr)) or np.any(arr <= 0.0):
+            raise ValueError("分关节速度上限必须为 6 维有限正数向量")
+        clamped = np.clip(arr, 0.1, HARD_MAX_JOINT_SPEED)
+        self._max_joint_speed = clamped.copy()
+        self.io.arm.set_max_speeds(
+            np.rad2deg(self._max_joint_speed).tolist() + [GRIPPER_SPEED_DEG_S])
+        return self._max_joint_speed.copy()
 
     # ── 状态读取 ─────────────────────────────────────────────
     def get_current_pos(self):
@@ -218,11 +232,12 @@ class RebotAdapter:
 
         if dq_rad is not None:
             dq = np.asarray(dq_rad, dtype=np.float64)
-            ratios = np.abs(dq) / MAX_JOINT_SPEED
+            lim = self._max_joint_speed
+            ratios = np.abs(dq) / lim
             max_ratio = float(np.max(ratios)) if dq.size else 0.0
             if max_ratio > 1.0:
                 dq = dq / max_ratio
-            dq = np.clip(dq, -MAX_JOINT_SPEED, MAX_JOINT_SPEED)
+            dq = np.clip(dq, -lim, lim)
             self._q_target = self._q_target + dq * dt
             # 软限位：撞到边界就把目标钉在边界上，防止积分饱和
             self._q_target = np.clip(self._q_target, self.q_min, self.q_max)
@@ -256,7 +271,7 @@ class RebotAdapter:
                         break
                 time.sleep(0.1)
         # 恢复伺服速度包络
-        self.io.arm.set_max_speeds(np.rad2deg(MAX_JOINT_SPEED).tolist()
+        self.io.arm.set_max_speeds(np.rad2deg(self._max_joint_speed).tolist()
                                    + [GRIPPER_SPEED_DEG_S])
         self._last_cmd_time = time.time()   # 重置积分时钟，防止之后 dt 过大
 

@@ -136,6 +136,10 @@ class FakeRobot:
         self.commands.append(dq.copy())
         self.q += dq * 0.01
 
+    def set_joint_speed_limits(self, limits_rad):
+        self.max_joint_speed = np.asarray(limits_rad, dtype=float).copy()
+        return self.max_joint_speed.copy()
+
     def hold(self):
         pass
 
@@ -294,7 +298,17 @@ for key, value in (("kf_r_xy", 0.0), ("kf_slow_follow_speed", 0.07),
                    ("reach_release_tau", 0.005),
                    ("far_gain_boost", 0.80),
                    ("osc_confirm_reversals", 1),
-                   ("osc_large_err_release", 0.05)):
+                   ("osc_large_err_release", 0.05),
+                   ("world_kf_pose_delay_s", 0.30),
+                   ("world_kf_pose_lpf_tau_s", 0.25),
+                   ("world_kf_smith_blend", 1.2),
+                   ("world_kf_ff_gain", 0.95),
+                   ("ori_cruise_weight_min", 0.10),
+                   ("ori_soft_max_deg", 25.0),
+                   ("max_vel", 0.90),
+                   ("max_vel_joints", [2.4, 2.5, 2.0, 2.8, 2.8, 2.2]),
+                   ("max_vel_joints", [2.4, 2.0, 2.0, 3.5, 2.8, 2.2]),
+                   ("max_vel_joints", [2.0, 2.0, 2.0])):
     invalid = copy.deepcopy(valid_cfg)
     invalid["follow"][key] = value
     try:

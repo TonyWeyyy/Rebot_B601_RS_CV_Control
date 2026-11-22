@@ -56,7 +56,10 @@ from servo_timing import (AdaptiveLeadGate, FastStartGate, SlowFollowGate,
                           CameraTimestampCalibrator, AxisProcessNoiseGate,
                           StaticVelocityHold, DelayedTwistCompensator,
                           PostBrakeSettleGuard, OscillationDamper,
+                          CameraPoseHistory,
                           compute_reach_schedule,
+                          compute_orientation_cruise_weight,
+                          compute_weighted_damped_pseudoinverse,
                           adaptive_feedforward_scale,
                           apply_axis_reversal_damping, scale_joint_velocities,
                           camera_twist_from_tcp, compensate_palm_velocity,
@@ -100,7 +103,10 @@ POSITION_DEADBAND = 0.015     # 3D 误差死区 (m)，想贴更近可降到 0.01
 ORIENTATION_DEADBAND = np.deg2rad(2.0)
 MAX_VEL_CART = 0.30           # 最大末端线速度 (m/s)，首次调试建议 0.10
 MAX_VEL_ANGULAR = 1.20        # 最大角速度 (rad/s)
-MAX_VEL_JOINT = 1.20          # 最大关节速度 (rad/s)，适配层还有第二道限幅
+MAX_VEL_JOINT = 1.20          # 标量最大关节速度 (rad/s)，适配层还有第二道限幅
+# L2 分关节差异化限速：None = 回退全轴标量 MAX_VEL_JOINT；设置 6 元向量时受硬包络保护
+MAX_VEL_JOINTS = None
+HARD_MAX_VEL_JOINTS = np.array([2.5, 2.0, 2.0, 3.0, 3.0, 2.5], dtype=np.float64)
 CTRL_RATE = 0.01              # 控制周期 10ms (100Hz)：指令量化延迟减半
                               # 注意：下面三个常量由 CTRL_RATE 推导（时间制），
                               # 改频率时无需手改，安全时长不会随频率变化
@@ -257,6 +263,15 @@ OSC_GAIN_CUT = 0.45               # 满阻尼时振荡轴比例增益削减比�
 OSC_DECAY_TAU_S = 0.55            # 振荡平息后的阻尼回落时间常数 (s)
 OSC_CONFIRM_REVERSALS = 3         # 触发阻尼所需连续共振带过零反转次数（防单次快速来回误触）
 OSC_LARGE_ERR_RELEASE = 0.15      # 单轴误差 ≥ 此值视为大追赶，立即清连击并加速释放阻尼 (m)
+# L1 世界系卡尔曼滤波 + Smith 预估 + 大误差软姿态优先级（默认关闭以 100% 兼容旧配置）
+WORLD_KF_ENABLE = False           # true = 启用滞后对齐世界系 KF + Smith 预估器
+WORLD_KF_POSE_DELAY_S = 0.14      # 相机世界位姿查表延迟，匹配执行器闭环滞后 (s)
+WORLD_KF_POSE_LPF_TAU_S = 0.04    # 相机位姿低通时间常数，匹配二阶机电上升时间 (s)
+WORLD_KF_SMITH_BLEND = 0.75       # Smith 预估反投影混合比例 [0, 1]（吸收在途指令防过冲）
+WORLD_KF_FF_GAIN = 0.55           # 世界系真实手速巡航前馈增益（近端自动渐弱至 0）
+ORI_CRUISE_WEIGHT_MIN = 1.0       # 大误差巡航段姿态行权重下限（1.0=关闭软让权，0.40=释放 J4）
+ORI_SOFT_MAX_DEG = 10.0           # 姿态软让权保护角度上限（接近此角自动恢复 1.0 刚度）
+ORI_SOFT_MAX_RAD = np.deg2rad(ORI_SOFT_MAX_DEG)
 SETTLED_CONFIRM_FRAMES = max(1, round(0.08 / CTRL_RATE))
 
 CAMERA_FPS = 30               # 相机帧率；Gemini2 支持 640x480@60，
@@ -372,6 +387,7 @@ def load_follow_cfg(path):
                "gain_x": float(LAMBDA_GAIN_XYZ[0]),
                "max_vel": MAX_VEL_CART,
                "max_vel_joint": MAX_VEL_JOINT,
+               "max_vel_joints": None,
                "max_vel_angular": MAX_VEL_ANGULAR,
                "position_deadband": POSITION_DEADBAND,
                "deadband_hysteresis": DEADBAND_HYSTERESIS,
@@ -475,6 +491,13 @@ def load_follow_cfg(path):
                "osc_decay_tau_s": OSC_DECAY_TAU_S,
                "osc_confirm_reversals": OSC_CONFIRM_REVERSALS,
                "osc_large_err_release": OSC_LARGE_ERR_RELEASE,
+               "world_kf_enable": False,
+               "world_kf_pose_delay_s": 0.14,
+               "world_kf_pose_lpf_tau_s": 0.04,
+               "world_kf_smith_blend": 0.75,
+               "world_kf_ff_gain": 0.55,
+               "ori_cruise_weight_min": 1.0,
+               "ori_soft_max_deg": 10.0,
                "damping_base": DAMPING_BASE,
                "damping_adaptive": DAMPING_ADAPTIVE,
                "manipulability_threshold": MANIPULABILITY_THRESHOLD,
@@ -519,7 +542,7 @@ def apply_follow_cfg(cfg):
     global SMOOTH_ALPHA, REVERSAL_FAST_RESPONSE
     global MAX_ACCEL, REVERSAL_ACCEL_BOOST, REVERSAL_RESIDUAL_SCALE
     global DEPTH_OE_MIN_CUTOFF, DEPTH_OE_BETA, Z3D_MAX_JUMP
-    global K_ORIENTATION, MAX_VEL_JOINT, MAX_VEL_ANGULAR
+    global K_ORIENTATION, MAX_VEL_JOINT, MAX_VEL_JOINTS, MAX_VEL_ANGULAR
     global REACH_SOFT_START, REACH_SOFT_END, REACH_MIN_SCALE, REACH_DOCK_DIST
     global REACH_FF_MIN_SCALE, REACH_LEAD_MIN_SCALE, REACH_ACCEL_MIN_SCALE
     global REACH_DEADBAND_ON_BOOST, REACH_FAST_START_BOOST, FAR_GAIN_BOOST
@@ -528,6 +551,9 @@ def apply_follow_cfg(cfg):
     global KF_FF_STOP_DELAY_S, KF_FF_STOP_FRAMES, JOINT_VEL_GROUPED_CRUISE
     global OSC_DAMP_ENABLE, OSC_ERR_THRESH, OSC_MIN_HALF_S, OSC_MAX_HALF_S
     global OSC_GAIN_CUT, OSC_DECAY_TAU_S, OSC_CONFIRM_REVERSALS, OSC_LARGE_ERR_RELEASE
+    global WORLD_KF_ENABLE, WORLD_KF_POSE_DELAY_S, WORLD_KF_POSE_LPF_TAU_S
+    global WORLD_KF_SMITH_BLEND, WORLD_KF_FF_GAIN
+    global ORI_CRUISE_WEIGHT_MIN, ORI_SOFT_MAX_DEG, ORI_SOFT_MAX_RAD
     global WORKSPACE_MIN, WORKSPACE_MAX, WORKSPACE_RADIUS
     global SERVO_DIRECTION, KF_RESYNC_FRAMES, Z3D_MAX_RATE, Z_FREEZE_MAX
     global KF_ADAPT_ENABLE, KF_ADAPT_REF, KF_ADAPT_MAX, KF_ADAPT_DECAY
@@ -630,6 +656,9 @@ def apply_follow_cfg(cfg):
     Z3D_MAX_JUMP = float(fcfg.get("z3d_max_jump", Z3D_MAX_JUMP))
     K_ORIENTATION = float(fcfg["k_orientation"])
     MAX_VEL_JOINT = float(fcfg["max_vel_joint"])
+    raw_mvj = fcfg.get("max_vel_joints", None)
+    MAX_VEL_JOINTS = (None if raw_mvj is None
+                      else np.asarray(raw_mvj, dtype=np.float64))
     MAX_VEL_ANGULAR = float(fcfg["max_vel_angular"])
     # 伸展度增益调度（旧 yaml 没有这四个键时用代码默认值）
     REACH_SOFT_START = float(fcfg.get("reach_soft_start", REACH_SOFT_START))
@@ -674,6 +703,14 @@ def apply_follow_cfg(cfg):
         "osc_confirm_reversals", OSC_CONFIRM_REVERSALS))
     OSC_LARGE_ERR_RELEASE = float(fcfg.get(
         "osc_large_err_release", OSC_LARGE_ERR_RELEASE))
+    WORLD_KF_ENABLE = bool(fcfg.get("world_kf_enable", False))
+    WORLD_KF_POSE_DELAY_S = float(fcfg.get("world_kf_pose_delay_s", 0.14))
+    WORLD_KF_POSE_LPF_TAU_S = float(fcfg.get("world_kf_pose_lpf_tau_s", 0.04))
+    WORLD_KF_SMITH_BLEND = float(fcfg.get("world_kf_smith_blend", 0.75))
+    WORLD_KF_FF_GAIN = float(fcfg.get("world_kf_ff_gain", 0.55))
+    ORI_CRUISE_WEIGHT_MIN = float(fcfg.get("ori_cruise_weight_min", 1.0))
+    ORI_SOFT_MAX_DEG = float(fcfg.get("ori_soft_max_deg", 10.0))
+    ORI_SOFT_MAX_RAD = float(np.deg2rad(ORI_SOFT_MAX_DEG))
     ws = cfg["workspace"]
     WORKSPACE_MIN = np.array(ws["min"], dtype=np.float64)
     WORKSPACE_MAX = np.array(ws["max"], dtype=np.float64)
@@ -723,8 +760,9 @@ def validate_follow_cfg(cfg):
         (0.18 <= f["distance"] <= 0.60, "distance 须在 0.18~0.60m"),
         (0.0 < f["gain"] <= 3.5, "gain 须在 (0, 3.5]"),
         (0.0 < f["gain_x"] <= 2.5, "gain_x 须在 (0, 2.5]"),
-        (0.0 < f["max_vel"] <= 0.70, "max_vel 须在 (0, 0.70]m/s"),
+        (0.0 < f["max_vel"] <= 0.85, "max_vel 须在 (0, 0.85]m/s"),
         (0.0 < f["max_vel_joint"] <= 2.0, "max_vel_joint 须在 (0, 2.0]rad/s"),
+        (0.0 < f["max_vel_angular"] <= 2.2, "max_vel_angular 须在 (0, 2.2]rad/s"),
         (f["position_deadband"] > 0.0, "position_deadband 必须为正"),
         (f["deadband_hysteresis"] >= 1.0, "deadband_hysteresis 不得小于 1"),
         (f["kf_ff_deadband_on"] > f["kf_ff_deadband_off"] >= 0.0,
@@ -800,10 +838,29 @@ def validate_follow_cfg(cfg):
          0.02 <= f["reach_release_tau"] <= 0.25 and
          0.0 <= f["far_gain_boost"] <= 0.60,
          "伸展度联动稳定与远距追赶参数超出安全范围"),
+        (0.0 <= f["world_kf_pose_delay_s"] <= 0.25 and
+         0.0 <= f["world_kf_pose_lpf_tau_s"] <= 0.15 and
+         0.0 <= f["world_kf_smith_blend"] <= 1.0 and
+         0.0 <= f["world_kf_ff_gain"] <= 0.85,
+         "世界系 KF / Smith 预估参数超出安全范围"),
+        (0.20 <= f["ori_cruise_weight_min"] <= 1.0 and
+         3.0 <= f["ori_soft_max_deg"] <= 15.0,
+         "大误差姿态软优先级参数超出安全范围"),
     ]
     for ok, message in checks:
         if not ok:
             raise ValueError(f"follow.yaml 配置错误: {message}")
+    raw_mvj = f.get("max_vel_joints", None)
+    if raw_mvj is not None:
+        if not isinstance(raw_mvj, (list, tuple)) or len(raw_mvj) != 6:
+            raise ValueError("follow.yaml 配置错误: max_vel_joints 必须为 6 维列表")
+        mvj_arr = np.asarray(raw_mvj, dtype=np.float64)
+        if (not np.all(np.isfinite(mvj_arr))
+                or np.any(mvj_arr <= 0.0)
+                or np.any(mvj_arr > HARD_MAX_VEL_JOINTS + 1e-9)):
+            raise ValueError(
+                "follow.yaml 配置错误: max_vel_joints 超出安全硬件包络 "
+                f"{HARD_MAX_VEL_JOINTS.tolist()} rad/s（J2/J3 严禁超过 2.0）")
     ws = cfg["workspace"]
     lower = np.asarray(ws["min"], dtype=np.float64)
     upper = np.asarray(ws["max"], dtype=np.float64)
@@ -929,8 +986,8 @@ def main():
             or not np.all((lambda_gain_xyz[1:] > 0.0)
                           & (lambda_gain_xyz[1:] <= 3.5))):
         raise ValueError("命令行增益超出安全范围")
-    if not np.isfinite(max_vel_cart) or not 0.0 < max_vel_cart <= 0.70:
-        raise ValueError("max_vel 须在 (0, 0.70]m/s")
+    if not np.isfinite(max_vel_cart) or not 0.0 < max_vel_cart <= 0.85:
+        raise ValueError("max_vel 须在 (0, 0.85]m/s")
     if camera_fps not in (30, 60):
         raise ValueError("Gemini 2 跟随模式仅允许 --fps 30 或 60")
     # 曝光：命令行 > yaml（color_exposure_ms），0 = 自动曝光
@@ -1017,6 +1074,13 @@ def main():
         max_step_px=float(fcfg.get("hybrid_max_step_px", 90.0)) * pinch_scale)
     tracker = PalmTracker()
 
+    # L2 分关节速度上限（None = 全轴标量 MAX_VEL_JOINT；设置 6 元向量时受硬包络钳位）
+    joint_speed_limits = (
+        np.full(6, MAX_VEL_JOINT, dtype=np.float64)
+        if MAX_VEL_JOINTS is None
+        else np.clip(np.asarray(MAX_VEL_JOINTS, dtype=np.float64),
+                     0.1, HARD_MAX_VEL_JOINTS))
+
     # ── 机械臂 ──
     robot = None
     desired_rotation = None
@@ -1028,6 +1092,11 @@ def main():
         print(f"移动到初始位置: {HOME_JOINT_POS}")
         robot.move_to_joints(HOME_JOINT_POS, speed_deg_s=15.0)
         time.sleep(0.5)
+
+        if hasattr(robot, "set_joint_speed_limits"):
+            applied_lim = robot.set_joint_speed_limits(joint_speed_limits)
+            if applied_lim is not None:
+                joint_speed_limits = np.asarray(applied_lim, dtype=np.float64)
 
         if follow_enabled:
             # 与 100Hz 伺服环保持同一关节角基准（get_command_pos），避免 MIT 重力静差
@@ -1084,6 +1153,11 @@ def main():
         print(f"跟随参数: 距离 {desired_depth}m  "
               f"gain(x/y/z)={lambda_gain_xyz.tolist()}  "
               f"max_vel={max_vel_cart}  前馈={VEL_FEEDFORWARD}")
+        print(f"关节限速 (rad/s): {np.round(joint_speed_limits, 2).tolist()}  "
+              f"世界系KF={'ON' if WORLD_KF_ENABLE else 'OFF'} "
+              f"(delay={WORLD_KF_POSE_DELAY_S*1000:.0f}ms smith={WORLD_KF_SMITH_BLEND:.2f} "
+              f"ff={WORLD_KF_FF_GAIN:.2f})  "
+              f"姿态软权重={ORI_CRUISE_WEIGHT_MIN:.2f}(≤{ORI_SOFT_MAX_DEG:.0f}°)")
         if KF_ENABLE:
             print(f"卡尔曼: Q={KF_Q} R={KF_R} Rxy={KF_R_XY} Rz={KF_R_Z} "
                   f"lead={'动态' if KF_DYNAMIC_LEAD else '固定'} "
@@ -1166,6 +1240,12 @@ def main():
         large_err_release=OSC_LARGE_ERR_RELEASE,
         enabled=OSC_DAMP_ENABLE)
     osc_levels_now = [np.zeros(3, dtype=np.float64)]
+    # L1 世界系 KF 与滞后对齐相机位姿历史缓冲
+    pose_history = CameraPoseHistory(
+        lpf_tau_s=WORLD_KF_POSE_LPF_TAU_S, max_history_s=0.60)
+    kf_world = KalmanTarget3D(q=KF_Q, r=KF_R, r_xy=KF_R_XY, r_z=KF_R_Z)
+    world_kf_time = [0.0]
+    world_kf_reject_count = [0]
     prev_command_joints = [None]      # 上周期适配层内部下发角（含 200Hz 斜坡）
     lost_counter = [0]
     prev_target_cam = [None]            # 上一周期掌心目标（前馈用）
@@ -1283,6 +1363,23 @@ def main():
             else:
                 lost_counter[0] = 0
 
+            # L1 世界系 KF 开启时，提前计算一次内存 FK 位姿并推入滞后对齐位姿历史缓冲
+            # （下方控制段直接复用 prefetched_fk，避免单周期重复计算 Pinocchio FK）。
+            prefetched_fk = None
+            if (WORLD_KF_ENABLE and following and robot is not None
+                    and T_tcp_camera is not None):
+                try:
+                    _pf_q = robot.get_command_pos()
+                    _pf_pos, _pf_rot, _pf_J = compute_tcp_fk_and_jacobian(
+                        robot, _pf_q)
+                    pose_history.push(t0, _pf_pos, _pf_rot, T_tcp_camera, dt)
+                    prefetched_fk = (_pf_q, _pf_pos, _pf_rot, _pf_J)
+                except Exception:
+                    prefetched_fk = None
+            use_world_kf = bool(KF_ENABLE and WORLD_KF_ENABLE and following
+                                and T_tcp_camera is not None
+                                and pose_history.has_data())
+
             # ── 时间戳卡尔曼：状态保存在最近观测时刻 ─────────────────
             # 新观测按真实观测间隔 update；重复控制周期不再反复修改后验状态。
             # 使用时再按 now-kf_time 外推到现在，避免异步观测的时间错位。
@@ -1304,6 +1401,10 @@ def main():
                 else:
                     kf.q_scale = max(1.0, kf.q_scale * scaled_decay(
                         KF_ADAPT_DECAY, dt, CTRL_RATE))
+                if use_world_kf:
+                    kf_world.q_scale = (kf.q_scale.copy()
+                                        if isinstance(kf.q_scale, np.ndarray)
+                                        else float(kf.q_scale))
                 if new_kf_meas:
                     meas_time = obs_time if obs_time > 0.0 else t0
                     if kf.initialized:
@@ -1359,6 +1460,43 @@ def main():
                             kf_reject_count[0] = 0
                         kf_last_seq[0] = obs_seq
 
+                    # 同步更新世界系 KF：用 `meas_time - WORLD_KF_POSE_DELAY_S` 查表
+                    # 将观测投影至基座世界系，从几何层面剥离 eye-in-hand 相机自运动。
+                    if use_world_kf:
+                        p_cam_d, R_cam_d = pose_history.lookup(
+                            meas_time - WORLD_KF_POSE_DELAY_S, use_lpf=True)
+                        if p_cam_d is not None and R_cam_d is not None:
+                            target_w_meas = p_cam_d + R_cam_d @ target_cam
+                            kf_world.q_scale = (kf.q_scale.copy()
+                                                if isinstance(kf.q_scale, np.ndarray)
+                                                else float(kf.q_scale))
+                            if not kf_world.initialized:
+                                kf_world.update(target_w_meas, 0.0)
+                                world_kf_time[0] = meas_time
+                                world_kf_reject_count[0] = 0
+                            else:
+                                dt_w = float(np.clip(
+                                    meas_time - world_kf_time[0], 1e-3, 0.50))
+                                pred_w = kf_world.position() + kf_world.velocity() * dt_w
+                                innov_w = float(np.linalg.norm(target_w_meas - pred_w))
+                                gate_w = (0.06 + 2.0 * float(np.linalg.norm(
+                                    kf_world.velocity())) * dt_w)
+                                if innov_w > gate_w:
+                                    world_kf_reject_count[0] += 1
+                                    kf_rejected_now[0] = True
+                                    if world_kf_reject_count[0] >= KF_RESYNC_FRAMES:
+                                        kf_world.reset()
+                                        kf_world.update(target_w_meas, 0.0)
+                                        world_kf_time[0] = meas_time
+                                        world_kf_reject_count[0] = 0
+                                    else:
+                                        kf_world.predict(dt_w)
+                                        world_kf_time[0] = meas_time
+                                else:
+                                    kf_world.update(target_w_meas, dt_w)
+                                    world_kf_time[0] = meas_time
+                                    world_kf_reject_count[0] = 0
+
                 _kv_raw = kf.velocity() if kf.initialized else np.zeros(3)
                 if frozen_meas:
                     # 深度无效时横向仍可跟随，但旧纵向速度不得继续注入。
@@ -1377,10 +1515,15 @@ def main():
                 near_stop_mode = bool(
                     in_deadband[0] or hold_latch[0] is not None
                     or last_joint_speed[0] < 0.35)
-                _kv = (twist_comp.compensate(
-                           _kv_raw, kf.position(), now=t0,
-                           near_stop=near_stop_mode)
-                       if kf.initialized else _kv_raw.copy())
+                if use_world_kf and kf_world.initialized:
+                    _, _R_cam_now = pose_history.latest(use_lpf=False)
+                    _kv = (_R_cam_now.T @ kf_world.velocity()
+                           if _R_cam_now is not None else np.zeros(3))
+                else:
+                    _kv = (twist_comp.compensate(
+                               _kv_raw, kf.position(), now=t0,
+                               near_stop=near_stop_mode)
+                           if kf.initialized else _kv_raw.copy())
                 if frozen_meas:
                     _kv[2] = 0.0
                 _kvn = float(np.linalg.norm(_kv))
@@ -1401,6 +1544,8 @@ def main():
                                 # 防止机械臂刹停后残留的 _kv_raw 在尾段自我解锁炸开锁存。
                                 kf.x[3:] = _kv.copy()
                                 _kv_raw = kf.velocity()
+                            if kf_world.initialized:
+                                kf_world.x[3:] = 0.0
                     else:
                         ff_stop_count[0] = 0
                 elif last_joint_speed[0] > 0.05:
@@ -1448,6 +1593,8 @@ def main():
                             _kv_raw = np.zeros(3)
                             _kv = np.zeros(3)
                             _kvn = 0.0
+                        if kf_world.initialized:
+                            kf_world.x[3:] = 0.0
                 else:
                     settled_frames[0] = 0
                 if not ff_moving[0]:
@@ -1463,6 +1610,8 @@ def main():
                         _kv_raw = np.zeros(3)
                         _kv = np.zeros(3)
                         _kvn = 0.0
+                    if kf_world.initialized:
+                        kf_world.x[3:] = 0.0
                     ff_exit_count[0] = 0
                     if target_cam is not None:
                         fast_start.reset(target_cam)
@@ -1556,9 +1705,21 @@ def main():
                     # 传输延迟已经包含在 age_s 中，不能重复补偿。
                     processing_s = max(0.0, pub_time - arrival_time)
                     age_s = measurement_age(t0, kf_time[0], max_age=0.25)
-                    # 年龄外推必须用原始相机系速度：静止手掌在机械臂运动时
-                    # 的视位置变化，正是“现在”应有的观测位置。
-                    now_target = kf.position() + _kv_raw * age_s
+                    # L1 世界系 KF 启用时：先在世界系按真实手速外推，再以 Smith 混合位姿
+                    # 反投影回相机系（天然吸收 140ms 在途指令，消除过冲且保持零静态重力偏差）。
+                    _wkf_proj_ok = False
+                    if use_world_kf and kf_world.initialized:
+                        _p_proj, _R_proj = pose_history.blended_pose(
+                            t0, WORLD_KF_POSE_DELAY_S, WORLD_KF_SMITH_BLEND)
+                        if _p_proj is not None and _R_proj is not None:
+                            _v_w_est = kf_world.velocity()
+                            _p_w_now = kf_world.position() + _v_w_est * age_s
+                            now_target = _R_proj.T @ (_p_w_now - _p_proj)
+                            _wkf_proj_ok = True
+                    if not _wkf_proj_ok:
+                        # 年龄外推必须用原始相机系速度：静止手掌在机械臂运动时
+                        # 的视位置变化，正是“现在”应有的观测位置。
+                        now_target = kf.position() + _kv_raw * age_s
                     lead_error_now = float(np.linalg.norm(
                         now_target - np.array([0.0, 0.0, desired_depth])))
                     if hold_latch[0] is not None:
@@ -1576,9 +1737,10 @@ def main():
                         osc_max_pre = float(np.max(osc_levels_now[0]))
                         lead_hand_ok = (_kvn > FF_KF_DEADBAND_OFF
                                         and osc_max_pre < 0.25)
+                        _lead_vel_vec = _kv if _wkf_proj_ok else _kv_raw
                         if KF_LEAD_ADAPTIVE and lead_raw_s > 0.0:
                             lead_weight_now[0], lead_target_weight[0] = lead_gate.update(
-                                _kv_raw, now_target - np.array(
+                                _lead_vel_vec, now_target - np.array(
                                     [0.0, 0.0, desired_depth]),
                                 dt, ff_moving[0], valid=lead_hand_ok)
                         else:
@@ -1592,14 +1754,21 @@ def main():
                             1.0 - (1.0 - REACH_LEAD_MIN_SCALE) * reach_ext_ema[0])
                         lead_s = (lead_raw_s * lead_weight_now[0]
                                   * lead_scale_ext * (1.0 - osc_max_pre))
-                        target_cam = now_target + _kv_raw * lead_s
+                        if _wkf_proj_ok:
+                            target_cam = _R_proj.T @ (
+                                _p_w_now + _v_w_est * lead_s - _p_proj)
+                        else:
+                            target_cam = now_target + _kv_raw * lead_s
 
             if following and target_cam is not None and lost_counter[0] <= LOST_HOLD_FRAMES:
                 try:
-                    current_joints = robot.get_command_pos()
+                    if prefetched_fk is not None:
+                        current_joints, tcp_pos, tcp_rot, J_robot = prefetched_fk
+                    else:
+                        current_joints = robot.get_command_pos()
+                        tcp_pos, tcp_rot, J_robot = compute_tcp_fk_and_jacobian(
+                            robot, current_joints)
                     q_cmd_log = current_joints.copy()
-                    tcp_pos, tcp_rot, J_robot = compute_tcp_fk_and_jacobian(
-                        robot, current_joints)
                     with lock:
                         control_status["tcp"] = tcp_pos.round(3).tolist()
 
@@ -1618,6 +1787,10 @@ def main():
                         kf_last_seq[0] = -1
                         kf_time[0] = 0.0
                         kf_reject_count[0] = 0
+                        kf_world.reset()
+                        world_kf_time[0] = 0.0
+                        world_kf_reject_count[0] = 0
+                        pose_history.reset()
                         ff_moving[0] = False
                         ff_exit_count[0] = 0
                         ff_stop_count[0] = 0
@@ -1788,15 +1961,23 @@ def main():
                                     if (pos_ff_allow > 0.05
                                             and pos_err_cam[_ax] * hand_v > 0.0
                                             and abs(hand_v) > FF_KF_DEADBAND_OFF):
-                                        if pos_err_cam[_ax] * raw_v > 0.0:
-                                            eff_ff = max(
-                                                min(abs(raw_v), abs(hand_v)),
-                                                support_w * pos_ff_allow * abs(hand_v))
+                                        if use_world_kf and kf_world.initialized:
+                                            # L1 世界系纯净手速前馈：同速巡航时不衰减，
+                                            # 随停靠渐弱 ff_scale、伸展度与振荡度平滑退出。
+                                            v_cam[_ax] += (
+                                                WORLD_KF_FF_GAIN * ff_scale
+                                                * ff_scale_ext * pos_ff_allow
+                                                * hand_v)
                                         else:
-                                            eff_ff = support_w * pos_ff_allow * abs(hand_v)
-                                        v_cam[_ax] += (
-                                            eff_vel_ff * pos_ff_allow * ff_scale
-                                            * np.copysign(eff_ff, pos_err_cam[_ax]))
+                                            if pos_err_cam[_ax] * raw_v > 0.0:
+                                                eff_ff = max(
+                                                    min(abs(raw_v), abs(hand_v)),
+                                                    support_w * pos_ff_allow * abs(hand_v))
+                                            else:
+                                                eff_ff = support_w * pos_ff_allow * abs(hand_v)
+                                            v_cam[_ax] += (
+                                                eff_vel_ff * pos_ff_allow * ff_scale
+                                                * np.copysign(eff_ff, pos_err_cam[_ax]))
                                     elif ax_brake and pos_err_cam[_ax] * raw_v < 0.0:
                                         damping_gain = (VEL_FEEDFORWARD
                                                         * max(ff_scale, 0.75))
@@ -1906,7 +2087,24 @@ def main():
                     else:
                         damping = DAMPING_BASE
 
-                    joint_vel = compute_damped_pseudoinverse(J_robot, damping) @ v_world
+                    # L1-B 大误差巡航软姿态优先级（Weighted DLS）：高速追手时适度放松俯仰
+                    # 刚度，减少 J4 强行抵消 J2+J3 抢占大臂速度；近端停靠与接近软角上限时自动恢复 1.0。
+                    ori_cruise_w = compute_orientation_cruise_weight(
+                        pos_err_norm, float(np.linalg.norm(ori_err)),
+                        min_weight=ORI_CRUISE_WEIGHT_MIN,
+                        start_err=0.08, full_err=0.18,
+                        ori_soft_max_rad=ORI_SOFT_MAX_RAD,
+                        active=(ff_moving[0] and hold_latch[0] is None
+                                and osc_max < 0.25 and not in_deadband[0]))
+                    if ori_cruise_w < 0.999:
+                        row_w = np.array([1.0, 1.0, 1.0,
+                                          ori_cruise_w, ori_cruise_w, ori_cruise_w],
+                                         dtype=np.float64)
+                        joint_vel = compute_weighted_damped_pseudoinverse(
+                            J_robot, row_w, damping) @ v_world
+                    else:
+                        joint_vel = compute_damped_pseudoinverse(
+                            J_robot, damping) @ v_world
                     # 非伸展远距巡航启用 [J1,J5] 与 [J2,J3,J4,J6] 分组限速：消除水平偏航
                     # 与竖直俯仰互相拖慢（日志中占远距追赶 21%），停靠与伸展段切回全轴
                     # 统一缩放以压低斜向合成动能、保障停稳无过冲。
@@ -1918,7 +2116,7 @@ def main():
                         and ext_s < 0.5
                         and osc_max < 0.25)
                     joint_vel = scale_joint_velocities(
-                        joint_vel, MAX_VEL_JOINT, grouped=use_grouped_scale)
+                        joint_vel, joint_speed_limits, grouped=use_grouped_scale)
                     # 平滑进死区：高速冲入死区时走上方 EMA + max_accel 斜坡平顺刹停，
                     # 避免 2.0 rad/s → 0.0 的 10ms 阶跃急刹激发伸展悬臂弹性回弹；
                     # 仅在低速尾段或 static_hold 激活时才硬置零。
@@ -1938,9 +2136,9 @@ def main():
                         qdot_cmd = ((current_joints - prev_command_joints[0])
                                     / max(float(dt), 1e-3))
                         # 控制周期抖动时防止差分被放大；正常斜坡本就在
-                        # MAX_VEL_JOINT 内，钳位只影响异常采样。
+                        # joint_speed_limits 内，钳位只影响异常采样。
                         qdot_cmd = np.clip(qdot_cmd,
-                                           -MAX_VEL_JOINT, MAX_VEL_JOINT)
+                                           -joint_speed_limits, joint_speed_limits)
                         if np.all(np.isfinite(qdot_cmd)):
                             prev_camera_twist[0] = camera_twist_from_tcp(
                                 J_robot @ qdot_cmd, tcp_rot, T_tcp_camera)
@@ -1968,6 +2166,10 @@ def main():
                     settle_guard.reset()
                     osc_damper.reset()
                     osc_levels_now[0][:] = 0.0
+                    kf_world.reset()
+                    world_kf_time[0] = 0.0
+                    world_kf_reject_count[0] = 0
+                    pose_history.reset()
                     prev_command_joints[0] = None
                     hold_world[0] = None
                     last_joint_speed[0] = 0.0
@@ -1991,6 +2193,10 @@ def main():
                 kf_last_seq[0] = -1
                 kf_time[0] = 0.0
                 kf_reject_count[0] = 0
+                kf_world.reset()
+                world_kf_time[0] = 0.0
+                world_kf_reject_count[0] = 0
+                pose_history.reset()
                 ff_moving[0] = False
                 ff_exit_count[0] = 0
                 ff_stop_count[0] = 0

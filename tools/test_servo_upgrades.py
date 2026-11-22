@@ -16,7 +16,10 @@ from servo_timing import (AdaptiveLeadGate, FastStartGate, SlowFollowGate,
                           CameraTimestampCalibrator, AxisProcessNoiseGate,
                           StaticVelocityHold, DelayedTwistCompensator,
                           PostBrakeSettleGuard, OscillationDamper,
+                          CameraPoseHistory,
                           compute_reach_schedule,
+                          compute_orientation_cruise_weight,
+                          compute_weighted_damped_pseudoinverse,
                           adaptive_feedforward_scale,
                           apply_axis_reversal_damping, scale_joint_velocities,
                           camera_twist_from_tcp, compensate_palm_velocity,
@@ -888,6 +891,109 @@ class OscillationDamperTests(unittest.TestCase):
         np.testing.assert_array_equal(out, np.zeros(3))
         with self.assertRaises(ValueError):
             OscillationDamper(min_half_s=0.5, max_half_s=0.3)
+
+
+class CameraPoseHistoryTests(unittest.TestCase):
+    def test_static_world_point_invariant_under_translating_rotating_camera(self):
+        hist = CameraPoseHistory(lpf_tau_s=0.0, max_history_s=0.60)
+        T_tc = np.eye(4)
+        T_tc[:3, 3] = np.array([0.02, -0.01, 0.05])
+        world_hand = np.array([0.35, 0.12, 0.55])
+        delay_s = 0.14
+
+        def pose_at(tau):
+            p = np.array([0.10 + 0.30 * tau, 0.05 * np.sin(3.0 * tau), 0.30])
+            ang = 0.25 * tau
+            c, s = np.cos(ang), np.sin(ang)
+            R = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+            return p, R
+
+        for k in range(50):
+            t = k * 0.01
+            p_cmd, R_cmd = pose_at(t)
+            self.assertTrue(hist.push(t, p_cmd, R_cmd, T_tc, dt=0.01))
+            if t >= delay_s + 0.02:
+                # 物理相机实际位姿落后命令 delay_s
+                p_phys, R_phys = pose_at(t - delay_s)
+                p_cam_phys = p_phys + R_phys @ T_tc[:3, 3]
+                R_cam_phys = R_phys @ T_tc[:3, :3]
+                obs_cam = R_cam_phys.T @ (world_hand - p_cam_phys)
+                p_lu, R_lu = hist.lookup(t - delay_s, use_lpf=True)
+                # 旋转矩阵必须保持正交且 det=+1
+                np.testing.assert_allclose(R_lu.T @ R_lu, np.eye(3), atol=1e-6)
+                self.assertAlmostEqual(float(np.linalg.det(R_lu)), 1.0, places=6)
+                reconstructed_world = p_lu + R_lu @ obs_cam
+                np.testing.assert_allclose(
+                    reconstructed_world, world_hand, atol=2e-3)
+
+    def test_blended_pose_interpolates_and_handles_invalid_inputs(self):
+        hist = CameraPoseHistory(lpf_tau_s=0.0, max_history_s=0.50)
+        T_tc = np.eye(4)
+        for k in range(25):
+            t = k * 0.01
+            hist.push(t, np.array([t, 0.0, 0.0]), np.eye(3), T_tc, dt=0.01)
+        p0, _ = hist.blended_pose(0.24, 0.14, 0.0)
+        p1, _ = hist.blended_pose(0.24, 0.14, 1.0)
+        pm, _ = hist.blended_pose(0.24, 0.14, 0.5)
+        self.assertAlmostEqual(p0[0], 0.10, places=4)
+        self.assertAlmostEqual(p1[0], 0.24, places=4)
+        self.assertAlmostEqual(pm[0], 0.17, places=4)
+        self.assertFalse(hist.push(0.25, np.array([np.nan, 0.0, 0.0]),
+                                   np.eye(3), T_tc, dt=0.01))
+
+
+class OrientationPriorityAndJointLimitsTests(unittest.TestCase):
+    def test_orientation_weight_relaxes_in_far_cruise_and_guards_tilt_limit(self):
+        # 停靠区或未激活：保持 1.0 刚性姿态
+        self.assertEqual(compute_orientation_cruise_weight(0.05, 0.01), 1.0)
+        self.assertEqual(compute_orientation_cruise_weight(
+            0.20, 0.01, active=False), 1.0)
+        # 大误差且小倾角：平滑下调至 min_weight=0.40
+        w_far = compute_orientation_cruise_weight(
+            0.20, np.deg2rad(2.0), min_weight=0.40,
+            ori_soft_max_rad=np.deg2rad(10.0))
+        self.assertAlmostEqual(w_far, 0.40, places=6)
+        # 倾角接近 10° 软上限：自动拉回 1.0 防止相机丢手
+        w_guard = compute_orientation_cruise_weight(
+            0.20, np.deg2rad(10.0), min_weight=0.40,
+            ori_soft_max_rad=np.deg2rad(10.0))
+        self.assertEqual(w_guard, 1.0)
+
+    def test_weighted_dls_matches_standard_at_unit_weight_and_frees_wrist(self):
+        # 构造类似 B601 的竖直+俯仰耦合雅可比：z 靠 J2/J3，俯仰由 J2+J3+J4 决定
+        J = np.eye(6, dtype=np.float64)
+        J[2, 1] = 0.25
+        J[2, 2] = 0.25
+        J[2, 2] = 0.20
+        J[4, 1] = 1.0
+        J[4, 2] = 1.0
+        J[4, 3] = 1.0
+        J[4, 4] = 0.0
+        J[3, 4] = 1.0
+        v = np.array([0.0, 0.0, 0.50, 0.0, 0.0, 0.0])
+        dq_rigid = compute_weighted_damped_pseudoinverse(
+            J, np.ones(6), damping=0.05) @ v
+        # 校验单位权重与标准伪逆恒等
+        JJT = J @ J.T
+        dq_std = J.T @ np.linalg.inv(JJT + (0.05 ** 2) * np.eye(6)) @ v
+        np.testing.assert_allclose(dq_rigid, dq_std, atol=1e-10)
+        # 降低姿态行权重后，平移速度仍高精度满足，且手腕 J4 负担下降
+        dq_soft = compute_weighted_damped_pseudoinverse(
+            J, np.array([1.0, 1.0, 1.0, 0.40, 0.40, 0.40]), damping=0.05) @ v
+        self.assertLess(abs(dq_soft[3]), abs(dq_rigid[3]))
+        self.assertAlmostEqual(float((J @ dq_soft)[2]), float((J @ dq_rigid)[2]), places=2)
+
+    def test_per_joint_vector_limits_free_wrist_without_exceeding_j2_j3(self):
+        limits = np.array([2.4, 2.0, 2.0, 2.8, 2.8, 2.2])
+        # J4=2.6, J2=1.5, J3=1.4：按统一 2.0 会把 J2/J3 砍到 1.15/1.08；按 L2 向量不限速
+        dq = np.array([1.8, 1.5, 1.4, 2.6, 1.8, 0.2])
+        scaled_l2 = scale_joint_velocities(dq, limits, grouped=False)
+        np.testing.assert_allclose(scaled_l2, dq, atol=1e-12)
+        # 一旦承重 J2 超 2.0，必须严格压回 <=2.0
+        dq_over = np.array([1.0, 2.5, 1.5, 2.6, 1.0, 0.0])
+        scaled_safe = scale_joint_velocities(dq_over, limits, grouped=False)
+        self.assertAlmostEqual(scaled_safe[1], 2.0, places=6)
+        self.assertTrue(np.all(np.abs(scaled_safe) <= limits + 1e-9))
 
 
 if __name__ == "__main__":
