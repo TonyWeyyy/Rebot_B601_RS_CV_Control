@@ -1046,6 +1046,38 @@ class OrientationPriorityAndJointLimitsTests(unittest.TestCase):
         self.assertEqual(damper.streak[0], 0)
         np.testing.assert_array_equal(lv_rst, np.zeros(3))
 
+    def test_kf_partial_xy_update_tracks_xy_without_touching_frozen_z(self):
+        kf = KalmanTarget3D(q=2.0, r_xy=0.0023, r_z=0.0038)
+        # 未初始化时不得用部分观测强行初始化
+        self.assertFalse(kf.update_partial([0.1, 0.2], [[1, 0, 0], [0, 1, 0]], 0.02))
+        kf.update([0.0, 0.0, 0.40], 0.0)
+        kf.x[5] = 0.0
+        # 模拟 10 帧深度冻结期间，手掌沿 X/Y 高速移动，仅更新 XY
+        H_xy = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        for k in range(1, 11):
+            t = k * 0.02
+            ok = kf.update_partial([0.40 * t, -0.30 * t], H_xy, 0.02)
+            self.assertTrue(ok)
+        # X/Y 位置与速度已紧跟移动，Z 位置和 Z 速度丝毫未被污染
+        self.assertAlmostEqual(kf.position()[2], 0.40, places=9)
+        self.assertAlmostEqual(kf.velocity()[2], 0.0, places=9)
+        self.assertGreater(kf.position()[0], 0.06)
+        self.assertGreater(kf.velocity()[0], 0.25)
+        self.assertLess(kf.velocity()[1], -0.18)
+        # 旋转子空间（世界系相机 XY 平面）验证：沿光轴方向的深度分量保持不变
+        kf_w = KalmanTarget3D(q=2.0, r_xy=0.0023, r_z=0.0038)
+        kf_w.update([0.0, 0.0, 0.50], 0.0)
+        ang = np.deg2rad(30.0)
+        R = np.array([[np.cos(ang), 0.0, np.sin(ang)],
+                      [0.0, 1.0, 0.0],
+                      [-np.sin(ang), 0.0, np.cos(ang)]])
+        H_w = R[:, :2].T
+        opt_axis = R[:, 2]
+        z_before = float(np.dot(opt_axis, kf_w.position()))
+        self.assertTrue(kf_w.update_partial([0.10, 0.05], H_w, 0.02))
+        z_after = float(np.dot(opt_axis, kf_w.position()))
+        self.assertAlmostEqual(z_after, z_before, places=9)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

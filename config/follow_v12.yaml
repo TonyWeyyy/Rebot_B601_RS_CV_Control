@@ -1,17 +1,19 @@
 # ============================================================
-# 【v12.1-dev / L1（双共识世界系 KF + Smith 预估 + 软姿态）+ L2（停靠自适应分关节限速）】
+# 【v12.2-dev / L1+L2 满效提速与顺滑版（基于 212533 零振荡实机日志全量升级）】
 # ------------------------------------------------------------
-# 基于 v12.0-dev 实机日志（210645 / 210848，跟踪误差已大降 -30%）针对性根治 4 类稳态短板：
-#   1) 双估计器保守共识速度（consensus_velocity）：同时运行世界系 KF 与带 ±40ms 局部容错窗的
-#      DelayedTwistCompensator，逐轴取同向较小幅值（异向归零），根治 210848 停手后 110~180ms
-#      的机械回弹二次误解锁（rapid reunlocks）与小幅自激；
-#   2) 世界系前馈小信号保护（≤7.5cm 为 0，7.5~14cm 平滑切入）+ 参数收敛
-#      （world_kf_smith_blend=0.55, world_kf_ff_gain=0.45, ori_cruise_weight_min=0.60），
-#      彻底消除 210848 t=46.5~47.5s 的 2.0Hz 小幅水平振铃；
-#   3) 振荡阻尼器短暂停手改衰减不清零（decay-on-inactive）：保留连击记忆，在 210848
-#      t=18.67s 提前 1.23 秒压死竖直振荡，同时正常快挥 194645 误触仅 1.7%；
-#   4) 关节软限位缓冲（最后 ~4.6° 平滑收紧外推）+ L2 停靠/伸展自适应收回 ≤2.0 rad/s：
-#      消除 210848 t=18.72s J4 顶死 +1.40rad 导致的 10° 俯仰冲击，大误差追手仍全享 L2 提速。
+# 在 v12.1 零自激共振稳态基础上，落实 5 项定向提速与防顿挫升级（不触碰 MIT 底层、J2/J3 严守 ≤2.0）：
+#   1) 深度冻结期 XY 子空间持续更新（KalmanTarget3D.update_partial）：严格不采纳无效深度 Z
+#      （四层深度保护链 100% 完整），但用新鲜 2D XY 持续更新 kf 与 kf_world，消除深度恢复瞬间的
+#      跳变门拒收、KF 重同步清零与 200ms 追手中途急刹；
+#   2) 非对称双估计器保持门控（严进宽出 + kf_ff_stop_delay_s=0.08s）：死区外折返过零时需
+#      世界系与自运动补偿两路同时低于 deadband_off 才锁存静止，消除中途假停顿；停手唤醒仍
+#      严格走 consensus_velocity，停稳零退化；
+#   3) 精准释放 5.5~11cm 未饱和黄金区：世界系前馈 5.5~11cm 切入（world_kf_ff_gain=0.52），
+#      L2 6.5~11cm 放开并启用全量安全硬包络 [2.50, 2.00, 2.00, 3.00, 3.00, 2.40]、max_vel=0.85、
+#      max_accel=3.55（≤5.5cm 停靠区仍完整收回 ≤2.0 rad/s 与零正向前馈）；
+#   4) 高速短丢手桥接增强：LK 光流升级 3 层金字塔（31x31、box_half=52、max_step_px=115），
+#      coast 允许误差放宽至 0.22m（仍受 0.12s/0.35m/s/软墙边界约束）；
+#   5) 开启硬件曝光时间戳校准（camera_hw_timestamp_enable=true，异常自动安全回退主机时钟）。
 # ============================================================
 
 follow:
@@ -23,21 +25,21 @@ follow:
   gain: 2.55              # 竖直/深度方向位置增益（Y/Z）：保持 v11.0 稳态小信号基准
   gain_x: 2.02            # 水平方向增益（X，靠底座 J1 偏航）
 
-  # ---- 速度上限（L2 分关节差异化限速）----
-  max_vel: 0.80           # 最大末端线速度 (m/s)（L2 硬上限 0.85）
-  max_vel_joint: 2.00     # 标量回退关节速度上限 (rad/s)
-  max_vel_joints: [2.40, 2.00, 2.00, 2.80, 2.80, 2.20]
+  # ---- 速度上限（L2 分关节差异化限速，满用安全硬包络）----
+  max_vel: 0.85           # 最大末端线速度 (m/s)（L2 安全硬上限 0.85）
+  max_vel_joint: 2.00     # 标量回退与停靠段关节速度上限 (rad/s)
+  max_vel_joints: [2.50, 2.00, 2.00, 3.00, 3.00, 2.40]
                           # L2 逐轴安全限速 [J1, J2, J3, J4, J5, J6] (rad/s)：
-                          # J2/J3 承重关节严守 ≤2.00；J4/J5 轻载手腕 2.80；J1 底座偏航 2.40
+                          # J2/J3 承重关节严守 ≤2.00；J4/J5 轻载手腕 3.00；J1 底座偏航 2.50
   max_vel_angular: 2.00   # 最大角速度 (rad/s)
   joint_vel_grouped_cruise: true  # 非伸展、非振荡远距巡航启用 [J1,J5]/[J2,J3,J4,J6] 分组限速
 
   # ---- L1-A 世界系卡尔曼滤波 + Smith 预估器 ----
-  world_kf_enable: true           # 开启滞后对齐世界系 KF + 双共识速度 + Smith 预估
+  world_kf_enable: true           # 开启滞后对齐世界系 KF + 非对称双共识速度 + Smith 预估
   world_kf_pose_delay_s: 0.14     # 与实测 140ms 执行器/视觉闭环滞后对齐 (s)
   world_kf_pose_lpf_tau_s: 0.04   # 匹配二阶 MIT 机电上升时间的位姿低通 (s)
   world_kf_smith_blend: 0.55      # Smith 预估反投影混合比例 [0, 1]（降低滞后失配敏感度）
-  world_kf_ff_gain: 0.45          # 纯净世界系手速巡航前馈增益（≤7.5cm 为 0，>7.5cm 平滑切入）
+  world_kf_ff_gain: 0.52          # 纯净世界系手速巡航前馈增益（≤5.5cm 为 0，5.5~11cm 切入）
 
   # ---- L1-B 大误差巡航姿态软优先级（Weighted DLS）----
   ori_cruise_weight_min: 0.60     # >8cm 追赶段姿态行权重下限（兼顾释放 J4 与控制光学杠杆）
@@ -76,7 +78,7 @@ follow:
   kf_ff_deadband_off: 0.06
   kf_ff_deadband_on: 0.130
   kf_ff_exit_frames: 6            # L1-C 回调至 6 帧（60ms），与世界系 KF 配合进一步压实稳停
-  kf_ff_stop_delay_s: 0.04
+  kf_ff_stop_delay_s: 0.08        # 死区外双估计器同时静默确认 80ms，彻底消除快挥折返假停顿
   kf_fast_start_enable: true
   kf_fast_start_frames: 2
   kf_fast_start_dist: 0.032
@@ -117,7 +119,7 @@ follow:
   reversal_fast_response: true
 
   # ---- 加速度限制 ----
-  max_accel: 3.30
+  max_accel: 3.55                 # 中近区提速（伸展与刹车仍受 reach_accel_min_scale 保护）
   reversal_accel_boost: 2.00
   reversal_residual_scale: 0.18
   depth_oe_min_cutoff: 0.85
@@ -159,18 +161,18 @@ follow:
 
   # ---- 相机与诊断 ----
   fps: 60
-  camera_hw_timestamp_enable: false
+  camera_hw_timestamp_enable: true  # 开启 Gemini 2 硬件曝光时间戳（异常自动回退主机时钟）
   camera_hw_max_transport_s: 0.20
   diag_enable: true
   diag_queue_size: 8192
   diag_actual_feedback_hz: 0.0
   color_exposure_ms: 6.0
 
-  # ---- 检测+跟踪混合（光流桥接）----
+  # ---- 检测+跟踪混合（3 层金字塔光流桥接，增强高速挥手防掉检）----
   hybrid_track_enable: true
   hybrid_max_frames: 15
-  hybrid_box_half: 45
-  hybrid_max_step_px: 90
+  hybrid_box_half: 52
+  hybrid_max_step_px: 115
 
   # ---- 进阶与安全边界参数 ----
   servo_direction: 1.0

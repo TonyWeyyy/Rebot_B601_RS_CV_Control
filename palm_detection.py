@@ -220,7 +220,7 @@ class LKPalmBridge:
                 and self._prev_gray is not None:
             pts2, st, _ = cv2.calcOpticalFlowPyrLK(
                 self._prev_gray, gray, self._pts, None,
-                winSize=(25, 25), maxLevel=2)
+                winSize=(31, 31), maxLevel=3)
             if pts2 is not None:
                 st = st.reshape(-1).astype(bool)
                 good_new = pts2.reshape(-1, 2)[st]

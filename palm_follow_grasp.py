@@ -1386,6 +1386,9 @@ def main():
             # 使用时再按 now-kf_time 外推到现在，避免异步观测的时间错位。
             new_kf_meas = bool(visible and target_cam is not None
                                and not frozen_meas and obs_seq != kf_last_seq[0])
+            new_frozen_xy_meas = bool(
+                visible and target_cam is not None and frozen_meas
+                and kf.initialized and obs_seq != kf_last_seq[0])
             lead_s = 0.0
             if KF_ENABLE:
                 kf_rejected_now[0] = False
@@ -1497,6 +1500,43 @@ def main():
                                     kf_world.update(target_w_meas, dt_w)
                                     world_kf_time[0] = meas_time
                                     world_kf_reject_count[0] = 0
+                elif new_frozen_xy_meas:
+                    # 深度冻结期间（2D 关键点仍新鲜）：严格不采纳无效深度 Z，仅用
+                    # XY 子空间观测持续更新 kf 与 kf_world，避免深度恢复瞬间因 XY 脱节
+                    # 触发跳变门拒收、KF 重同步速度清零和 200ms 追手中途急刹。
+                    meas_time = max(
+                        obs_time if obs_time > 0.0 else t0, kf_time[0] + 1e-3)
+                    dt_meas = float(np.clip(meas_time - kf_time[0], 1e-3, 0.50))
+                    pred_xy = kf.position()[:2] + kf.velocity()[:2] * dt_meas
+                    innov_xy = float(np.linalg.norm(target_cam[:2] - pred_xy))
+                    gate_xy = (0.08 + 2.0 * float(np.linalg.norm(
+                        kf.velocity()[:2])) * dt_meas)
+                    if innov_xy <= gate_xy:
+                        kf.x[5] = 0.0  # 冻结期间保持相机 Z 速度为 0，不漂移 Z 状态
+                        kf.update_partial(
+                            target_cam[:2],
+                            np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+                            dt_meas)
+                        kf_time[0] = meas_time
+                        kf_reject_count[0] = 0
+                    if use_world_kf and kf_world.initialized:
+                        p_cam_d, R_cam_d = pose_history.lookup(
+                            meas_time - WORLD_KF_POSE_DELAY_S, use_lpf=True)
+                        if p_cam_d is not None and R_cam_d is not None:
+                            dt_w = float(np.clip(
+                                meas_time - world_kf_time[0], 1e-3, 0.50))
+                            H_w_xy = R_cam_d[:, :2].T
+                            z_w_xy = target_cam[:2] + H_w_xy @ p_cam_d
+                            pred_w_xy = H_w_xy @ (
+                                kf_world.position() + kf_world.velocity() * dt_w)
+                            innov_w_xy = float(np.linalg.norm(z_w_xy - pred_w_xy))
+                            gate_w_xy = (0.08 + 2.0 * float(np.linalg.norm(
+                                kf_world.velocity())) * dt_w)
+                            if innov_w_xy <= gate_w_xy:
+                                kf_world.update_partial(z_w_xy, H_w_xy, dt_w)
+                                world_kf_time[0] = meas_time
+                                world_kf_reject_count[0] = 0
+                    kf_last_seq[0] = obs_seq
 
                 _kv_raw = kf.velocity() if kf.initialized else np.zeros(3)
                 if frozen_meas:
@@ -1520,6 +1560,7 @@ def main():
                                  _kv_raw, kf.position(), now=t0,
                                  near_stop=near_stop_mode)
                              if kf.initialized else _kv_raw.copy())
+                _kv_world_cam = None
                 if use_world_kf and kf_world.initialized:
                     _, _R_cam_now = pose_history.latest(use_lpf=False)
                     _kv_world_cam = (_R_cam_now.T @ kf_world.velocity()
@@ -1532,14 +1573,25 @@ def main():
                     _kv = _kv_twist
                 if frozen_meas:
                     _kv[2] = 0.0
+                    _kv_twist[2] = 0.0
+                    if _kv_world_cam is not None:
+                        _kv_world_cam[2] = 0.0
                 _kvn = float(np.linalg.norm(_kv))
+                # 非对称双估计器保持判定：死区外连续追赶折返过零时，两估计器短暂 20~40ms
+                # 异号不应触发中途误停顿，需两路同时低于 deadband_off 才进入静止确认；
+                # 死区内、振荡抑制及所有唤醒仍严格使用共识速度 _kvn。
+                _kvn_stay = (max(float(np.linalg.norm(_kv_world_cam)),
+                                 float(np.linalg.norm(_kv_twist)))
+                             if _kv_world_cam is not None else _kvn)
                 _was_moving = ff_moving[0]
                 if ff_moving[0]:
-                    if _kvn < FF_KF_DEADBAND_OFF:
+                    osc_stopping = (float(np.max(osc_levels_now[0])) >= 0.50)
+                    speed_for_stop = (_kvn if (in_deadband[0] or osc_stopping)
+                                      else _kvn_stay)
+                    if speed_for_stop < FF_KF_DEADBAND_OFF:
                         ff_stop_count[0] += 1
                         # 死区内或振荡抑制期立即锁存静止；正常死区外需连续确认
                         # kf_ff_stop_delay_s，避免快挥折返过零误停顿。
-                        osc_stopping = (float(np.max(osc_levels_now[0])) >= 0.50)
                         if (in_deadband[0] or osc_stopping
                                 or ff_stop_count[0] >= KF_FF_STOP_FRAMES):
                             ff_moving[0] = False
@@ -1686,8 +1738,9 @@ def main():
                     target_cam - np.array([0.0, 0.0, desired_depth]))) \
                     if target_cam is not None else 1e9
             elif (target_cam is not None and 0 < lost_counter[0] <= COAST_FRAMES
-                    and coast_err[0] < 0.15
-                    and not near_wall[0] and reach_r_now[0] <= REACH_SOFT_START):
+                    and coast_err[0] < 0.22
+                    and not near_wall[0]
+                    and reach_r_now[0] <= REACH_SOFT_START + 0.04):
                 coast_offset[0] += coast_vel[0] * dt
                 coast_vel[0] *= scaled_decay(COAST_DECAY, dt, CTRL_RATE)
             if target_cam is not None and lost_counter[0] > 0:
@@ -1969,11 +2022,11 @@ def main():
                                             and pos_err_cam[_ax] * hand_v > 0.0
                                             and abs(hand_v) > FF_KF_DEADBAND_OFF):
                                         if use_world_kf and kf_world.initialized:
-                                            # L1 世界系纯净手速前馈：仅在 >7.5cm 巡航区平滑切入
-                                            # （≤7.5cm 小信号停靠区为 0，杜绝 2Hz 小幅自激），
+                                            # L1 世界系纯净手速前馈：≤5.5cm 小信号停靠区为 0
+                                            # （杜绝 2Hz 小幅自激），5.5~11.0cm 平滑切入全量追赶，
                                             # 并随伸展度与振荡度平滑退出。
                                             wkf_t = float(np.clip(
-                                                (pos_err_norm - 0.075) / 0.065,
+                                                (pos_err_norm - 0.055) / 0.055,
                                                 0.0, 1.0))
                                             wkf_err_gate = wkf_t * wkf_t * (3.0 - 2.0 * wkf_t)
                                             v_cam[_ax] += (
@@ -2127,21 +2180,25 @@ def main():
                         and pos_err_norm > ff_taper_now[0]
                         and ext_s < 0.5
                         and osc_max < 0.25)
-                    # L2 停靠/伸展安全限速平滑收紧：大误差追手（>8cm、非深伸展、无振荡）
-                    # 释放全量 L2 分关节限速（如 J1=2.4, J4/J5=2.8）；进入 ≤8cm 停靠区、
-                    # 深伸展或振荡抑制时平滑收回至 ≤MAX_VEL_JOINT（2.0 rad/s），降低停靠动能。
+                    # L2 停靠/伸展安全限速平滑收紧：>6.5cm 追手平滑释放 L2 分关节限速
+                    # （底座/大臂 [J1-J3] 在 ext_s<0.60 放开，轻载腕部 [J4-J6] 在 ext_s<0.75 放开）；
+                    # 进入 ≤6.5cm 停靠区、深伸展或振荡抑制时完整收回至 ≤MAX_VEL_JOINT（2.0 rad/s）。
                     l2_dock_limits = np.minimum(
                         joint_speed_limits, MAX_VEL_JOINT)
                     if (ff_moving[0] and hold_latch[0] is None
-                            and osc_max < 0.25 and ext_s < 0.60
-                            and pos_err_norm > 0.08):
+                            and osc_max < 0.25 and pos_err_norm > 0.065):
                         l2_t = float(np.clip(
-                            (pos_err_norm - 0.08) / 0.06, 0.0, 1.0))
-                        l2_blend = (l2_t * l2_t * (3.0 - 2.0 * l2_t)
-                                    * (1.0 - ext_s / 0.60))
+                            (pos_err_norm - 0.065) / 0.045, 0.0, 1.0))
+                        l2_s = l2_t * l2_t * (3.0 - 2.0 * l2_t)
+                        arm_ext_w = float(np.clip(1.0 - ext_s / 0.60, 0.0, 1.0))
+                        wrist_ext_w = float(np.clip(1.0 - ext_s / 0.75, 0.0, 1.0))
+                        l2_blend_vec = np.array(
+                            [arm_ext_w, arm_ext_w, arm_ext_w,
+                             wrist_ext_w, wrist_ext_w, wrist_ext_w],
+                            dtype=np.float64) * l2_s
                         eff_joint_limits = (
                             l2_dock_limits
-                            + (joint_speed_limits - l2_dock_limits) * l2_blend)
+                            + (joint_speed_limits - l2_dock_limits) * l2_blend_vec)
                     else:
                         eff_joint_limits = l2_dock_limits
                     joint_vel = scale_joint_velocities(
