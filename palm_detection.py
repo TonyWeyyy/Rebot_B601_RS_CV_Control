@@ -24,6 +24,7 @@ import cv2
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
+from servo_timing import compute_roi_box, remap_roi_landmarks
 
 # ── 配置 ──────────────────────────────────────────────────
 PALM_LANDMARK_ID = 9        # 中指根部，作为掌心代表点
@@ -51,7 +52,7 @@ class PalmDetector:
     推理从 CPU XNNPACK ~10ms 降到 GPU ~3-5ms。
     """
 
-    def __init__(self, backend="auto"):
+    def __init__(self, backend="auto", roi_enable=False, roi_scale=0.68):
         if not os.path.exists(MODEL_PATH):
             raise FileNotFoundError(
                 f"未找到模型文件 {MODEL_PATH}\n"
@@ -73,8 +74,19 @@ class PalmDetector:
         if self.backend == "cpu":
             self.detector = self._create(
                 mp_python.BaseOptions.Delegate.CPU)
-        print(f"[检测器] 推理后端: {self.backend.upper()}")
+        self.roi_enable = bool(roi_enable)
+        self.roi_scale = float(roi_scale)
+        self._roi_box = None
+        print(f"[检测器] 推理后端: {self.backend.upper()}"
+              + (f"  ROI加速: ON (scale={self.roi_scale:.2f})"
+                 if self.roi_enable else ""))
         self._timestamp_ms = 0
+
+    def _next_timestamp_ms(self):
+        # VIDEO 模式严格要求时间戳单调递增（同帧 ROI 漏检回退全图时也能保证 +1ms）
+        now_ms = int(time.monotonic() * 1000)
+        self._timestamp_ms = max(self._timestamp_ms + 1, now_ms)
+        return self._timestamp_ms
 
     def _create(self, delegate):
         options = mp_vision.HandLandmarkerOptions(
@@ -89,21 +101,47 @@ class PalmDetector:
 
     def detect(self, color_bgr):
         """
-        返回掌心像素坐标 (u, v) 和全部关键点；未检测到返回 (None, None, None)
+        返回掌心像素坐标 (u, v) 和全图归一化关键点；未检测到返回 (None, None, None)。
+
+        roi_enable=True 时优先对上一帧掌心周边的迟滞 ROI 裁剪图推理（约省 65~74% 像素）；
+        若 ROI 漏检（如超快甩手冲出窗口），同一帧立即回退全图推理并重置 ROI，确保零额外掉帧。
         """
+        h, w = color_bgr.shape[:2]
+        if self.roi_enable and self._roi_box is not None:
+            x0, y0, x1, y1 = self._roi_box
+            if 0 <= x0 < x1 <= w and 0 <= y0 < y1 <= h:
+                roi_rgb = np.ascontiguousarray(
+                    cv2.cvtColor(color_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2RGB))
+                mp_roi = mp.Image(image_format=mp.ImageFormat.SRGB, data=roi_rgb)
+                roi_res = self.detector.detect_for_video(
+                    mp_roi, self._next_timestamp_ms())
+                if roi_res.hand_landmarks:
+                    landmarks = remap_roi_landmarks(
+                        roi_res.hand_landmarks[0], self._roi_box, w, h)
+                    lm = landmarks[PALM_LANDMARK_ID]
+                    u, v = int(lm.x * w), int(lm.y * h)
+                    self._roi_box = compute_roi_box(
+                        w, h, (u, v), prev_box=self._roi_box,
+                        scale=self.roi_scale)
+                    return u, v, landmarks
+            # ROI 漏检：立刻同帧回退全图推理，绝不白丢这一帧
+            self._roi_box = None
+
         rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        # VIDEO 模式要求时间戳单调递增；用真实时钟比固定 +33ms 更利于内部追踪
-        self._timestamp_ms = int(time.monotonic() * 1000)
-        result = self.detector.detect_for_video(mp_image, self._timestamp_ms)
+        result = self.detector.detect_for_video(
+            mp_image, self._next_timestamp_ms())
 
         if not result.hand_landmarks:
+            self._roi_box = None
             return None, None, None
 
         landmarks = result.hand_landmarks[0]
-        h, w = color_bgr.shape[:2]
         lm = landmarks[PALM_LANDMARK_ID]
         u, v = int(lm.x * w), int(lm.y * h)
+        if self.roi_enable:
+            self._roi_box = compute_roi_box(
+                w, h, (u, v), prev_box=None, scale=self.roi_scale)
         return u, v, landmarks
 
     def close(self):

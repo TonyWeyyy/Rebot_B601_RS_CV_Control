@@ -2,6 +2,7 @@
 """视觉伺服的时间与状态切换工具（纯计算，无硬件依赖）。"""
 
 import math
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -1247,6 +1248,79 @@ def apply_joint_limit_cushion(q_now, joint_vel, q_min, q_max, margin_rad=0.08):
                 dq[i] *= float(np.clip(rem / margin, 0.0, 1.0))
                 cushioned = True
     return dq, cushioned
+
+
+def compute_roi_box(frame_w, frame_h, center_uv, prev_box=None,
+                    scale=0.68, min_size=288, margin_ratio=0.26):
+    """计算带迟滞死区的方形 ROI 裁剪框 (x0, y0, x1, y1)，用于加速 MediaPipe 推理。
+
+    - 掌心仍处于上一帧 ROI 内部安全边距（margin_ratio）以内时，保持原裁剪框完全不动，
+      避免每帧微移裁剪框干扰 MediaPipe VIDEO 模式内部跨帧跟踪；
+    - 掌心靠近边缘时重新以掌心居中并钳位到画面边界内；
+    - center_uv 无效或裁剪边长接近全图短边时返回 None（走全图推理）。
+    """
+    try:
+        w = int(frame_w)
+        h = int(frame_h)
+        sc = float(scale)
+        ms = int(min_size)
+        mr = float(margin_ratio)
+    except (TypeError, ValueError):
+        return None
+    if (w <= 0 or h <= 0 or center_uv is None
+            or not math.isfinite(sc) or not math.isfinite(mr)):
+        return None
+    try:
+        u, v = float(center_uv[0]), float(center_uv[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not (math.isfinite(u) and math.isfinite(v)):
+        return None
+
+    short_side = min(w, h)
+    size = min(short_side, max(ms, int(round(short_side * float(np.clip(sc, 0.45, 0.90))))))
+    size = size - (size % 2)
+    if size <= 0 or size >= short_side - 8:
+        return None
+
+    if prev_box is not None and len(prev_box) == 4:
+        px0, py0, px1, py1 = (int(prev_box[0]), int(prev_box[1]),
+                              int(prev_box[2]), int(prev_box[3]))
+        if (0 <= px0 < px1 <= w and 0 <= py0 < py1 <= h
+                and (px1 - px0) == size and (py1 - py0) == size):
+            margin = size * float(np.clip(mr, 0.10, 0.40))
+            if (px0 + margin <= u <= px1 - margin
+                    and py0 + margin <= v <= py1 - margin):
+                return (px0, py0, px1, py1)
+
+    half = size // 2
+    x0 = int(round(u)) - half
+    y0 = int(round(v)) - half
+    x0 = max(0, min(w - size, x0))
+    y0 = max(0, min(h - size, y0))
+    return (x0, y0, x0 + size, y0 + size)
+
+
+def remap_roi_landmarks(landmarks, roi_box, frame_w, frame_h):
+    """将 ROI 局部归一化关键点精确映射回全图归一化坐标，保证捏合距离与绘制完全一致。"""
+    if not landmarks or roi_box is None:
+        return landmarks
+    x0, y0, x1, y1 = roi_box
+    roi_w = float(x1 - x0)
+    roi_h = float(y1 - y0)
+    fw = float(frame_w)
+    fh = float(frame_h)
+    if roi_w <= 0.0 or roi_h <= 0.0 or fw <= 0.0 or fh <= 0.0:
+        return landmarks
+    z_scale = roi_w / fw
+    return [
+        SimpleNamespace(
+            x=(x0 + float(lm.x) * roi_w) / fw,
+            y=(y0 + float(lm.y) * roi_h) / fh,
+            z=float(getattr(lm, "z", 0.0)) * z_scale)
+        for lm in landmarks
+    ]
+
 
 
 

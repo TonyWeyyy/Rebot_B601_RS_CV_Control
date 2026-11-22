@@ -270,9 +270,11 @@ WORLD_KF_POSE_DELAY_S = 0.14      # 相机世界位姿查表延迟，匹配执�
 WORLD_KF_POSE_LPF_TAU_S = 0.04    # 相机位姿低通时间常数，匹配二阶机电上升时间 (s)
 WORLD_KF_SMITH_BLEND = 0.75       # Smith 预估反投影混合比例 [0, 1]（吸收在途指令防过冲）
 WORLD_KF_FF_GAIN = 0.55           # 世界系真实手速巡航前馈增益（近端自动渐弱至 0）
-ORI_CRUISE_WEIGHT_MIN = 1.0       # 大误差巡航段姿态行权重下限（1.0=关闭软让权，0.40=释放 J4）
+ORI_CRUISE_WEIGHT_MIN = 1.0       # 大误差巡航段姿态行权重下限（1.0=关闭软让权，0.80=轻度释放 J4）
 ORI_SOFT_MAX_DEG = 10.0           # 姿态软让权保护角度上限（接近此角自动恢复 1.0 刚度）
 ORI_SOFT_MAX_RAD = np.deg2rad(ORI_SOFT_MAX_DEG)
+ROI_CROP_ENABLE = False           # true = MediaPipe 迟滞 ROI 裁剪推理加速（漏检同帧回退全图）
+ROI_CROP_SCALE = 0.68             # ROI 边长占画面短边比例（0.45~0.90）
 SETTLED_CONFIRM_FRAMES = max(1, round(0.08 / CTRL_RATE))
 
 CAMERA_FPS = 30               # 相机帧率；Gemini2 支持 640x480@60，
@@ -499,6 +501,8 @@ def load_follow_cfg(path):
                "world_kf_ff_gain": 0.55,
                "ori_cruise_weight_min": 1.0,
                "ori_soft_max_deg": 10.0,
+               "roi_crop_enable": False,
+               "roi_crop_scale": 0.68,
                "damping_base": DAMPING_BASE,
                "damping_adaptive": DAMPING_ADAPTIVE,
                "manipulability_threshold": MANIPULABILITY_THRESHOLD,
@@ -555,6 +559,7 @@ def apply_follow_cfg(cfg):
     global WORLD_KF_ENABLE, WORLD_KF_POSE_DELAY_S, WORLD_KF_POSE_LPF_TAU_S
     global WORLD_KF_SMITH_BLEND, WORLD_KF_FF_GAIN
     global ORI_CRUISE_WEIGHT_MIN, ORI_SOFT_MAX_DEG, ORI_SOFT_MAX_RAD
+    global ROI_CROP_ENABLE, ROI_CROP_SCALE
     global WORKSPACE_MIN, WORKSPACE_MAX, WORKSPACE_RADIUS
     global SERVO_DIRECTION, KF_RESYNC_FRAMES, Z3D_MAX_RATE, Z_FREEZE_MAX
     global KF_ADAPT_ENABLE, KF_ADAPT_REF, KF_ADAPT_MAX, KF_ADAPT_DECAY
@@ -712,6 +717,8 @@ def apply_follow_cfg(cfg):
     ORI_CRUISE_WEIGHT_MIN = float(fcfg.get("ori_cruise_weight_min", 1.0))
     ORI_SOFT_MAX_DEG = float(fcfg.get("ori_soft_max_deg", 10.0))
     ORI_SOFT_MAX_RAD = float(np.deg2rad(ORI_SOFT_MAX_DEG))
+    ROI_CROP_ENABLE = bool(fcfg.get("roi_crop_enable", False))
+    ROI_CROP_SCALE = float(fcfg.get("roi_crop_scale", 0.68))
     ws = cfg["workspace"]
     WORKSPACE_MIN = np.array(ws["min"], dtype=np.float64)
     WORKSPACE_MAX = np.array(ws["max"], dtype=np.float64)
@@ -847,6 +854,8 @@ def validate_follow_cfg(cfg):
         (0.20 <= f["ori_cruise_weight_min"] <= 1.0 and
          3.0 <= f["ori_soft_max_deg"] <= 15.0,
          "大误差姿态软优先级参数超出安全范围"),
+        (0.45 <= f["roi_crop_scale"] <= 0.90,
+         "roi_crop_scale 须在 0.45~0.90"),
     ]
     for ok, message in checks:
         if not ok:
@@ -1065,7 +1074,10 @@ def main():
     desired_u, desired_v = int(round(cx)), int(round(cy))   # 期望掌心点 = 画面中心
 
     print("初始化手掌检测...")
-    detector = PalmDetector(backend=args.detector_backend)
+    detector = PalmDetector(
+        backend=args.detector_backend,
+        roi_enable=ROI_CROP_ENABLE,
+        roi_scale=ROI_CROP_SCALE)
     # 检测+跟踪混合：掉检帧光流桥接（hybrid 系列参数见 follow.yaml；
     # 60fps 下彩色流分辨率可能为 1280x720，按 pinch_scale 同步缩放像素窗口与步长）
     lk_bridge = LKPalmBridge(

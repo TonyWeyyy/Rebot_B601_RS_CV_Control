@@ -21,6 +21,7 @@ from servo_timing import (AdaptiveLeadGate, FastStartGate, SlowFollowGate,
                           compute_orientation_cruise_weight,
                           compute_weighted_damped_pseudoinverse,
                           consensus_velocity, apply_joint_limit_cushion,
+                          compute_roi_box, remap_roi_landmarks,
                           adaptive_feedforward_scale,
                           apply_axis_reversal_damping, scale_joint_velocities,
                           camera_twist_from_tcp, compensate_palm_velocity,
@@ -1077,6 +1078,40 @@ class OrientationPriorityAndJointLimitsTests(unittest.TestCase):
         self.assertTrue(kf_w.update_partial([0.10, 0.05], H_w, 0.02))
         z_after = float(np.dot(opt_axis, kf_w.position()))
         self.assertAlmostEqual(z_after, z_before, places=9)
+
+    def test_roi_box_hysteresis_and_exact_landmark_remapping(self):
+        # 640x480 画面下 scale=0.68 -> 约 326x326 ROI
+        box1 = compute_roi_box(640, 480, (320, 240), prev_box=None, scale=0.68)
+        self.assertIsNotNone(box1)
+        x0, y0, x1, y1 = box1
+        self.assertEqual(x1 - x0, y1 - y0)
+        self.assertLess(x1 - x0, 400)
+        # 掌心在安全死区内小幅移动：ROI 框必须完全不动，避免干扰 VIDEO 内部追踪
+        box2 = compute_roi_box(640, 480, (345, 255), prev_box=box1, scale=0.68)
+        self.assertEqual(box2, box1)
+        # 掌心逼近边缘：自动重新居中且严格钳位在画面内
+        box3 = compute_roi_box(640, 480, (610, 460), prev_box=box1, scale=0.68)
+        self.assertNotEqual(box3, box1)
+        self.assertEqual(box3[2], 640)
+        self.assertEqual(box3[3], 480)
+        self.assertIsNone(compute_roi_box(640, 480, None))
+        # ROI 关键点映射回全图归一化坐标后，像素位置与捏合距离必须与全图 100% 一致
+        roi_w = box1[2] - box1[0]
+        roi_h = box1[3] - box1[1]
+        # 假设全图某两点像素为 (300, 220) 与 (360, 250)
+        lm_a = types.SimpleNamespace(
+            x=(300.0 - box1[0]) / roi_w, y=(220.0 - box1[1]) / roi_h, z=-0.05)
+        lm_b = types.SimpleNamespace(
+            x=(360.0 - box1[0]) / roi_w, y=(250.0 - box1[1]) / roi_h, z=-0.05)
+        remapped = remap_roi_landmarks([lm_a, lm_b], box1, 640, 480)
+        self.assertAlmostEqual(remapped[0].x * 640.0, 300.0, places=6)
+        self.assertAlmostEqual(remapped[0].y * 480.0, 220.0, places=6)
+        self.assertAlmostEqual(remapped[1].x * 640.0, 360.0, places=6)
+        self.assertAlmostEqual(remapped[1].y * 480.0, 250.0, places=6)
+        pinch_px = float(np.hypot(
+            (remapped[1].x - remapped[0].x) * 640.0,
+            (remapped[1].y - remapped[0].y) * 480.0))
+        self.assertAlmostEqual(pinch_px, float(np.hypot(60.0, 30.0)), places=6)
 
 
 if __name__ == "__main__":
