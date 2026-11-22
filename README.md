@@ -13,7 +13,64 @@
 > 日常调参只改 `config/follow.yaml`（跟随）和 `config/grasp.yaml`（夹爪）两个文件；
 > 命令行参数临时覆盖。完整的技术原理与踩坑记录见 [技术手册.md](技术手册.md)。
 
-## 最新版本 v11.0（伸展稳停 + 高速追赶定版）
+## 最新版本 v12.0（L1 世界系 KF + L2 分关节差异化限速定版）
+
+本版在 v11.0 伸展稳停与防共振基线之上，**不改动底层 MIT 控制协议、严守承重关节 `J2/J3 ≤ 2.0 rad/s`**，完整落地了 **L1（控制与感知架构升级）+ L2（分关节差异化安全限速）** 并行方案，现已通过多轮实机高频日志验收并定版（对应配置文件 `config/follow_v12.yaml`，已同步至默认 `config/follow.yaml`）。
+
+### 核心升级行为
+
+- **滞后对齐世界系卡尔曼滤波 + Smith 预估器（`CameraPoseHistory` + `kf_world`）**：
+  - 按实测 `140ms` 执行滞后与 `40ms` 机电低通维护相机世界位姿历史缓冲（支持 SO(3) 测地线球面插值），把每帧观测从几何层投影至基座世界系，剥离 eye-in-hand 相机自运动；
+  - 按 `world_kf_smith_blend=0.55` 反投影回相机系吸收在途指令并保持静态重力静差为零；纯净世界系手速前馈 `world_kf_ff_gain=0.52` 仅在 `5.5~11cm` 平滑切入（`≤5.5cm` 停靠区严格为 `0`，杜绝 2Hz 小幅自激）；
+- **非对称双估计器门控（`consensus_velocity`）**：
+  - 同时运行世界系 KF 与带 `±40ms` 容错窗的 `DelayedTwistCompensator`：死区外连续追手折返过零时，需两路同时低于 `deadband_off` 持续 `80ms` 才进入静止（消除中途假停顿）；死区内、振荡抑制及所有停手后唤醒严格采用同向保守交集 `consensus_velocity` + 刹车冷静窗，杜绝回弹二次误解锁；
+- **深度冻结期 XY 子空间持续更新（`KalmanTarget3D.update_partial`）**：
+  - 完整保留四层深度保护链（绝不采纳无效深度 Z），但在 `frozen=1` 且 2D 关键点新鲜期间仅用 XY 子空间（世界系沿光轴正交平面）持续更新 `kf / kf_world`，根除深度空洞恢复时的跳变门拒收、KF 重同步清零与 200ms 追手中途急刹；
+- **L2 分关节差异化安全限速 + 停靠自适应收回 + 关节软限位缓冲**：
+  - 控制层与适配层（`rebot_adapter.py` `HARD_MAX_JOINT_SPEED`）双重硬包络校验：`J2/J3` 承重抗重力关节严守 `≤ 2.00 rad/s`，轻载手腕 `J4/J5` 放宽至 `3.00 rad/s`、底座偏航 `J1` 放宽至 `2.50 rad/s`、末端 `max_vel=0.85 m/s`、`max_accel=3.55 m/s²`；
+  - 进入 `≤6.5cm` 停靠区、深伸展或振荡抑制时平滑收回至 `≤2.00 rad/s`；关节逼近 `q_min/q_max` 最后 `0.08 rad（~4.6°）` 时由 `apply_joint_limit_cushion()` 平滑收紧外推速度，消除撞限位俯仰冲击；
+- **加权阻尼伪逆软姿态优先级（`compute_weighted_damped_pseudoinverse`）**：大误差追手轻度放松姿态权重至 `0.80`（`≤10°` 软角保护自动恢复 `1.0`），兼顾追手顺滑与画面平稳；
+- **迟滞 ROI 裁剪推理加速 + 3 层金字塔光流桥接**：
+  - `PalmDetector` 默认开启 `roi_crop_enable=true`（`scale=0.68`，省约 65~74% 像素计算量），内部 `26%` 迟滞死区防微抖，ROI 漏检时**同帧立即回退全图推理**且将 21 个关键点精确还原为全图归一化坐标（捏合夹爪与绘制零偏差）；
+  - `LKPalmBridge` 升级 `31×31` / 3 层金字塔（`box_half=52, max_step_px=115`），配合 `coast_err < 0.22m` 显著压低高速挥手掉检断档；
+- **振荡阻尼器短暂停手改衰减不清零**：短暂 `ff_moving=0` 期间保留共振连击记忆并按 `decay_tau_s` 平滑衰减，杜绝回弹重启后的探测盲区。
+
+### v12.0 参数摘要
+
+| 参数 | v12.0 最终值 | 说明 |
+| --- | --- | --- |
+| `distance` | `0.40m` | 期望相机到掌心距离 |
+| `gain / gain_x / far_gain_boost` | `2.55 / 2.02 / 0.35` | 小信号基线与 `>8cm` 非线性追赶 |
+| `max_vel / max_vel_angular` | `0.85m/s / 2.00rad/s` | 末端线速与角速度上限 |
+| `max_vel_joints` | `[2.50, 2.00, 2.00, 3.00, 3.00, 2.40]` | L2 分关节安全限速（`J2/J3` 严守 `2.00`） |
+| `world_kf_enable / delay / lpf / smith / ff` | `true / 0.14s / 0.04s / 0.55 / 0.52` | 世界系 KF + Smith 预估 + 纯净前馈 |
+| `ori_cruise_weight_min / ori_soft_max_deg` | `0.80 / 10.0°` | 大误差巡航轻量软姿态优先级 |
+| `kf_ff_deadband_off / on / exit_frames / stop_delay_s` | `0.06 / 0.130 / 6 / 0.08s` | 非对称双估计器滞回与折返防假停 |
+| `max_accel / reversal_accel_boost / smooth_alpha` | `3.55m/s² / 2.00 / 0.50` | 启停与换向动态响应 |
+| `post_brake_settle_s / post_brake_ext_extra_s` | `0.24s / 0.10s` | 刹车回弹冷静窗 |
+| `roi_crop_enable / roi_crop_scale` | `true / 0.68` | MediaPipe 迟滞 ROI 裁剪加速 |
+| `hybrid_box_half / hybrid_max_step_px` | `52 / 115` | 3 层金字塔 LK 光流桥接 |
+| `camera_hw_timestamp_enable` | `false` | 使用稳定无切换抖动的主机单调时钟 |
+
+完整参数以 `config/follow_v12.yaml`（与 `config/follow.yaml` 同步）为准；可随时通过 `--follow-cfg config/follow_v11.yaml` 或 `config/follow_v10.yaml` 一键回退历史版本。
+
+### 离线验证与实机验收基线
+
+```bash
+python3 tools/test_servo_upgrades.py    # 82 项单元测试全部通过
+python3 tools/offline_smoke_test.py     # 正常/故障、--no-gripper 打开、eye-in-hand 静止、v11/v10/v9/v8/v7.1 回退配置校验
+python3 tools/analyze_servo_log.py logs/servo_时间.csv --json
+```
+
+- 实机验收（`213740` / `214900`）：
+  - 跟踪精度：分轴中位误差 `|ex|=4.30~5.68cm`、`|ey|=6.10~6.22cm`、`|ez|=1.95~2.50cm`，P95 跟随误差 `17.9~18.9cm`；
+  - 稳态性能：停手稳定耗时中位数 `0.19~0.23s`，静止残余关节速度 P95 为 `0.000 rad/s`，0 运行错误、0 超时（控制周期工作耗时 P95 `0.73ms`）；
+  - 感知与负载均衡：推理耗时中位数降至 `5.84ms`，观测年龄中位数 `13.6ms`（P95 `22.1ms`），`J4` 大误差饱和从 v11.0 的 `30.2%` 降至 `5.0%~6.8%`；
+- 当前物理天花板说明：v12.0 已接近「纯位置 MIT 斜坡（~140ms 闭环滞后）+ `J2/J3 ≤ 2.0 rad/s`」架构的物理极限；后续若需跨代提速与更强减振，需推进底层 `rebot_control` MIT 速度/重力前馈（L3 路线）。
+
+---
+
+## 历史版本 v11.0（伸展稳停 + 高速追赶定版）
 
 本版基于实机高频日志（B601-RS + Orbbec Gemini 2，60fps / 100Hz 伺服）针对**伸展态停手晃动**与**中远距追手速度**进行了系统升级，现已实机验收并定版（对应配置文件 `config/follow_v11.yaml`，已同步至默认 `config/follow.yaml`）。
 

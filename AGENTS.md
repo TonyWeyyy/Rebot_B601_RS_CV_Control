@@ -38,16 +38,17 @@ python3 tools/analyze_servo_log.py logs/servo_<timestamp>.csv --json
 4. **4-Layer Depth Protection Chain**: Do not remove or bypass the depth guards in `palm_follow_grasp.py`: (1) 7×7→14×14→21×21 median window fallback, (2) jump rejection `|Δz| > z3d_max_jump`, (3) per-frame rate limit `±z3d_max_rate`, (4) 3-frame consistency check (`reacq_buf`) after long loss (≥30 frames) or startup.
 5. **Workspace & Speed Limits**:
    - `workspace.max_radius` (≤ 0.42m, 70% reach rule to prevent J2 stall) applies **only to horizontal radial distance** `hypot(X, Y)` via `horizontal_radial_soft_wall()`, preserving inward, tangential, and vertical Z motion. Exceeding hard boundaries by >5cm triggers automatic slow return to HOME.
-   - Cartesian `max_vel` and adapter `MAX_JOINT_SPEED` (2.0 rad/s) are in series.
+   - Cartesian `max_vel` (≤ 0.85 m/s) and per-joint limits `max_vel_joints` are doubly enforced in `validate_follow_cfg()` and `rebot_adapter.py` (`HARD_MAX_JOINT_SPEED = [2.5, 2.0, 2.0, 3.0, 3.0, 2.5]`, strictly keeping gravity-bearing `J2/J3 <= 2.0 rad/s`; docking/extension/oscillation tapers back to `<= 2.0 rad/s` on all 6 axes, with `apply_joint_limit_cushion()` near `q_min/q_max`).
 6. **Time-Derived Frame Constants**: Never hardcode tick counts for durations. Always derive frame counts from `CTRL_RATE` (e.g., `round(duration_s / CTRL_RATE)`) and scale EMA/decay factors with actual `dt` (`scaled_alpha`, `scaled_decay`).
 
 ## Control & Configuration Conventions
 - **Parameter Precedence**: CLI flags > `config/follow.yaml` & `config/grasp.yaml` > module-level defaults in `palm_follow_grasp.py`.
   - When adding a config parameter to `follow.yaml`, you must: (1) define the module-level default in `palm_follow_grasp.py`, (2) declare it `global` inside `apply_follow_cfg()`, and (3) validate bounds/NaN in `validate_follow_cfg()`.
-- **Fallback Configs**: Keep `config/follow_v11.yaml`, `config/follow_v10.yaml`, `config/follow_v9_fallback.yaml`, `config/follow_v8_fallback.yaml`, and `config/follow_v7.1_fallback.yaml` valid against `validate_follow_cfg()` (verified by `offline_smoke_test.py`).
-- **Stationary & Eye-in-Hand Behavior (v10/v11+)**:
-  - `KalmanTarget3D` updates only when `target_seq` increments on a fresh 3D measurement (skipping KF update when depth is frozen).
-  - Eye-in-hand camera self-motion compensation (`DelayedTwistCompensator`, lag- and LPF-matched to ~140ms plant + ~75ms KF delay) is used for stationary detection (`ff_moving`) and cruise support gating, paired with `PostBrakeSettleGuard`, `compute_reach_schedule` (asymmetric `reach_release_tau`), and `OscillationDamper` (`confirm_reversals=3`, `large_err_release=0.15m`).
+- **Fallback Configs**: Keep `config/follow_v12.yaml`, `config/follow_v11.yaml`, `config/follow_v10.yaml`, `config/follow_v9_fallback.yaml`, `config/follow_v8_fallback.yaml`, and `config/follow_v7.1_fallback.yaml` valid against `validate_follow_cfg()` (verified by `offline_smoke_test.py`).
+- **Stationary & Eye-in-Hand Behavior (v12.0+)**:
+  - `KalmanTarget3D` updates full 3D only when `target_seq` increments on a fresh 3D measurement; during `frozen=1` (fresh 2D landmarks, temporarily invalid depth), `update_partial()` updates ONLY the XY subspace (orthogonal to camera optical axis in world frame) without ever contaminating Z.
+  - Lag-aligned World-Frame KF (`CameraPoseHistory` + `kf_world` + Smith-predictor blended projection) runs alongside `DelayedTwistCompensator`, combined via asymmetric dual-estimator gating (`consensus_velocity` for wake-up/near-stop/FF/lead; both-below-off confirmation for mid-air reversals), paired with `PostBrakeSettleGuard`, `compute_reach_schedule` (asymmetric `reach_release_tau`), `OscillationDamper` (decay-on-inactive, `confirm_reversals=3`, `large_err_release=0.15m`), and `compute_weighted_damped_pseudoinverse` (soft orientation cruise weight with tilt guard).
+  - `PalmDetector` supports hysteresis ROI cropping (`roi_crop_enable`, `compute_roi_box`, `remap_roi_landmarks`) with immediate same-frame full-frame fallback and strictly monotonic VIDEO timestamps.
   - When `ff_moving=False`, the arm holds its current pose (`kf_slow_follow_enable: false`).
 - **Gripper Coupling**:
   - `--no-gripper` actively opens the gripper to `gripper.open_deg` on startup to prevent camera occlusion.
