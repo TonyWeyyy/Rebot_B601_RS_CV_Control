@@ -291,21 +291,12 @@ class WorldPBVSController:
             v_p_cam = v_p_cam * (max_v_eff * math.tanh(v_p_norm / max_v_eff) / v_p_norm)
         v_p_world = cam_rot @ v_p_cam
 
-        # 4. 世界系目标速度前馈（速度感知近端渐弱，≤5.5cm 停靠核心平滑归零）
+        # 4. 世界系目标速度前馈（与 v13.0 实机验收曲线一致：≤5.5cm 为 0，5.5~11cm 线性切入，避免双重衰减）
         ff_scale = 0.0
         v_ff_world = zero3
         if decision.allow_ff and (not osc_active):
-            taper_scale, _, _ = adaptive_feedforward_scale(
-                error_vector=err_w,
-                target_velocity=v_w,
-                base_taper_dist=self.cfg.ff_taper_dist,
-                enabled=True,
-                speed_ref=self.cfg.ff_taper_speed_ref,
-                max_taper_dist=self.cfg.ff_taper_max_dist,
-            )
-            # 停靠核心区 (<= 5.5cm) 彻底退出巡航前馈，杜绝微幅自激
             dock_ramp = float(np.clip((err_norm - 0.055) / 0.055, 0.0, 1.0))
-            ff_scale = float(taper_scale) * dock_ramp * float(rs["ff_scale"])
+            ff_scale = dock_ramp * float(rs["ff_scale"])
             v_ff_world = v_w * (self.cfg.world_ff_gain * ff_scale)
             ff_norm = float(np.linalg.norm(v_ff_world))
             if ff_norm > self.cfg.ff_max_vel:

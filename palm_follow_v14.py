@@ -253,6 +253,8 @@ def main(argv=None) -> int:
                 cleared = backend.clear_safety_fault()
                 if cleared:
                     print("[v14] 已清除 M6 安全监督软停机锁存")
+                # 启动跟随前同步锚定 _q_target，防止重启瞬间指令跳变
+                backend.hold()
             if pipeline is not None:
                 pipeline.reset(keep_pose_history=True)
                 pipeline.lock_current_orientation()

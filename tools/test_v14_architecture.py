@@ -442,6 +442,35 @@ class DigitalTwinAndEndToEndTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             apply_cli_overrides(cfg, bad_args)
 
+    def test_hardware_backend_uses_q_target_not_lagged_command_pos(self):
+        """回归测试：`HardwareRobotBackend.get_state()` 必须返回 `_q_target` 而非滞后的 `get_command_pos()`，防止每拍被 200Hz 斜坡往回拽丢速 30%。"""
+        from servo_v14.robot_backend import HardwareRobotBackend
+
+        class _FakeAdapter:
+            def __init__(self):
+                self._q_target = np.array([0.50, 0.40, 0.30, 0.10, 0.0, 0.0])
+                self.q_min = np.full(6, -2.0)
+                self.q_max = np.full(6, 2.0)
+
+            def get_command_pos(self):
+                # 模拟 200Hz 线程滞后半拍的旧斜坡位置
+                return self._q_target - 0.015
+
+            def get_feedback_state(self, max_age_s=0.05):
+                return {"valid": True, "q": self._q_target - 0.02,
+                        "dq": np.zeros(6), "tau": np.zeros(6),
+                        "age_ms": 0.5, "t_mos": np.full(6, 30.0)}
+
+            def get_safety_status(self):
+                return {"latched": False, "reason": "", "thermal_speed_scale": 1.0}
+
+            def get_mit_loop_stats(self):
+                return {"period_p99_ms": 5.0, "can_fail_total": 0}
+
+        hb = HardwareRobotBackend(adapter=_FakeAdapter())
+        st = hb.get_state(1.0)
+        np.testing.assert_allclose(st.q_cmd, np.array([0.50, 0.40, 0.30, 0.10, 0.0, 0.0]))
+
     def test_v14_main_sim_end_to_end_smoke(self):
         """端到端冒烟测试 `palm_follow_v14.main(--sim --headless)`：验证相机→检测→LK→4层深度→夹爪→100Hz伺服→日志→安全退出全链路。"""
         from unittest import mock

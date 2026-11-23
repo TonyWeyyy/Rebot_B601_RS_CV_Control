@@ -155,8 +155,19 @@ class HardwareRobotBackend:
         return oMi.translation.copy(), oMi.rotation.copy()
 
     def get_state(self, now_s: float) -> RobotState:
-        """组合 `q_cmd`、200Hz 零开销实测反馈缓存与 M6 主动安全监督状态。"""
-        q_cmd = np.asarray(self.adapter.get_command_pos(), dtype=np.float64)
+        """组合 `q_cmd`、200Hz 零开销实测反馈缓存与 M6 主动安全监督状态。
+
+        关键时序说明：
+            `q_cmd` 必须读取 100Hz 连续积分目标 `self.adapter._q_target`（与 v13
+            `joint_vel_cmd()` 完全一致），**绝不可读异步 200Hz 斜坡中间值 `get_command_pos()`**！
+            否则每拍 100Hz 积分都会被 200Hz 异步滞后的 `command_positions` 往回拽半拍，
+            直接吃掉 ~30% 跟随速度并引入 50Hz 锯齿抖动。
+        """
+        q_target = getattr(self.adapter, "_q_target", None)
+        if q_target is not None:
+            q_cmd = np.asarray(q_target, dtype=np.float64).copy()
+        else:
+            q_cmd = np.asarray(self.adapter.get_command_pos(), dtype=np.float64)
         fb = self.adapter.get_feedback_state(max_age_s=0.05)
         sup = self.adapter.get_safety_status() or {}
         stats = self.adapter.get_mit_loop_stats() or {}

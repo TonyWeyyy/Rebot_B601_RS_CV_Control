@@ -48,7 +48,7 @@ v14:
     vel_deadband_on: 0.130          # 目标速度高于此值确认运动 (m/s)
     exit_confirm_s: 0.050           # 连续高于上沿确认退出静止时长 (s)
     stop_confirm_s: 0.080           # 死区外连续低速确认进静止时长 (s，防折返假停顿)
-    docking_dist_m: 0.080           # 进入 DOCKING 减速停靠区的距离阈值 (m)
+    docking_dist_m: 0.065           # 进入 DOCKING 减速停靠区的距离阈值 (m，与 v13 L2 停靠收回半径一致)
     fast_start_enable: true         # 静止快启通道
     fast_start_frames: 2            # 连续同向新观测确认帧数
     fast_start_dist: 0.028          # 快启最小位移阈值 (m)
