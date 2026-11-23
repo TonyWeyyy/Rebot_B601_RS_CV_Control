@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
 """
-reBot Arm B601-RS 机械臂适配层
-替代原项目的 Panthera_lib.Panthera，对外暴露几乎相同的接口，
-使得视觉伺服主程序（palm_follow_grasp.py）里的控制数学可以原样保留。
+reBot Arm B601-RS 机械臂适配层（运动下发 + 夹爪封装 + Pinocchio 运动学/重力动力学）
+==================================================================================
+替代原项目的 ``Panthera_lib.Panthera``，对外暴露几乎一致的弧度/米制接口，
+使得视觉伺服主程序（``palm_follow_grasp.py``）的控制数学可完整复用。
 
-设计：
-  ┌─ 运动下发：rebot_control（LAN-GER/rebot_control，MIT 位置控制 + 关节限速）
-  │     原项目的 robot.Joint_Vel(关节速度) 在这里实现为：
-  │     每个控制周期把关节速度积分成位置目标 q_target += dq*dt，
-  │     再调 set_joint_angles()，由库内部 200Hz 平滑斜坡执行。
-  │     效果等价于速度伺服，且天然带每关节速度上限保护。
-  │
-  ├─ 夹爪（J7）：通过 set_joint_angles 的第 7 个通道下发（单位：度），
-  │     用 set_gripper_deg() 设置目标角。与 6 关节共用同一 CAN 主机，
-  │     不存在第二个 motorbridge 连接争抢电机 7 的问题。
-  │
-  └─ 运动学/动力学：Pinocchio 直接加载 reBotArm_control_py 仓库里的 URDF
-        （原项目 Panthera 也是这么做的，FK/雅可比/重力项全部对齐）
+架构与核心边界设计：
+  1. 运动下发（``rebot_control`` + v13 ``mit_controller_ext`` 方案 A 扩展）：
+     - 原项目的关节速度接口 ``Joint_Vel(dq)`` 在此实现为「墙上时钟积分位置目标
+       ``q_target += dq * dt`` + 可选 MIT 速度前馈 ``dq_des``」，由底层 200Hz MIT
+       控制线程平滑斜坡执行，并叠加双重关节硬限速（``HARD_MAX_JOINT_SPEED``）。
+  2. 单 CAN 主机 J7 夹爪封装：
+     - 夹爪（电机 7）与 6 个手臂关节共用同一条 ``can0`` 总线与同一个 ``ReBotRSMITController``，
+       目标角（度）通过 ``set_gripper_deg()`` 缓存并随 7 通道指令的第 7 路同步下发；
+       严禁额外打开第二个 ``motorbridge`` 实例争抢 CAN 主机。
+  3. 严格的单位与零位修正边界：
+     - 底层 ``rebot_control`` SDK 接口一律使用【度 / 度每秒】（7 通道）；
+     - 本适配层对外与 Pinocchio 一律使用【弧度 / 弧度每秒 / 米 / Nm】（6 关节）；
+     - ``config/joint_offset.json`` 标定零偏只注入 Pinocchio 广义坐标（FK/雅可比/重力），
+       绝不改写下发给 SDK 的目标角。
+  4. Pinocchio 双模型线程隔离与 Gemini 2 质点注入：
+     - 主模型 ``self.model / self.data`` 供 100Hz 伺服线程及离线标定计算 FK/雅可比；
+     - 独立重力模型 ``self._grav_model / self._grav_data`` 搭配 ``self._grav_lock``
+       专供 200Hz MIT 线程回调静态重力前馈（绝不共享 ``self.data`` 避免数据竞争），
+       并按 ``mit_ext.yaml`` 将腕部 Gemini 2 相机+支架等效质点（约 0.32kg）挂载至 ``joint6``。
+  5. 安全停机红线（2026-09 事故后修订）：
+     - ``stop()`` 必须走 ``return_to_zero=True, wait=True`` 的「缓慢回零 → 到位后失能」
+       完整流程；严禁在任何非零位/屈肘承载姿态下直接失能电机（会导致机械臂自由下落）。
 
 依赖：
     git clone https://github.com/LAN-GER/rebot_control.git
@@ -24,16 +34,8 @@ reBot Arm B601-RS 机械臂适配层
     URDF 来自 https://github.com/Seeed-Projects/reBotArm_control_py 的 urdf/ 目录
 
 ⚠️ 使用前先核对：
-    1. 你机器上 rebot_control 的实际类名/方法名（不同版本可能有出入，
-       本文件所有对机械臂 SDK 的调用都集中在 _ArmIO 类里，只需改这一个类）
-    2. URDF 路径与关节名称（B601_RS_JOINT_NAMES）
-    3. 单位：rebot_control 用【度】，Pinocchio 用【弧度】，本适配层对外一律用弧度
-
-⚠️ 安全停机约定（2026-09 事故后修订）：
-    stop() 必须走 rebot_control 的「缓慢回零 → 到位后失能」完整流程
-    （return_to_zero=True, wait=True）。
-    严禁在任何非零位/非重力平衡位姿下直接失能电机——
-    屈肘姿态下失能 = 机械臂自由下落（已发生过真实事故）。
+    1. 本机 ``rebot_control`` 的实际类名/方法名（所有对机械臂 SDK 的直接调用集中在 ``_ArmIO``）
+    2. ``URDF_PATH`` 路径与 6 关节名称（``B601_RS_JOINT_NAMES``）
 """
 
 import os
@@ -109,7 +111,24 @@ CTRL_DT = 0.02   # 仅作 dt 钳制参照；实际积分用墙上时钟，主循
 # 底层 IO：所有与 rebot_control SDK 相关的调用只出现在这个类里
 # ─────────────────────────────────────────────────────────────
 class _ArmIO:
+    """``rebot_control`` SDK 隔离封装层（单 CAN 主机 ``can0``，7 通道统一使用【度】）。
+
+    所有直接依赖上游 ``ReBotRSMITController`` 与运行时子类扩展 ``mit_controller_ext``
+    的调用均封装在此类内，便于 SDK 升级或测试打桩。内部同时缓存 J7 夹爪目标角（度），
+    与 6 关节共用单条 CAN 主机总线。
+    """
+
     def __init__(self):
+        """加载上游控制器与 v13 MIT 扩展、启动 200Hz 线程并读取 J7 夹爪初始角度。
+
+        初始化流程：
+          1. 动态插入本地 ``rebot_control`` 源码目录及当前目录至 ``sys.path``；
+          2. 调用 ``mit_controller_ext.build_controller`` 进行 SHA256 校验与子类化扩展
+             （若校验不通过或配置关闭，自动无缝回退上游原版）；
+          3. 启动控制器（``enable_esc=False`` 避免抢占主程序退出热键，保留 SIGINT/SIGTERM）；
+          4. 下发默认 7 轴安全速度包络（deg/s）；
+          5. 同步读取一次 J7 当前实际角度作为初始目标，防止上电使能瞬间夹爪突跳。
+        """
         # rebot_control 是源码仓库（无 pip 包），真实包名为 rebot，
         # 控制器类为 ReBotRSMITController（已在本地仓库核对：
         # set_joint_angles 收 7 个【度】(6关节+夹爪)、set_max_speeds 单位度/秒、
@@ -143,10 +162,23 @@ class _ArmIO:
             self.gripper_deg = 0.0
 
     def send_joint_positions_deg(self, q_deg_7):
+        """下发 7 路纯位置目标（6 关节 + J7 夹爪，单位：度；MIT 速度前馈恒为 0）。
+
+        Args:
+            q_deg_7 (Sequence[float]): 长度为 7 的目标关节角列表（deg）。
+        """
         self.arm.set_joint_angles(q_deg_7)      # 7 个数：6 关节 + 夹爪保持（纯位置，dq_des=0）
 
     def send_joint_mit_targets_deg(self, q_deg_7, dq_deg_s_7):
-        """P1：透传 7 路目标角与前馈角速度（扩展不可用时自动退化为 set_joint_angles）。"""
+        """P1：透传 7 路目标角（deg）与 MIT 速度前馈（deg/s）。
+
+        当 v13 扩展未启用或底层控制器未实现 ``set_joint_mit_targets`` 时，
+        自动安全退化为纯位置接口 ``set_joint_angles``。
+
+        Args:
+            q_deg_7 (Sequence[float]): 7 路目标角度（deg），第 7 路为 J7 夹爪。
+            dq_deg_s_7 (Sequence[float]): 7 路速度前馈（deg/s），J7 夹爪通道必须为 0.0。
+        """
         setter = getattr(self.arm, "set_joint_mit_targets", None)
         if setter is not None:
             setter(q_deg_7, dq_deg_s_7)
@@ -154,10 +186,22 @@ class _ArmIO:
             self.arm.set_joint_angles(q_deg_7)
 
     def read_joint_positions_deg(self):
+        """通过同步 CAN 往返读取 6 个手臂关节当前实际角度（单位：度）。
+
+        注意：该调用会持有底层 ``io_lock`` 并阻塞数 ms~数十 ms，仅限初始化、标定或低频复核。
+
+        Returns:
+            np.ndarray: 形状为 ``(6,)`` 的 float64 实际角度数组（deg）。
+        """
         return np.array(self.arm.read_joint_angles()[:6], dtype=np.float64)
 
     def feedback_snapshot(self):
-        """扩展控制器 200Hz 反馈缓存（内存读取，无 CAN I/O）；不可用时返回 None。"""
+        """读取 MIT 扩展控制器的 200Hz 应答内存缓存（零 CAN I/O）。
+
+        Returns:
+            dict | None: 包含 ``q, dq, tau, cmd, valid, t_mos, age_s, seq`` 的原始快照字典；
+            扩展不可用或读取异常时返回 ``None``。
+        """
         getter = getattr(self.arm, "get_feedback_snapshot", None)
         if getter is None:
             return None
@@ -167,6 +211,11 @@ class _ArmIO:
             return None
 
     def loop_stats(self):
+        """读取 200Hz MIT 控制线程的周期与 CAN 通信健康统计（无 CAN I/O）。
+
+        Returns:
+            dict | None: 循环统计字典（含周期 p99、CAN 失败总次数等）；扩展不可用时返回 ``None``。
+        """
         getter = getattr(self.arm, "get_loop_stats", None)
         if getter is None:
             return None
@@ -176,14 +225,13 @@ class _ArmIO:
             return None
 
     def stop(self):
-        """
-        安全停机：缓慢回零 → 确认到位 → 才失能电机。
+        """安全停机：缓慢回零 → 确认到位 → 才失能电机。
 
         ★★★ 绝对禁止改回 return_to_zero=False ★★★
-        return_to_zero=False 会在当前位姿（可能是屈肘抬起等需要力矩
+        ``return_to_zero=False`` 会在当前位姿（可能是屈肘抬起等需要力矩
         对抗重力的姿态）直接失能电机，导致机械臂自由下落。
 
-        wait=True 同样不可省略：shutdown 是守护线程，不等它跑完主线程退出时，
+        ``wait=True`` 同样不可省略：shutdown 是守护线程，不等它跑完主线程退出时，
         解释器会把「失能电机/关闭 CAN」杀在半路上。
         """
         try:
@@ -196,17 +244,35 @@ class _ArmIO:
 # 对外适配器：接口对齐 Panthera
 # ─────────────────────────────────────────────────────────────
 class RebotAdapter:
+    """reBot Arm B601-RS 高层适配器（对外统一使用弧度 / 米 / Nm，封装 6 关节 + J7 夹爪）。
+
+    主要职责：
+      - 封装速度伺服积分、软限位钳位与 ``HARD_MAX_JOINT_SPEED`` 双重硬限速；
+      - 维护单 CAN 主机第 7 通道夹爪目标角（度）并实施软限位兜底；
+      - 提供主 Pinocchio 运动学模型（``self.model / self.data``）与 200Hz 独立重力
+        动力学模型（``self._grav_model / self._grav_data / self._grav_lock``）线程隔离；
+      - 对外透传 v13 MIT 扩展的 200Hz 反馈缓存、录波、伸展阻尼调度与 P4 主动安全状态。
+    """
+
     def __init__(self, urdf_path=URDF_PATH, joint_names=B601_RS_JOINT_NAMES):
+        """初始化底层机械臂通信、Pinocchio 双模型、软限位与 200Hz 重力前馈回调。
+
+        Args:
+            urdf_path (str): B601-RS 机械臂 URDF 文件路径（支持 ``~`` 展开）。
+            joint_names (list[str]): 按关节 1→6 顺序排列的 URDF 关节名称列表。
+        """
         self.io = _ArmIO()
 
-        # Pinocchio 模型（运动学 + 重力项）
+        # Pinocchio 主模型（供 100Hz 伺服 FK/雅可比及离线标定脚本使用）
         self.model = pin.buildModelFromUrdf(os.path.expanduser(urdf_path))
         self.data = self.model.createData()
         self.joint_names = joint_names
         self.motor_count = 6
 
-        # P3 M2：独立 Pinocchio 重力动力学模型与数据（绝不与伺服 FK 共享 self.data）
-        # 可附加腕部 Gemini 2 相机 + 支架等效质点，精确覆盖全工作区 J2/J3/J4 重力矩。
+        # P3 M2：独立 Pinocchio 重力动力学模型与数据（绝不与伺服 FK 共享 self.data，
+        # 避免 200Hz MIT 线程与 100Hz 伺服线程并发读写同一 Pinocchio Data 导致竞态）。
+        # 按 mit_ext.yaml 附加腕部 Gemini 2 相机 + 支架等效质点（典型 0.32kg），
+        # 精确覆盖全工作区 J2/J3/J4 静态重力矩。
         self._grav_lock = threading.Lock()
         self._grav_model = pin.buildModelFromUrdf(os.path.expanduser(urdf_path))
         ext_cfg = getattr(self.io, "ext_cfg", {}) or {}
@@ -215,10 +281,12 @@ class RebotAdapter:
             ext_cfg.get("gravity_payload_com_link6_m", [0.0, 0.0, 0.0]),
             dtype=np.float64)
         if payload_m > 1e-6:
+            # 以纯质点惯量（3x3 转动惯量为零，静态重力仅取决于质量与质心位置）挂载至 joint6
             jid6 = self._grav_model.getJointId(self.joint_names[-1])
             inertia = pin.Inertia(payload_m, payload_com, np.zeros((3, 3), dtype=np.float64))
             self._grav_model.appendBodyToJoint(jid6, inertia, pin.SE3.Identity())
         self._grav_data = self._grav_model.createData()
+        # 预缓存广义坐标/广义速度索引与 0 分配输入缓冲，确保 200Hz 回调耗时 ~0.02ms
         self._grav_idx_q = [
             self._grav_model.joints[self._grav_model.getJointId(n)].idx_q
             for n in self.joint_names]
@@ -227,7 +295,7 @@ class RebotAdapter:
             for n in self.joint_names]
         self._grav_q_buf = np.zeros(self._grav_model.nq, dtype=np.float64)
 
-        # 关节限位（从 URDF 读取并内收 margin）
+        # 软件关节限位（弧度）：从 URDF 机械上下限各向内收缩 JOINT_LIMIT_MARGIN（10°）
         self.q_min = np.zeros(6)
         self.q_max = np.zeros(6)
         for i, name in enumerate(joint_names):
@@ -248,7 +316,19 @@ class RebotAdapter:
             setter(self._gravity_torque_callback)
 
     def set_joint_speed_limits(self, limits_rad):
-        """设置分关节速度上限（弧度/秒），强制钳位至 HARD_MAX_JOINT_SPEED 硬包络。"""
+        """设置伺服阶段分关节速度上限（弧度/秒），强制钳位至 ``HARD_MAX_JOINT_SPEED`` 安全包络。
+
+        同时把转换后的度/秒速度上限与固定夹爪速度 ``GRIPPER_SPEED_DEG_S`` 下发至底层 200Hz 斜坡。
+
+        Args:
+            limits_rad (float | array-like): 标量或 6 维正数速度上限（rad/s）。
+
+        Returns:
+            np.ndarray: 钳位生效后的 6 维速度上限副本（rad/s）。
+
+        Raises:
+            ValueError: 输入不是有限正数标量或 6 维有限正数向量时抛出。
+        """
         arr = np.asarray(limits_rad, dtype=np.float64)
         if arr.ndim == 0:
             arr = np.full(6, float(arr), dtype=np.float64)
@@ -262,42 +342,70 @@ class RebotAdapter:
 
     # ── 状态读取 ─────────────────────────────────────────────
     def get_current_pos(self):
-        """
-        返回 6 关节实际角度（弧度）—— 对应 Panthera.get_current_pos()
-        ⚠️ 这是 7 路串行同步 CAN 读（持有 io_lock，单次约数 ms~数十 ms），
-        会挤占 200Hz MIT 下发线程。只允许低频使用（初始化、标定采样、
-        到位等待），50Hz 伺服热循环里请用 get_command_pos()。
+        """返回 6 关节实际角度（弧度）—— 对应 ``Panthera.get_current_pos()``。
+
+        ⚠️ 这是 7 路串行同步 CAN 读（持有底层 ``io_lock``，单次约数 ms~数十 ms），
+        会挤占 200Hz MIT 下发线程。只允许低频使用（初始化、标定采样、到位复核），
+        100Hz 伺服热循环里请用 ``get_command_pos()`` 或零开销 ``get_feedback_state()``。
+
+        Returns:
+            np.ndarray: 形状为 ``(6,)`` 的 float64 实际关节角（rad，未加 ``JOINT_OFFSET``）。
         """
         return np.deg2rad(self.io.read_joint_positions_deg())
 
     def get_command_pos(self):
-        """
-        返回 6 关节"当前实际下发值"（弧度）：rebot_control 内部 200Hz 斜坡
-        正在发送的角度，纯内存读取、无 CAN I/O，可在伺服热循环中每周期调用。
-        伺服稳态下与实际位置差异很小；需要真值时低频调用 get_current_pos() 校准。
+        """返回 6 关节当前底层实际下发角（弧度，纯内存读取，无 CAN I/O）。
+
+        读取的是 ``rebot_control`` 内部 200Hz 斜坡正在发送的目标角度，可在伺服热循环中
+        每周期无阻塞调用；控制雅可比、工作空间软/硬墙与积分均应锚定于此以防内外环振荡。
+
+        Returns:
+            np.ndarray: 形状为 ``(6,)`` 的 float64 当前指令角（rad）。
         """
         return np.deg2rad(np.array(self.io.arm.get_command_angles()[:6],
                                    dtype=np.float64))
 
     # ── v13 MIT 扩展：200Hz 反馈缓存（内存读取，无 CAN I/O，可在伺服热循环调用）──
     def mit_ext_info(self):
-        """扩展控制器状态：{'active','phase','reason','upstream_sha256','cfg'}。"""
+        """返回 v13 MIT 扩展控制器加载信息浅拷贝。
+
+        Returns:
+            dict: 包含 ``active, phase, reason, upstream_sha256, cfg`` 等字段的状态字典。
+        """
         return dict(getattr(self.io, "ext_info", {"active": False}))
 
     def get_mit_loop_stats(self):
+        """返回 200Hz MIT 控制循环统计信息（周期分位数、CAN 失败次数等），不可用返回 ``None``。"""
         return self.io.loop_stats()
 
     def get_mit_gains(self):
-        """上游配置中的 6 关节 MIT (kp, kd)，供探针/辨识换算预期下垂与阻尼比。"""
+        """读取上游电机配置中的 6 关节 MIT 增益 ``(kp, kd)``，供探针与系统辨识脚本使用。
+
+        Returns:
+            tuple[np.ndarray, np.ndarray]: ``(kp_6, kd_6)``，均为 6 维 float64 数组
+            （单位分别为 ``Nm/rad`` 与 ``Nm·s/rad``）。
+        """
         motors = self.io.arm.config.motors[:6]
         return (np.array([float(m.kp) for m in motors], dtype=np.float64),
                 np.array([float(m.kd) for m in motors], dtype=np.float64))
 
     def get_feedback_state(self, max_age_s=None):
-        """
-        最近一拍 MIT 应答缓存（6 关节，弧度 / 弧度每秒 / Nm）。
-        返回 dict：q, dq, tau, q_cmd, t_mos(7), age_s, seq, valid；扩展不可用返回 None。
-        valid=True 表示 6 关节数据齐全、有限且年龄 ≤ max_age_s。
+        """读取最近一拍 200Hz MIT 应答缓存（6 关节，弧度 / 弧度每秒 / Nm，无 CAN I/O）。
+
+        Args:
+            max_age_s (float | None): 允许的最大缓存年龄（秒）；为 ``None`` 时读取
+                ``mit_ext.yaml`` 的 ``feedback_max_age_s``（默认 0.05s）。
+
+        Returns:
+            dict | None: 包含以下字段的字典；扩展不可用时返回 ``None``：
+                - ``q`` (np.ndarray, (6,)): 实际关节角（rad）
+                - ``dq`` (np.ndarray, (6,)): 实际关节角速度（rad/s）
+                - ``tau`` (np.ndarray, (6,)): 实际关节力矩（Nm）
+                - ``q_cmd`` (np.ndarray, (6,)): 同拍指令角（rad）
+                - ``t_mos`` (np.ndarray, (7,)): 7 路电机 MOS 管温度（°C）
+                - ``age_s`` (float): 缓存距今时间（s）
+                - ``seq`` (int): 200Hz 循环拍号
+                - ``valid`` (bool): 6 关节应答齐全、全有限且 ``0 <= age_s <= max_age_s`` 时为 True。
         """
         snap = self.io.feedback_snapshot()
         if snap is None:
@@ -318,9 +426,17 @@ class RebotAdapter:
                 "valid": valid}
 
     def get_current_pos_cached(self, max_age_s=None):
-        """
-        非阻塞实际角（弧度）。仅当 mit_ext.feedback_trusted=true（实机探针验证通过）
-        且缓存新鲜时返回，否则返回 None，调用方必须回退阻塞式 get_current_pos()。
+        """非阻塞获取 6 关节实际角度（弧度），仅在缓存经实机验证可信且新鲜时返回。
+
+        仅当 ``mit_ext.feedback_trusted=True``（通过 ``mit_feedback_probe.py`` 验证）
+        且 ``get_feedback_state(max_age_s)["valid"]`` 为 True 时返回；否则返回 ``None``，
+        调用方必须回退阻塞式 ``get_current_pos()``。
+
+        Args:
+            max_age_s (float | None): 允许的最大缓存年龄（秒）。
+
+        Returns:
+            np.ndarray | None: 6 维实际关节角副本（rad）或 ``None``。
         """
         if not self.io.ext_cfg.get("feedback_trusted", False):
             return None
@@ -330,13 +446,27 @@ class RebotAdapter:
         return state["q"].copy()
 
     def start_feedback_recording(self):
+        """启动 200Hz MIT 扩展内存录波（供系统辨识/探针脚本使用）。
+
+        Raises:
+            RuntimeError: MIT 扩展未启用导致底层无 ``start_recording`` 接口时抛出。
+        """
         starter = getattr(self.io.arm, "start_recording", None)
         if starter is None:
             raise RuntimeError("MIT 扩展未启用，无法录波")
         starter()
 
     def stop_feedback_recording(self):
-        """返回录波 numpy 字典（6 关节）：t, q_cmd, q, dq, tau。"""
+        """停止 200Hz 录波并返回按起始时刻归零的 6 关节 numpy 字典。
+
+        Returns:
+            dict[str, np.ndarray]:
+                - ``t``: ``(N,)`` 相对时间（s，从 0 开始）
+                - ``q_cmd``: ``(N, 6)`` 指令角（rad）
+                - ``q``: ``(N, 6)`` 实际角（rad）
+                - ``dq``: ``(N, 6)`` 实际角速度（rad/s）
+                - ``tau``: ``(N, 6)`` 实际力矩（Nm）
+        """
         rows = self.io.arm.stop_recording()
         if not rows:
             empty = np.zeros((0, 6))
@@ -351,7 +481,21 @@ class RebotAdapter:
 
     # ── 标定/辨识工具专用：直接位置目标与临时限速（伺服主程序不使用）──
     def set_joint_targets_direct(self, q_rad, dq_rad=None):
-        """直接设定 6 关节位置目标（弧度，钳位软限位）；可选传入前馈角速度 dq_rad（rad/s）。"""
+        """直接设定 6 关节位置目标（弧度，强制钳位软限位），可选同步传入前馈角速度。
+
+        专供正弦扫频辨识/重力验证等工具脚本使用；接触软限位边界且继续朝外运动时自动
+        清零对应轴前馈速度，夹爪 J7 保持当前目标且速度前馈恒为 0。
+
+        Args:
+            q_rad (array-like): 6 维目标关节角（rad）。
+            dq_rad (array-like | None): 可选 6 维速度前馈（rad/s），钳位至 ``±HARD_MAX_JOINT_SPEED``。
+
+        Returns:
+            np.ndarray: 软限位钳位后的实际下发 6 维目标角副本（rad）。
+
+        Raises:
+            ValueError: ``q_rad`` 或 ``dq_rad`` 不是 6 维有限向量时抛出。
+        """
         q = np.asarray(q_rad, dtype=np.float64)
         if q.shape != (6,) or not np.all(np.isfinite(q)):
             raise ValueError("关节目标必须为 6 维有限向量")
@@ -367,6 +511,7 @@ class RebotAdapter:
             if dq.shape != (6,) or not np.all(np.isfinite(dq)):
                 raise ValueError("前馈速度必须为 6 维有限向量")
             dq = np.clip(dq, -HARD_MAX_JOINT_SPEED, HARD_MAX_JOINT_SPEED)
+            # 贴近软限位且速度仍指向边界外侧时，立即清零该轴速度前馈防撞限位
             hit_lo = (q <= self.q_min) & (dq < 0.0)
             hit_hi = (q >= self.q_max) & (dq > 0.0)
             dq = np.where(hit_lo | hit_hi, 0.0, dq)
@@ -375,8 +520,20 @@ class RebotAdapter:
         return self._q_target.copy()
 
     def override_joint_speed_limits(self, limits_rad):
-        """临时下发 200Hz 斜坡限速（弧度/秒），强制钳位 HARD_MAX_JOINT_SPEED；
-        不修改伺服用 _max_joint_speed，结束后必须调用 restore_joint_speed_limits()。"""
+        """临时覆写底层 200Hz 斜坡限速（rad/s），强制钳位至 ``[0.01, HARD_MAX_JOINT_SPEED]``。
+
+        不修改伺服常规使用的 ``self._max_joint_speed``，工具脚本结束后必须调用
+        ``restore_joint_speed_limits()`` 恢复。
+
+        Args:
+            limits_rad (array-like): 6 维有限正数速度上限（rad/s）。
+
+        Returns:
+            np.ndarray: 钳位后实际生效的 6 维速度上限（rad/s）。
+
+        Raises:
+            ValueError: 输入不是 6 维有限正数向量时抛出。
+        """
         arr = np.asarray(limits_rad, dtype=np.float64)
         if arr.shape != (6,) or not np.all(np.isfinite(arr)) or np.any(arr <= 0.0):
             raise ValueError("限速必须为 6 维有限正数向量")
@@ -385,15 +542,23 @@ class RebotAdapter:
         return clamped
 
     def restore_joint_speed_limits(self):
+        """将底层 200Hz 斜坡限速恢复为 ``self._max_joint_speed``（与 ``override_joint_speed_limits`` 配对）。"""
         self.io.arm.set_max_speeds(np.rad2deg(self._max_joint_speed).tolist()
                                    + [GRIPPER_SPEED_DEG_S])
 
     # ── 运动指令 ─────────────────────────────────────────────
     def joint_vel_cmd(self, dq_rad):
-        """
-        对应 Panthera.Joint_Vel(dq)：关节速度指令。
-        实现方式：积分成位置目标，并在 P1 扩展启用时同步下发速度前馈 dq_des（夹爪 J7 恒为 0）。
-        dq_rad: 6 维关节速度（rad/s），None 或全零 = 保持
+        """关节速度伺服指令（对应 ``Panthera.Joint_Vel(dq)``）。
+
+        实现机制：
+          1. 按墙上时钟计算步长 ``dt``，上限钳制到 ``3 * CTRL_DT``（防止停顿/切换后积分大跳）；
+          2. 若任意轴超速，按最大超限比 ``max_ratio`` 对 6 轴等比例缩放（保持末端笛卡尔运动方向不偏航）；
+          3. 积分更新 ``self._q_target`` 并钳位在软件限位 ``[q_min, q_max]`` 内，触碰软限位边界的轴
+             强制将对应 MIT 速度前馈 ``dq_send`` 清零；
+          4. 打包第 7 通道夹爪目标角（保持值，速度前馈恒为 0.0），转为度/度每秒下发至底层 MIT 扩展。
+
+        Args:
+            dq_rad (array-like | None): 6 维期望关节角速度（rad/s）；传入 ``None`` 或全零时保持当前目标。
         """
         now = time.time()
         # dt 上限钳制到 3 个控制周期：hold()/move_to_joints() 之后或循环卡顿
@@ -405,6 +570,7 @@ class RebotAdapter:
         if dq_rad is not None:
             dq = np.asarray(dq_rad, dtype=np.float64)
             lim = self._max_joint_speed
+            # 按最大超限比例等比缩小 6 轴速度，避免单轴独立裁剪导致末端轨迹偏离直线
             ratios = np.abs(dq) / lim
             max_ratio = float(np.max(ratios)) if dq.size else 0.0
             if max_ratio > 1.0:
@@ -424,7 +590,11 @@ class RebotAdapter:
         self.io.send_joint_mit_targets_deg(q_deg, dq_deg_s)
 
     def hold(self):
-        """保持当前位置（丢手/暂停时调用）。用内部下发值重锚定，无 CAN I/O。"""
+        """保持当前机械臂位置（丢手 / 暂停 / 安全停机前调用，无 CAN I/O）。
+
+        用底层 200Hz 当前实际下发角重锚定 ``self._q_target``、重置积分时钟，
+        并下发纯位置指令（``dq_des = 0``）防止速度前馈残留。
+        """
         self._q_target = self.get_command_pos().copy()
         self._last_cmd_time = time.time()   # 重置积分时钟，防止恢复后 dt 过大
         q_deg = np.rad2deg(self._q_target).tolist()
@@ -432,7 +602,18 @@ class RebotAdapter:
         self.io.send_joint_positions_deg(q_deg)
 
     def move_to_joints(self, q_rad, speed_deg_s=20.0, wait=True, timeout=15.0):
-        """对应 Panthera.Joint_Pos_Vel：回零/回初始位用"""
+        """点到点缓慢关节运动（对应 ``Panthera.Joint_Pos_Vel``，用于回 HOME / 归零 / 标定）。
+
+        临时以低速 ``speed_deg_s`` 下发纯位置目标（``dq_des = 0``），到位后再恢复伺服速度包络
+        并重置积分时钟。等待到位时先检查 200Hz 指令斜坡进入 1° 内，再用可信 200Hz 缓存（不可用时
+        回退阻塞式同步读）复核实际角进入 2° 内。
+
+        Args:
+            q_rad (array-like): 6 维目标关节角（rad，自动钳位至软件限位）。
+            speed_deg_s (float): 本次移动 6 关节统一限速（deg/s），默认 20.0°/s。
+            wait (bool): 是否阻塞等待到位，默认 True。
+            timeout (float): 最长等待超时时间（s），默认 15.0s。
+        """
         self._q_target = np.clip(np.asarray(q_rad, dtype=np.float64),
                                  self.q_min, self.q_max)
         self.io.arm.set_max_speeds([speed_deg_s] * 6 + [GRIPPER_SPEED_DEG_S])
@@ -458,30 +639,45 @@ class RebotAdapter:
         self._last_cmd_time = time.time()   # 重置积分时钟，防止之后 dt 过大
 
     def stop(self):
+        """执行安全停机链（委托 ``_ArmIO.stop()`` 走 ``return_to_zero=True, wait=True``）。"""
         self.io.stop()
 
     def _gripper_keep_deg(self):
+        """返回缓存的 J7 夹爪目标角（度），供 7 通道下发接口拼接第 7 路使用。"""
         # 夹爪（J7）目标角：初始化时读取并缓存，之后由 set_gripper_deg() 更新。
         # 用缓存值随每个控制周期下发，避免每周期多发一次同步 CAN 读。
         return self.io.gripper_deg
 
     # ── 夹爪（J7）控制 ─────────────────────────────────────
     def set_gripper_deg(self, deg):
-        """设定夹爪（J7）目标角度（度），随下一次 50Hz 指令下发生效。
+        """设定夹爪（J7）目标角度（度），随下一次伺服控制周期第 7 通道下发生效。
 
-        带硬限幅兜底。正常开合范围请先运行 gripper_j7_calibrate.py
-        实测标定（结果写入 config/grasp.yaml），不要凭猜填写。
+        带 ``GRIPPER_SOFT_LIMIT_DEG`` 硬限幅兜底。正常开合范围应由 ``gripper_j7_calibrate.py``
+        实测标定后写入 ``config/grasp.yaml``。
+
+        Args:
+            deg (float): 期望夹爪目标角度（deg）。
         """
         lo, hi = GRIPPER_SOFT_LIMIT_DEG
         self.io.gripper_deg = float(np.clip(deg, lo, hi))
 
     def get_gripper_deg(self):
-        """当前夹爪目标角度（度）"""
+        """返回当前缓存的夹爪（J7）目标角度（单位：度）。"""
         return float(self.io.gripper_deg)
 
     # ── 运动学（Pinocchio，单位弧度/米）────────────────────
     def _build_q_full(self, joint_positions):
-        """SDK 关节角 → pinocchio q_full。★ 加 JOINT_OFFSET 零位修正 ★"""
+        """将 6 维 SDK 关节角（rad）映射为 Pinocchio 广义坐标向量 ``q_full``。
+
+        ★ 零位修正边界 ★：``JOINT_OFFSET`` 仅在此处叠加到 Pinocchio 广义坐标用于运动学/动力学
+        计算，绝不反馈叠加到下发给电机的目标角。
+
+        Args:
+            joint_positions (Sequence[float]): 6 维 SDK 坐标系关节角（rad）。
+
+        Returns:
+            np.ndarray: 长度为 ``self.model.nq`` 的 Pinocchio 广义坐标向量（rad）。
+        """
         q_full = np.zeros(self.model.nq)
         for i, name in enumerate(self.joint_names):
             jid = self.model.getJointId(name)
@@ -490,7 +686,16 @@ class RebotAdapter:
         return q_full
 
     def forward_kinematics(self):
-        """对应 Panthera.forward_kinematics() → {'position','rotation'}"""
+        """基于同步读取的实际关节角计算末端 ``joint6`` 正运动学（对应 ``Panthera.forward_kinematics()``）。
+
+        注意：内部调用阻塞式 ``get_current_pos()``，仅适合标定/初始化等低频场景；
+        100Hz 伺服热循环应直接用指令角/缓存角在外部计算 FK。
+
+        Returns:
+            dict[str, np.ndarray]:
+                - ``'position'``: ``(3,)`` 末端在基座系下的位置（m）
+                - ``'rotation'``: ``(3, 3)`` 末端相对基座系的旋转矩阵
+        """
         q = self._build_q_full(self.get_current_pos())
         pin.forwardKinematics(self.model, self.data, q)
         pin.updateFramePlacements(self.model, self.data)
@@ -500,9 +705,18 @@ class RebotAdapter:
                 'rotation': oMi.rotation.copy()}
 
     def gravity_torque(self, q_rad, include_payload=False):
-        """对应 Panthera.get_Gravity(q)：广义重力项。
-        include_payload=False：原始 URDF（兼容历史标定脚本）；
-        include_payload=True：含腕部 Gemini 2 相机附加质量（P3 重力前馈用，线程安全独立 Data）。
+        """计算 6 关节广义重力矩（单位：Nm，对应 ``Panthera.get_Gravity(q)``）。
+
+        Args:
+            q_rad (Sequence[float]): 6 维 SDK 坐标系关节角（rad）。
+            include_payload (bool):
+                - ``False``（默认）：在主模型 ``self.model / self.data`` 上按原始 URDF 计算
+                  （兼容历史标定脚本）；
+                - ``True``：在线程安全的独立 ``_grav_model / _grav_data`` 上计算，包含腕部
+                  Gemini 2 相机+支架附加质量（与 200Hz P3 重力前馈完全一致）。
+
+        Returns:
+            np.ndarray: 形状为 ``(6,)`` 的 float64 重力矩向量（Nm）。
         """
         if include_payload:
             return np.asarray(self._gravity_torque_callback(q_rad), dtype=np.float64)
@@ -513,7 +727,17 @@ class RebotAdapter:
         return g_full[cols]
 
     def _gravity_torque_callback(self, q_rad):
-        """200Hz MIT 线程专用静态重力矩回调（使用独立 _grav_model/_grav_data，耗时 ~0.02ms）。"""
+        """200Hz MIT 线程专用静态重力矩回调（独立 ``_grav_model/_grav_data/_grav_lock``，耗时 ~0.02ms）。
+
+        与 100Hz 伺服线程使用的 ``self.model / self.data`` 完全物理隔离，并复用预分配
+        的 ``self._grav_q_buf`` 避免高频内存分配。
+
+        Args:
+            q_rad (Sequence[float]): 6 维 SDK 坐标系关节角（rad）。
+
+        Returns:
+            list[float]: 6 关节静态重力矩列表（Nm）。
+        """
         with self._grav_lock:
             self._grav_q_buf[:] = 0.0
             for i in range(6):
@@ -523,13 +747,21 @@ class RebotAdapter:
             return [float(g_full[idx]) for idx in self._grav_idx_v]
 
     def set_reach_radius(self, reach_r_m):
-        """P3 M3：把当前 TCP 水平伸展半径 (m) 通知给 200Hz 阻尼调度器。"""
+        """P3 M3：将当前 TCP 水平伸展半径 ``hypot(X, Y)`` 通知给 200Hz 阻尼调度器。
+
+        Args:
+            reach_r_m (float): 当前末端水平伸展半径（m），用于动态缩放 J1~J3 阻尼 ``kd`` 抑制悬臂共振。
+        """
         setter = getattr(self.io.arm, "set_reach_radius", None)
         if setter is not None:
             setter(reach_r_m)
 
     def get_safety_status(self):
-        """P4 M6：读取 200Hz 主动安全监督层状态（无锁阻塞）；扩展未启用返回 None。"""
+        """P4 M6：无阻塞读取 200Hz 主动安全监督层状态（跟踪误差/过力矩软停机锁存及过温降速倍率）。
+
+        Returns:
+            dict | None: 安全监督状态字典；MIT 扩展未启用或读取失败时返回 ``None``。
+        """
         getter = getattr(self.io.arm, "get_safety_status", None)
         if getter is None:
             return None
@@ -539,7 +771,7 @@ class RebotAdapter:
             return None
 
     def clear_safety_fault(self):
-        """P4 M6：用户排查后按 g 重新启动跟随时清除软停机锁存。"""
+        """P4 M6：在用户排查异常后按 ``g`` 恢复跟随时，清除 200Hz 安全监督层的软停机锁存标志。"""
         clearer = getattr(self.io.arm, "clear_safety_fault", None)
         if clearer is not None:
             clearer()

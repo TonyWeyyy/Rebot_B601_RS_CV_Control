@@ -1,0 +1,170 @@
+# ============================================================
+# 【v14.0 架构配置 / 四层解耦 + 统一世界系 PBVS + 独立安全护盾 + 数字孪生】
+# ------------------------------------------------------------
+# 结构按 v14 四层架构清晰分组：
+#   1. estimator : 层 1 — 单一世界系目标估计器（基于 200Hz 真实 q_act FK）
+#   2. fsm       : 层 2 — 显式有限状态机（IDLE/TRACKING/DOCKING/HOLDING/COASTING/LOST/FAULT_HOLD/RETURN_HOME）
+#   3. pbvs      : 层 3 — 统一世界系 PBVS 控制器（严格使用 q_cmd 雅可比）
+#   4. safety    : 层 4 — 不可绕过安全护盾（软/硬墙、关节软限位、奇异保护、硬速红线）
+#   5. depth     : 4 层深度保护链（7x7→14x14→21x21、跳变拒收、5 帧恢复、速率限幅+One Euro）
+#   6. camera    : 相机取流与迟滞 ROI 推理参数
+#   7. sim       : 离线数字孪生参数（来自 B601-RS P0~P3 实机扫频与重力辨识）
+# ============================================================
+
+v14:
+  ctrl_rate_hz: 100.0               # 上层伺服控制频率 (Hz)
+
+  # ─── 层 1：统一世界系目标估计器 ────────────────────────────────
+  estimator:
+    pose_delay_s: 0.025             # 相机曝光 + USB 传输延迟 (s)（q_act 已为真实物理位姿）
+    pose_lpf_tau_s: 0.012           # 真实物理相机位姿轻量平滑时间常数 (s)
+    kf_q: 1.80                      # 恒速（CV）过程噪声基准 (m²/s⁴)
+    kf_r_xy: 0.0023                 # 世界系水平/切向观测噪声基准 (m²)
+    kf_r_z: 0.0038                  # 深度方向观测噪声基准 (m²)
+    kf_resync_frames: 3             # 重同步确认帧数
+    kf_static_q_scale: 0.65         # 静止阶段过程噪声缩放（≤ 1.0）
+    axis_adapt_enable: true         # 分轴自适应过程噪声 Q
+    axis_adapt_ref_xy: 0.032        # XY 新息触发参考阈值 (m)
+    axis_adapt_ref_z: 0.080         # Z 新息触发参考阈值 (m)
+    axis_adapt_max_xy: 1.75         # XY 最大 Q 放大倍率
+    axis_adapt_max_z: 1.00          # Z 最大 Q 放大倍率（保持 1.0 防深度噪声放大）
+    axis_adapt_confirm: 2           # 连续同向确认帧数
+    axis_adapt_attack_tau: 0.030    # Q 放大建立时间常数 (s)
+    axis_adapt_release_tau: 0.100   # Q 回落释放时间常数 (s)
+    target_stale_s: 0.12            # 观测过期阈值 (s)
+    lead_base_ms: 8.0               # 动态前瞻基准 (ms)
+    lead_max_ms: 15.0               # 动态前瞻上限 (ms)
+    lead_near_dist: 0.025           # 近目标前瞻撤回半径 (m)
+    lead_full_dist: 0.046           # 满额前瞻距离阈值 (m)
+    lead_dir_full_cos: 0.45         # 同向方向余弦阈值
+    lead_attack_tau: 0.028          # 前瞻建立时间常数 (s)
+    lead_release_tau: 0.012         # 前瞻撤回时间常数 (s)
+
+  # ─── 层 2：显式有限状态机（FSM）──────────────────────────────
+  fsm:
+    deadband_in_m: 0.020            # 进入 HOLDING/DOCKING 的 3D 误差死区 (m)
+    deadband_hysteresis: 1.70       # 死区退出迟滞倍率（退出阈值 = 3.4 cm）
+    vel_deadband_off: 0.060         # 目标速度低于此值视为静止 (m/s)
+    vel_deadband_on: 0.130          # 目标速度高于此值确认运动 (m/s)
+    exit_confirm_s: 0.050           # 连续高于上沿确认退出静止时长 (s)
+    stop_confirm_s: 0.080           # 死区外连续低速确认进静止时长 (s，防折返假停顿)
+    docking_dist_m: 0.065           # 进入 DOCKING 减速停靠区的距离阈值 (m，与 v13 L2 停靠收回半径一致)
+    fast_start_enable: true         # 静止快启通道
+    fast_start_frames: 2            # 连续同向新观测确认帧数
+    fast_start_dist: 0.028          # 快启最小位移阈值 (m)
+    fast_start_dir_cos: 0.80        # 快启方向一致性余弦阈值
+    post_brake_settle_s: 0.16       # 刹停回弹冷静窗基准时长 (s)
+    post_brake_ext_extra_s: 0.06    # 深伸展附加冷静窗时长 (s)
+    coast_window_s: 0.12            # 短时丢手滑行保持窗 (s)
+    lost_hold_s: 0.30               # 长时丢手重置判定时长 (s)
+
+  # ─── 层 3：统一世界系 PBVS 控制器 ────────────────────────────
+  pbvs:
+    distance: 0.40                  # 期望相机光轴到掌心距离 (m) [0.18, 0.60]
+    servo_direction: 1.0            # 伺服方向系数（1.0 或 -1.0）
+    gain: 2.75                      # 竖直/深度方向位置增益 (1/s)
+    gain_x: 2.20                    # 水平偏航方向位置增益 (1/s)
+    far_gain_boost: 0.40            # >8cm 同向追赶非线性增益上限
+    world_ff_gain: 0.62             # 世界系目标速度巡航前馈增益（DOCKING 平滑退至 0）
+    ff_max_vel: 0.95                # 前馈速度限幅 (m/s)
+    ff_taper_dist: 0.080            # 近端前馈渐弱基准距离 (m)
+    ff_taper_max_dist: 0.130        # 高速接近时扩展渐弱距离上限 (m)
+    ff_taper_speed_ref: 0.35        # 速度感知停靠参考速度 (m/s)
+    smooth_alpha: 0.50              # 末端速度指令 EMA 基准平滑系数（100Hz 标称）
+    max_accel: 4.25                 # 末端最大线加速度 (m/s²)
+    reversal_accel_boost: 2.00      # 换向制动加速度倍率
+    reversal_residual_scale: 0.18   # 换向保留旧方向残余速度比例
+    coast_decay_per20ms: 0.90       # 滑行窗每 20ms 速度衰减系数
+    coast_max_vel: 0.35             # 滑行窗最大允许线速度 (m/s)
+    static_vel_hold_enable: true    # 静止残余尾速保持归零
+    static_vel_hold_speed: 0.060    # 尾速归零阈值 (m/s)
+    static_vel_hold_delay_s: 0.030  # 尾速归零确认时长 (s)
+    # 伸展度联动调度
+    reach_soft_start: 0.24          # 开始柔和调度的水平半径 (m)
+    reach_soft_end: 0.38            # 满伸展调度半径 (m)
+    reach_min_scale: 0.70           # 满伸展最小速度比例
+    reach_dock_dist: 0.25           # 停靠区参考距离 (m)
+    reach_ff_min_scale: 0.65        # 满伸展最小前馈比例
+    reach_lead_min_scale: 0.30      # 满伸展最小前瞻比例
+    reach_accel_min_scale: 0.75     # 满伸展最小加速度比例
+    reach_att_tau: 0.15             # 伸展收紧平滑时间常数 (s)
+    reach_release_tau: 0.04         # 拉远起步释放时间常数 (s)
+    # 姿态保持与加权 DLS 软优先级
+    k_orientation: 1.60             # 姿态保持比例增益 (1/s)
+    orientation_deadband_deg: 2.0   # 姿态误差死区 (deg)
+    ori_cruise_weight_min: 0.80     # 远距巡航姿态最小权重
+    ori_soft_max_deg: 10.0          # 姿态偏角软护栏 (deg)
+    # 分轴闭环自激振荡阻尼安全网
+    osc_damp_enable: true
+    osc_err_thresh: 0.018           # 过零幅值门槛 (m)
+    osc_min_half_s: 0.14            # 共振半周期下限 (s)
+    osc_max_half_s: 0.42            # 共振半周期上限 (s)
+    osc_gain_cut: 0.30              # 触发阻尼时比例增益削减幅度
+    osc_decay_tau_s: 0.55           # 非活跃期阻尼衰减时间常数 (s)
+    osc_confirm_reversals: 3        # 触发阻尼所需连续共振过零次数
+    osc_large_err_release: 0.15     # 大误差主动追赶释放门槛 (m)
+
+  # ─── 层 4：独立安全护盾（硬红线，任何上层策略不可绕过）────────
+  safety:
+    max_vel: 0.85                   # 末端最大线速度硬上限 (m/s，≤ 0.85)
+    max_vel_angular: 2.00           # 末端最大角速度上限 (rad/s)
+    max_vel_joint_dock: 2.00        # 停靠/深伸展/振荡收回关节速度上限 (rad/s)
+    max_vel_joints: [2.50, 2.00, 2.00, 3.00, 3.00, 2.40]
+                                    # L2 分关节安全限速 [J1..J6] (rad/s)，J2/J3 严守 ≤ 2.00
+    joint_vel_grouped_cruise: true  # 非伸展非振荡巡航启用分组等比限速
+    joint_limit_cushion_rad: 0.08   # 关节软限位线性缓冲带 (~4.6°)
+    damping_base: 0.010             # 阻尼伪逆基准阻尼
+    damping_adaptive: true          # 可操作度自适应阻尼
+    manipulability_threshold: 0.004 # 奇异可操作度警戒阈值
+    min_manip_speed_scale: 0.35     # 奇异区最小速度缩放
+    hard_wall_margin_m: 0.05        # 越出工作空间 >5cm 触发自动缓慢回 HOME
+    workspace_min: [-0.40, -0.10, 0.03]
+    workspace_max: [ 0.40,  0.40, 0.60]
+    workspace_max_radius: 0.42      # 70% 臂展水平径向硬红线 (m，≤ 0.42)
+
+  # ─── 4 层深度保护链 ──────────────────────────────────────────
+  depth:
+    min_valid_m: 0.15               # Gemini 2 近距盲区下限 (m)
+    max_valid_m: 1.50               # 有效手部深度上限 (m)
+    max_jump_m: 0.08                # 第 2 层：帧间最大合法深度跳变 (m)
+    max_rate_m: 0.05                # 第 4 层：单帧深度变化率限幅 (m/frame)
+    reacq_frames: 5                 # 第 3 层：长丢失后连续一致恢复帧数
+    reacq_tol_m: 0.06               # 恢复窗口内最大极差 (m)
+    reacq_bg_margin_m: 0.25         # 拒绝超过 distance + margin 的背景深度
+    anti_lock_frames: 15            # 连续跳变拒收超 15 帧防锁死重锚
+    z_freeze_max_s: 0.20            # 深度冻结最长持续时间 (s)
+    oe_min_cutoff: 0.85             # 深度 One Euro 最小截止频率 (Hz)
+    oe_beta: 0.45                   # 深度 One Euro 速度自适应系数
+
+  # ─── 相机、检测与诊断 ────────────────────────────────────────
+  camera:
+    fps: 60
+    color_exposure_ms: 6.0
+    hw_timestamp_enable: false
+    hw_max_transport_s: 0.20
+    roi_crop_enable: true
+    roi_crop_scale: 0.68
+    hybrid_track_enable: true
+    hybrid_max_frames: 15
+    hybrid_box_half: 52
+    hybrid_max_step_px: 115
+    diag_enable: true
+    diag_queue_size: 8192
+
+  # ─── 离线数字孪生参数（来自 B601-RS P0~P3 实机系统辨识）────────
+  sim:
+    mit_hz: 200.0                   # 仿真底层 MIT 步进频率 (Hz)
+    kp: [72.0, 216.0, 216.0, 50.0, 50.0, 50.0]
+    kd_near: [4.6, 13.5, 14.0, 5.0, 4.0, 4.0]
+    kd_far:  [6.4, 14.5, 15.0, 5.0, 4.0, 4.0]
+    # P0 阶跃二阶拟合得到的各轴等效转动惯量 J_eff (kg·m²) 与阻尼/延迟
+    j_eff: [0.166, 0.341, 0.498, 0.094, 0.020, 0.048]
+    j1_ext_coeff: 0.85              # J1 悬臂伸展惯量随 r² 增量系数
+    vel_ff_scale: [0.70, 0.85, 0.85, 0.90, 0.90, 0.90]
+    gravity_ff_scale: [0.0, 0.65, 0.80, 0.80, 0.0, 0.0]
+    viscous_friction: [0.45, 1.40, 1.60, 0.35, 0.20, 0.20]
+    transport_delay_s: 0.005        # 总线纯传输延迟 (s)
+    dq_noise_std: 0.045             # 实测速度量化噪声标准差 (rad/s)
+    camera_delay_s: 0.025           # 仿真相机曝光+传输延迟 (s)
+    tau_limit_nm: [18.0, 28.0, 28.0, 10.0, 10.0, 10.0]
+    track_err_limit_deg: 12.0

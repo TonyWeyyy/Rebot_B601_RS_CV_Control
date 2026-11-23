@@ -1,21 +1,34 @@
 #!/usr/bin/env python3
 """
-Orbbec Gemini 2 相机封装
-替代原项目的 pyrealsense2 (RealSense D405) 相机层。
+Orbbec Gemini 2 RGB-D 相机封装模块（基于 Orbbec SDK v2 / pyorbbecsdk2）
+========================================================================
+用于替代原项目的 pyrealsense2（RealSense D405）相机层，向上层视觉伺服提供统一接口：
+    cam.fx, cam.fy, cam.cx, cam.cy  -> 对齐后的 RGB 相机内参（像素单位）
+    cam.camera_matrix               -> 3x3 相机内参矩阵（float32）
+    cam.dist_coeffs                 -> 5 维畸变系数（强制置零，见下文说明）
+    cam.depth_scale                 -> 深度原始值到米的换算系数（m/unit）
+    cam.get_frames(latest_only=True)-> (color_bgr, depth_raw, depth_scale)
+    cam.get_last_frame_timing()     -> (timestamp_s, source_str) 硬件帧时间戳
 
-对外接口与原项目 init_realsense() 返回的东西一一对应：
-    cam.intrinsic   -> fx, fy, cx, cy（RGB 相机内参，深度已对齐到 RGB）
-    cam.depth_scale -> 深度原始单位到米的换算系数
-    cam.get_frames() -> (color_bgr, depth_raw)  numpy 数组
+关键硬件与 SDK 特性：
+    1. Orbbec SDK v2 Pipeline + 硬件 D2C 对齐（OBAlignMode.HW_MODE）+ 帧同步：
+       深度图在相机硬件端直接对齐到 RGB 坐标系，因此反投影与手眼标定统一使用 RGB 内参。
+    2. 60fps 深度工作模式切换：
+       Gemini 2 默认 Unbinned Dense 模式 RGB 上限为 30fps；当请求 fps > 30 时，
+       必须先将设备深度工作模式切换至 ``Binned Sparse Default`` 才能开放 60fps。
+    3. 强制零畸变（dist_coeffs = np.zeros(5)）：
+       SDK 上报的畸变系数与 OpenCV Brown 模型不兼容（实测 k1≈42.6 会导致 PnP 严重畸变），
+       而该相机出厂流经内部校正后按零畸变计算可与深度图达到亚像素级吻合。
+    4. 低延迟取流（latest_only=True）：
+       排空 SDK 接收队列只保留最新一帧组，跳过旧帧的 MJPG 解码，防止视觉延迟随处理抖动累积。
 
 依赖：
-    pip install pyorbbecsdk opencv-contrib-python numpy
+    pip install pyorbbecsdk2 opencv-contrib-python numpy
 
 注意：
     - Gemini 2 深度有效范围约 0.15m ~ 10m（近距不如 D405，跟随距离别设太近）
-    - pip 包名是 pyorbbecsdk2（v2.x），`pip install pyorbbecsdk` 装的是旧 v1 分支
-    - 不同版本 pyorbbecsdk 的 API 名字可能略有差异，
-      若报错请对照你安装的 SDK 示例（example/python 目录）微调本文件
+    - pip 包名是 pyorbbecsdk2（v2.x），``pip install pyorbbecsdk`` 装的是旧 v1 分支
+    - 不同版本 pyorbbecsdk2 的时间戳 API 命名略有差异，已通过 ``_read_timestamp_seconds`` 兼容
 """
 
 import numpy as np
@@ -27,11 +40,34 @@ from pyorbbecsdk import (
 
 
 class Gemini2Camera:
+    """Orbbec Gemini 2 RGB-D 相机采集封装（Orbbec SDK v2 Pipeline）。
+
+    核心属性：
+        width, height (int): 实际生效的彩色图分辨率（像素），高帧率回退时可能不同于请求值。
+        fx, fy, cx, cy (float): 对齐后 RGB 相机内参（像素）。
+        camera_matrix (np.ndarray): 3x3 float32 内参矩阵。
+        dist_coeffs (np.ndarray): 5 维 float32 畸变向量，恒为全零。
+        depth_scale (float | None): 深度单位换算系数（米/原始单位），首帧到达时初始化。
+        dropped_frames (int): ``latest_only=True`` 排空队列累计跳过的旧帧组数。
+    """
+
     def __init__(self, width=640, height=480, fps=30, align_to_color=True,
                  color_exposure_ms=0.0):
+        """初始化并启动 Gemini 2 相机流、硬件 D2C 对齐、内参读取与可选手动曝光。
+
+        Args:
+            width (int): 期望的彩色/深度图像宽度（像素），默认 640。
+            height (int): 期望的彩色/深度图像高度（像素），默认 480。
+            fps (int): 期望帧率（Hz），默认 30；当 ``fps > 30`` 时会自动尝试切换至
+                ``Binned Sparse Default`` 深度工作模式以开放 60fps。
+            align_to_color (bool): 是否开启硬件级深度到彩色对齐（HW D2C）及帧同步，默认 True。
+            color_exposure_ms (float): 可选的彩色手动曝光时长（毫秒）；``<= 0`` 表示保持自动曝光。
+                开启后会以「试写 + 实测画面亮度」闭环自校准设备寄存器单位，过暗时自动退回自动曝光。
+        """
         self.width = width
         self.height = height
 
+        # 初始化 Orbbec SDK v2 采集管线与流配置对象
         self.pipeline = Pipeline()
         config = Config()
 
@@ -74,7 +110,8 @@ class Gemini2Camera:
                 p = color_profiles.get_stream_profile_by_index(i)
                 print(f"    {p.get_width()}x{p.get_height()}@"
                       f"{p.get_fps()} {p.get_format()}")
-            # 退而求其次：任意分辨率但帧率达标的 MJPG（保帧率优先于保分辨率）
+            # 退而求其次：任意分辨率但帧率达标的 MJPG（保帧率优先于保分辨率），
+            # 在满足目标 fps 的候选中优先选取像素面积最小的一档以降低解码和检测开销
             color_profile = None
             best_area = None
             for i in range(color_profiles.get_count()):
@@ -84,6 +121,7 @@ class Gemini2Camera:
                     if best_area is None or area < best_area:
                         color_profile, best_area = p, area
             if color_profile is None:
+                # 仍未匹配目标帧率（常见于 USB 2.0 降速链路），退回 SDK 默认配置
                 color_profile = color_profiles.get_default_video_stream_profile()
             print(f"[Gemini2] 回退使用: {color_profile.get_width()}x"
                   f"{color_profile.get_height()}@{color_profile.get_fps()}")
@@ -96,6 +134,7 @@ class Gemini2Camera:
         depth_profile = None
         if align_to_color:
             try:
+                # 查询与当前彩色 profile 兼容的硬件 D2C 深度流配置列表
                 d2c_profiles = self.pipeline.get_d2c_depth_profile_list(
                     color_profile, OBAlignMode.HW_MODE)
                 for i in range(d2c_profiles.get_count()):
@@ -114,6 +153,7 @@ class Gemini2Camera:
                 depth_profile = None
 
         if depth_profile is None:
+            # 未开启 D2C 或 D2C 列表查询失败时，直接从深度传感器枚举 Y16（16-bit 原始深度）流
             depth_profiles = self.pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
             try:
                 depth_profile = depth_profiles.get_video_stream_profile(
@@ -126,9 +166,11 @@ class Gemini2Camera:
 
         # ---- 深度对齐到彩色（D2C，硬件对齐）+ 帧同步 ----
         if align_to_color:
+            # 启用相机固件硬件对齐并将彩色/深度帧按时间戳同步成对输出
             config.set_align_mode(OBAlignMode.HW_MODE)
             self.pipeline.enable_frame_sync()
 
+        # 启动采集管线（之后才能读取有效内参并开始拉流）
         self.pipeline.start(config)
 
         # ---- 读取 RGB 相机内参（对齐后统一用 RGB 内参做反投影和标定）----
@@ -146,13 +188,13 @@ class Gemini2Camera:
         # 时 PnP 与深度图完全吻合（0.27px / 0% 误差），故强制置零。
         self.dist_coeffs = np.zeros(5, dtype=np.float32)
 
-        # 深度 scale 在首帧读取（见 get_frames）
+        # 深度 scale 在首帧读取（见 get_frames），此处先置空等待首帧填充
         self.depth_scale = None
-        self.dropped_frames = 0   # latest_only 排空丢弃的帧组数（DBG 诊断用）
-        self._last_frame_timestamp_s = None
-        self._timestamp_source = ""
+        self.dropped_frames = 0          # latest_only 排空丢弃的帧组数（DBG 诊断用）
+        self._last_frame_timestamp_s = None  # 最近一帧硬件时间戳（秒），无可用接口时为 None
+        self._timestamp_source = ""          # 命中时间戳方法名与缩放因子，用于日志定位
 
-        # 预热，丢弃前几帧
+        # 预热：丢弃前 30 帧，等待自动曝光/白平衡与硬件 D2C 同步收敛稳定
         print("[Gemini2] 预热相机...")
         for _ in range(30):
             self.pipeline.wait_for_frames(100)
@@ -228,7 +270,20 @@ class Gemini2Camera:
 
     @staticmethod
     def _read_timestamp_seconds(frame):
-        """兼容不同 pyorbbecsdk2 版本；通用接口按 SDK 的毫秒约定换算。"""
+        """从 Orbbec 帧对象读取硬件时间戳并统一换算为秒。
+
+        不同版本的 ``pyorbbecsdk2`` 对时间戳方法命名不统一（如 ``get_timestamp_us`` /
+        ``get_time_stamp_us`` / ``get_timestamp_ns`` / ``get_timestamp``）。
+        按微秒 -> 纳秒 -> 毫秒（通用接口 SDK 默认约定）顺序依次探测。
+
+        Args:
+            frame: Orbbec SDK 的 ColorFrame 或 DepthFrame 实例。
+
+        Returns:
+            tuple[float | None, str]: ``(timestamp_s, source)``；其中 ``timestamp_s`` 为
+            非负有限秒数，``source`` 为命中的接口名与倍率描述；所有候选均不可用时返回
+            ``(None, "")``。
+        """
         candidates = (
             ("get_timestamp_us", 1e-6), ("get_time_stamp_us", 1e-6),
             ("get_timestamp_ns", 1e-9), ("get_time_stamp_ns", 1e-9),
@@ -248,23 +303,35 @@ class Gemini2Camera:
         return None, ""
 
     def get_last_frame_timing(self):
-        """返回最近成功帧的硬件秒时间戳和来源；不改变 get_frames 三元组接口。"""
+        """返回最近一次成功取帧对应的硬件时间戳与来源标识。
+
+        独立提供该方法以在不破坏 ``get_frames()`` 三元组返回签名的前提下，向时序模块
+        （如 ``FrameTimestampMapper``）暴露硬件帧时间。
+
+        Returns:
+            tuple[float | None, str]: ``(timestamp_s, source_str)``，单位为秒；
+            若最近取帧失败或设备不支持硬件时间戳，则 ``timestamp_s`` 为 ``None``。
+        """
         return self._last_frame_timestamp_s, self._timestamp_source
 
     def get_frames(self, latest_only=True):
-        """
-        返回 (color_bgr, depth_raw, depth_scale)：
-            color_bgr  : HxWx3 uint8 BGR 图
-            depth_raw  : HxW uint16 深度原始值（已对齐到 color）
-            depth_scale: float，米 = depth_raw * depth_scale
-        失败返回 (None, None, None)
+        """读取一帧同步对齐的彩色图与深度图。
 
-        latest_only=True（默认）：取到一帧后排空 SDK 队列，只保留最新帧组。
-        处理速度慢于相机帧率时（如检测耗时上涨，log27 识别 3ms→12ms），
-        帧会在队列里积压——取帧 1ms 拿到的其实是几百 ms 前的旧帧，
-        延迟越积越大（「跟随不上」的隐形来源）。排空后处理慢就自动跳帧：
-        实际帧率降下来，但每一帧都是最新的，延迟有界不增长。
+        Args:
+            latest_only (bool): 默认 True。阻塞等到一帧后立即以 0ms 超时非阻塞排空
+                SDK 接收队列，仅保留最新帧组（被跳过的帧组不做 MJPG 解码，几乎零成本）。
+                当上层处理速度慢于相机帧率时（如检测耗时上涨，log27 识别 3ms→12ms），
+                可避免帧在队列里积压成数百 ms 滞后，确保单帧视觉延迟有界不增长。
+
+        Returns:
+            tuple: ``(color_bgr, depth_raw, depth_scale)``：
+                - ``color_bgr`` (np.ndarray | None): ``(H, W, 3)`` uint8 BGR 彩色图像。
+                - ``depth_raw`` (np.ndarray | None): ``(H, W)`` uint16 原始深度图（已对齐到彩色）。
+                - ``depth_scale`` (float | None): 换算系数（m/unit），满足
+                  ``depth_m = depth_raw * depth_scale``。
+            超时或任一帧缺失时返回 ``(None, None, None)``。
         """
+        # 阻塞等待至多 100ms 获取一组帧
         frames = self.pipeline.wait_for_frames(100)
         if frames is None:
             return None, None, None
@@ -283,6 +350,8 @@ class Gemini2Camera:
         if color_frame is None or depth_frame is None:
             self._last_frame_timestamp_s = None
             return None, None, None
+
+        # 优先读取彩色帧硬件时间戳，缺失时回退读取深度帧时间戳
         timestamp_s, source = self._read_timestamp_seconds(color_frame)
         if timestamp_s is None:
             timestamp_s, source = self._read_timestamp_seconds(depth_frame)
@@ -291,7 +360,7 @@ class Gemini2Camera:
             self._timestamp_source = source
             print(f"[Gemini2] 帧硬件时间接口: {source}")
 
-        # 彩色：MJPG 解码为 BGR
+        # 彩色帧解码：MJPG 用 OpenCV 解码为 BGR，未压缩 RGB 则直接 reshape 并转通道顺序
         if color_frame.get_format() == OBFormat.MJPG:
             color_image = cv2.imdecode(
                 np.asanyarray(color_frame.get_data()), cv2.IMREAD_COLOR)
@@ -300,7 +369,7 @@ class Gemini2Camera:
                 color_frame.get_height(), color_frame.get_width(), 3)
             color_image = cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
 
-        # 深度：uint16 原始值
+        # 深度帧解析：Y16 小端 uint16 缓冲区直接视图化为 (H, W)
         h, w = depth_frame.get_height(), depth_frame.get_width()
         depth_raw = np.frombuffer(depth_frame.get_data(), dtype=np.uint16).reshape(h, w)
 
@@ -315,6 +384,7 @@ class Gemini2Camera:
         return color_image, depth_raw, self.depth_scale
 
     def stop(self):
+        """停止 Orbbec Pipeline 采集并释放 USB 设备流资源。"""
         self.pipeline.stop()
 
 

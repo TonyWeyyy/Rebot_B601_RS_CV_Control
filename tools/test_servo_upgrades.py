@@ -37,22 +37,29 @@ from analyze_servo_log import summarize
 
 
 class TimingTests(unittest.TestCase):
+    """时间缩放、测量年龄保护与有界前瞻时间计算单元测试。"""
+
     def test_nominal_alpha_unchanged(self):
+        """验证标称控制周期 0.01s 下 EMA 平滑系数保持原值不变。"""
         self.assertAlmostEqual(scaled_alpha(0.48, 0.01), 0.48, places=12)
 
     def test_double_dt_alpha_is_two_ema_steps(self):
+        """验证双倍周期 0.02s 的时间缩放 EMA 等价于两次标称步长串联。"""
         a = scaled_alpha(0.48, 0.02)
         expected = 1.0 - (1.0 - 0.48) ** 2
         self.assertAlmostEqual(a, expected, places=12)
 
     def test_decay_uses_actual_dt(self):
+        """验证指数衰减系数按实际周期 dt 幂次缩放。"""
         self.assertAlmostEqual(scaled_decay(0.9, 0.02, 0.01), 0.81)
 
     def test_bad_timestamp_does_not_extrapolate(self):
+        """验证未来时间戳与 NaN 时间戳将观测年龄安全归零，防止异常外推。"""
         self.assertEqual(measurement_age(1.0, 2.0), 0.0)
         self.assertEqual(measurement_age(1.0, float("nan")), 0.0)
 
     def test_dynamic_lead_is_bounded_and_not_cumulative(self):
+        """验证动态前瞻时间受上限钳位，且重复周期内不随帧龄累积发散。"""
         lead = dynamic_lead_seconds(8.0, 0.004, 20.0)
         self.assertAlmostEqual(lead, 0.012)
         # 同一帧在后续重复控制周期仍应得到相同 lead，而不是随帧年龄增长。
@@ -61,7 +68,10 @@ class TimingTests(unittest.TestCase):
 
 
 class EyeInHandCompensationTests(unittest.TestCase):
+    """眼在手上（Eye-in-Hand）相机自运动速度补偿与世界/相机坐标变换测试。"""
+
     def test_static_point_cancels_pure_camera_translation(self):
+        """验证纯平移自运动下静止手掌的相机系视速度被精确抵消为零。"""
         twist = np.array([0.30, -0.10, 0.05, 0.0, 0.0, 0.0])
         palm = np.array([0.12, -0.07, 0.35])
         observed = -(twist[:3] + np.cross(twist[3:], palm))
@@ -69,6 +79,7 @@ class EyeInHandCompensationTests(unittest.TestCase):
         np.testing.assert_allclose(compensated, np.zeros(3), atol=1e-12)
 
     def test_static_point_cancels_pure_camera_rotation(self):
+        """验证纯旋转自运动（含叉乘臂长效应）下静止手掌的视速度被精确抵消。"""
         twist = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.50])
         palm = np.array([0.20, -0.10, 0.35])
         observed = -(twist[:3] + np.cross(twist[3:], palm))
@@ -76,6 +87,7 @@ class EyeInHandCompensationTests(unittest.TestCase):
         np.testing.assert_allclose(compensated, np.zeros(3), atol=1e-12)
 
     def test_tcp_angular_motion_includes_camera_mount_lever_arm(self):
+        """验证 TCP 角速度经相机安装偏置杠杆臂正确耦合为相机线速度并可完整抵消。"""
         transform = np.eye(4)
         transform[:3, 3] = [0.05, 0.0, 0.0]
         tcp_twist = np.array([0.10, 0.0, 0.0, 0.0, 0.0, 0.20])
@@ -90,6 +102,7 @@ class EyeInHandCompensationTests(unittest.TestCase):
             np.zeros(3), atol=1e-12)
 
     def test_true_hand_velocity_survives_compensation(self):
+        """验证相机与手掌同时运动时，补偿后精确还原真实手掌速度。"""
         twist = np.array([0.15, 0.02, -0.03, 0.01, -0.02, 0.03])
         palm = np.array([0.10, 0.05, 0.35])
         hand_velocity = np.array([0.40, -0.20, 0.10])
@@ -99,6 +112,7 @@ class EyeInHandCompensationTests(unittest.TestCase):
         np.testing.assert_allclose(compensated, hand_velocity, atol=1e-12)
 
     def test_delayed_camera_twist_history_cancels_lagged_stop_motion(self):
+        """验证历史旋量窗补偿可消除机械臂刚急停时视觉滞后残留的自运动假速度。"""
         # 机械臂 40ms 前以 0.42 m/s 冲刺，当前周期刚进死区指令归零 (0.0 m/s)；
         # 滞后 40ms 的视觉 KF 仍看到 -0.40 m/s 相对速度。
         history = [
@@ -112,6 +126,7 @@ class EyeInHandCompensationTests(unittest.TestCase):
         self.assertLess(float(np.linalg.norm(compensated)), 0.03)
 
     def test_camera_world_point_round_trip(self):
+        """验证世界坐标与相机坐标在非单位外参及 TCP 旋转下的往返变换可逆性。"""
         def rot_z(angle):
             c, s = np.cos(angle), np.sin(angle)
             return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
@@ -130,6 +145,7 @@ class EyeInHandCompensationTests(unittest.TestCase):
             point_world, atol=1e-12)
 
     def test_invalid_inputs_fall_back_safely(self):
+        """验证维度错误或含 NaN 输入时自运动补偿与旋量变换安全回退不崩。"""
         observed = np.array([0.1, 0.2, 0.3])
         np.testing.assert_array_equal(
             compensate_palm_velocity(observed, np.zeros(3), np.zeros(3)),
@@ -147,11 +163,15 @@ class EyeInHandCompensationTests(unittest.TestCase):
 
 
 class StaticVelocityHoldTests(unittest.TestCase):
+    """静止锁存死区内低速残余归零保持门控（``StaticVelocityHold``）测试。"""
+
     def setUp(self):
+        """构造 3 帧确认、速度门槛 0.025 的静止速度保持门控实例。"""
         self.gate = StaticVelocityHold(speed_limit=0.025, confirm_frames=3)
         self.low = np.array([0.010, -0.005, 0.0, 0.0, 0.0, 0.0])
 
     def test_low_speed_tail_zeroes_only_after_confirmation(self):
+        """验证低速尾振必须连续满足确认帧数后才切零，避免过早截断停靠。"""
         for expected in (False, False, True, True):
             result, active = self.gate.update(self.low, True, True)
             self.assertEqual(active, expected)
@@ -161,6 +181,7 @@ class StaticVelocityHoldTests(unittest.TestCase):
                 np.testing.assert_allclose(result, self.low)
 
     def test_high_speed_docking_keeps_original_decay(self):
+        """验证高于门槛的停靠速度不被静置保持强制截断，维持原有平滑衰减。"""
         fast = np.array([0.10, 0.0, 0.0, 0.0, 0.0, 0.0])
         for _ in range(5):
             result, active = self.gate.update(fast, True, True)
@@ -168,6 +189,7 @@ class StaticVelocityHoldTests(unittest.TestCase):
             np.testing.assert_allclose(result, fast)
 
     def test_motion_and_deadband_exit_reset_confirmation(self):
+        """验证重新进入运动态或离开位置死区会立即清空确认计数。"""
         self.gate.update(self.low, True, True)
         self.gate.update(self.low, True, True)
         result, active = self.gate.update(self.low, False, True)
@@ -179,12 +201,14 @@ class StaticVelocityHoldTests(unittest.TestCase):
         self.assertFalse(self.gate.update(self.low, True, True)[1])
 
     def test_disable_preserves_v9_velocity_state(self):
+        """验证 ``enabled=False`` 时完全透传原速度向量，兼容旧版本回退。"""
         for _ in range(5):
             result, active = self.gate.update(self.low, True, True, enabled=False)
             self.assertFalse(active)
             np.testing.assert_allclose(result, self.low)
 
     def test_nonfinite_input_fails_to_zero(self):
+        """验证含 NaN 的速度输入安全归零且不激活保持标志。"""
         bad = self.low.copy()
         bad[1] = np.nan
         result, active = self.gate.update(bad, True, True)
@@ -192,13 +216,17 @@ class StaticVelocityHoldTests(unittest.TestCase):
         np.testing.assert_array_equal(result, np.zeros(6))
 
     def test_input_array_is_not_modified(self):
+        """验证 ``update`` 不原地修改调用方传入的速度数组。"""
         original = self.low.copy()
         self.gate.update(self.low, True, True)
         np.testing.assert_allclose(self.low, original)
 
 
 class FastStartTests(unittest.TestCase):
+    """快速起步解锁门控（``FastStartGate``）防噪与同向确认测试。"""
+
     def test_static_noise_does_not_unlock(self):
+        """验证毫米级静止观测抖动绝不误解锁起步门控。"""
         gate = FastStartGate(True, 2, 0.030, 0.8)
         gate.reset(np.array([0.0, 0.0, 0.35]))
         for p in ([0.002, 0.0, 0.35], [-0.002, 0.001, 0.351],
@@ -206,12 +234,14 @@ class FastStartTests(unittest.TestCase):
             self.assertFalse(gate.update(np.array(p)))
 
     def test_coherent_motion_unlocks_on_second_new_frame(self):
+        """验证连续两帧同向超阈值位移在第 2 帧准确触发快速解锁。"""
         gate = FastStartGate(True, 2, 0.030, 0.8)
         gate.reset(np.array([0.0, 0.0, 0.35]))
         self.assertFalse(gate.update(np.array([0.032, 0.0, 0.35])))
         self.assertTrue(gate.update(np.array([0.038, 0.0, 0.35])))
 
     def test_reversal_cannot_inherit_confirmation(self):
+        """验证方向突反（跳点/振荡）不得继承上一帧的确认计数。"""
         gate = FastStartGate(True, 2, 0.030, 0.8)
         gate.reset(np.array([0.0, 0.0, 0.35]))
         self.assertFalse(gate.update(np.array([0.040, 0.0, 0.35])))
@@ -220,7 +250,10 @@ class FastStartTests(unittest.TestCase):
 
 
 class SlowFollowTests(unittest.TestCase):
+    """慢速微拖通道门控（``SlowFollowGate``）防噪与反向复位测试。"""
+
     def test_static_noise_never_activates(self):
+        """验证静止小幅噪声绝不误触发慢拖跟随通道。"""
         gate = SlowFollowGate()
         gate.reset(np.zeros(3))
         for point in ([0.002, 0.0, 0.0], [-0.002, 0.001, 0.0],
@@ -228,6 +261,7 @@ class SlowFollowTests(unittest.TestCase):
             self.assertFalse(gate.update(np.array(point)))
 
     def test_slow_coherent_drag_activates_without_fast_start(self):
+        """验证低速单向持续微拖可在不触发快启的情况下激活慢拖通道。"""
         gate = SlowFollowGate(distance=0.014, confirm_frames=3)
         gate.reset(np.zeros(3))
         states = [gate.update(np.array([x, 0.0, 0.0]))
@@ -236,6 +270,7 @@ class SlowFollowTests(unittest.TestCase):
         self.assertFalse(any(states[:2]))
 
     def test_reversal_restarts_confirmation(self):
+        """验证慢拖激活后方向反转会立刻失活并重新累计确认。"""
         gate = SlowFollowGate(distance=0.014, confirm_frames=2)
         gate.reset(np.zeros(3))
         gate.update(np.array([0.02, 0.0, 0.0]))
@@ -244,6 +279,7 @@ class SlowFollowTests(unittest.TestCase):
         self.assertFalse(gate.active)
 
     def test_disable_and_nonfinite_fail_safe(self):
+        """验证禁用开关与含 NaN 坐标输入均安全返回 False 并保持未激活。"""
         gate = SlowFollowGate()
         self.assertFalse(gate.update(np.array([0.1, 0.0, 0.0]), enabled=False))
         self.assertFalse(gate.update(np.array([np.nan, 0.0, 0.0])))
@@ -251,7 +287,10 @@ class SlowFollowTests(unittest.TestCase):
 
 
 class KalmanAxisNoiseTests(unittest.TestCase):
+    """3D 卡尔曼滤波器分轴观测噪声 R 与分轴过程噪声 Q 缩放兼容性测试。"""
+
     def test_scalar_behavior_is_backward_compatible(self):
+        """验证仅传标量 r 与传 r_xy=r_z=None 时滤波状态完全等价。"""
         scalar = KalmanTarget3D(q=1.5, r=0.004)
         vector = KalmanTarget3D(q=1.5, r=0.004, r_xy=None, r_z=None)
         for dt, meas in ((0.0, [0.0, 0.0, 0.35]),
@@ -262,6 +301,7 @@ class KalmanAxisNoiseTests(unittest.TestCase):
             np.testing.assert_allclose(scalar.x, vector.x, atol=1e-12)
 
     def test_xy_noise_is_independent_from_depth(self):
+        """验证较小 r_xy 使水平轴响应快于深度轴，且非正 r_xy 抛出 ValueError。"""
         kf = KalmanTarget3D(q=1.5, r=0.004, r_xy=0.0025, r_z=0.004)
         np.testing.assert_allclose(kf.r_vector, [0.0025, 0.0025, 0.004])
         kf.update(np.array([0.0, 0.0, 0.35]), 0.0)
@@ -272,6 +312,7 @@ class KalmanAxisNoiseTests(unittest.TestCase):
 
 
     def test_scalar_and_vector_process_noise_are_equivalent(self):
+        """验证标量与等值向量 q_scale 产生的过程噪声矩阵 Q 一致，且支持三轴独立缩放。"""
         scalar = KalmanTarget3D(q=1.5)
         vector = KalmanTarget3D(q=1.5)
         scalar.q_scale = 1.4
@@ -287,13 +328,17 @@ class KalmanAxisNoiseTests(unittest.TestCase):
 
 
 class AxisProcessNoiseGateTests(unittest.TestCase):
+    """分轴新息自适应过程噪声门控（``AxisProcessNoiseGate``）测试。"""
+
     def test_static_noise_never_amplifies_q(self):
+        """验证静止小新息抖动永远维持三轴 Q 倍率为 1.0。"""
         gate = AxisProcessNoiseGate()
         for _ in range(20):
             scales = gate.update(np.array([0.02, -0.02, 0.03]), 0.016)
         np.testing.assert_array_equal(scales, np.ones(3))
 
     def test_coherent_xy_innovation_amplifies_after_confirmation(self):
+        """验证连续同向大新息仅在确认后放大 XY 轴 Q，深度 Z 轴默认保持 1.0。"""
         gate = AxisProcessNoiseGate(confirm_frames=2)
         first = gate.update(np.array([0.08, 0.07, 0.20]), 0.016)
         second = gate.update(np.array([0.12, 0.09, 0.20]), 0.016)
@@ -303,6 +348,7 @@ class AxisProcessNoiseGateTests(unittest.TestCase):
         self.assertEqual(second[2], 1.0)  # 深度噪声默认绝不放大
 
     def test_reversal_must_confirm_again(self):
+        """验证新息符号反转时重置该轴计数并回落 Q 倍率，防止震荡放大噪声。"""
         gate = AxisProcessNoiseGate(confirm_frames=2)
         gate.update(np.array([0.10, 0.0, 0.0]), 0.016)
         before = gate.update(np.array([0.12, 0.0, 0.0]), 0.016)
@@ -314,6 +360,7 @@ class AxisProcessNoiseGateTests(unittest.TestCase):
         self.assertEqual(gate.counts[0], 2)
 
     def test_invalid_input_and_reset_restore_baseline_immediately(self):
+        """验证 NaN 新息与显式 ``reset()`` 均立刻将三轴 Q 倍率与计数恢复基线。"""
         gate = AxisProcessNoiseGate(confirm_frames=1)
         gate.update(np.array([0.12, 0.12, 0.0]), 0.10)
         self.assertTrue(np.any(gate.scales > 1.0))
@@ -326,11 +373,15 @@ class AxisProcessNoiseGateTests(unittest.TestCase):
 
 
 class AdaptiveDockingTests(unittest.TestCase):
+    """近目标高速逼近自适应前馈收束（``adaptive_feedforward_scale``）测试。"""
+
     def setUp(self):
+        """初始化 6cm 误差样本与 v8 线性收束基准比例。"""
         self.error = np.array([0.06, 0.0, 0.0])
         self.old_scale = self.error[0] / 0.07
 
     def test_slow_approach_and_disable_match_v8_exactly(self):
+        """验证低速逼近或禁用开关时与 v8 固定线性收束公式完全一致。"""
         slow, taper, approach = adaptive_feedforward_scale(
             self.error, np.array([-0.05, 0.0, 0.0]), 0.07)
         disabled, _, _ = adaptive_feedforward_scale(
@@ -341,6 +392,7 @@ class AdaptiveDockingTests(unittest.TestCase):
         self.assertAlmostEqual(approach, 0.05)
 
     def test_fast_approach_only_reduces_feedforward(self):
+        """验证高速逼近目标时拉宽收束距离并提前压低前馈以抑止停靠过冲。"""
         scale, taper, approach = adaptive_feedforward_scale(
             self.error, np.array([-0.60, 0.0, 0.0]), 0.07)
         self.assertAlmostEqual(approach, 0.60)
@@ -349,6 +401,7 @@ class AdaptiveDockingTests(unittest.TestCase):
         self.assertAlmostEqual(scale, 0.50)
 
     def test_moving_away_has_no_extra_braking(self):
+        """验证目标远离机械臂时不触发额外前馈衰减，避免拖慢追赶。"""
         scale, taper, approach = adaptive_feedforward_scale(
             self.error, np.array([0.60, 0.0, 0.0]), 0.07)
         self.assertAlmostEqual(scale, self.old_scale)
@@ -356,6 +409,7 @@ class AdaptiveDockingTests(unittest.TestCase):
         self.assertEqual(approach, 0.0)
 
     def test_zero_error_and_nonfinite_input_fail_safe(self):
+        """验证零误差与 NaN 误差输入均安全返回 0 前馈比例。"""
         scale, _, approach = adaptive_feedforward_scale(
             np.zeros(3), np.array([-0.6, 0.0, 0.0]), 0.07)
         self.assertEqual((scale, approach), (0.0, 0.0))
@@ -365,7 +419,11 @@ class AdaptiveDockingTests(unittest.TestCase):
 
 
 class ActualFeedbackTests(unittest.TestCase):
+    """低频独立实际反馈采样器（``ActualFeedbackSampler``）与新鲜度守卫测试。"""
+
     class Robot:
+        """用于单测的最小假机械臂接口（支持注入 NaN 与 CAN 异常）。"""
+
         def __init__(self):
             self.actual = np.linspace(0.1, 0.6, 6)
             self.command = np.linspace(0.2, 0.7, 6)
@@ -380,6 +438,7 @@ class ActualFeedbackTests(unittest.TestCase):
             return self.command.copy()
 
     def test_sample_pairs_actual_with_command_at_same_point(self):
+        """验证单次采样将同一时刻的实际角、指令角与读取耗时成对写入快照。"""
         robot = self.Robot()
         sampler = ActualFeedbackSampler(robot, hz=1.0)
         self.assertTrue(sampler.sample_once())
@@ -390,6 +449,7 @@ class ActualFeedbackTests(unittest.TestCase):
         self.assertTrue(np.isfinite(snapshot["time"]))
 
     def test_nonfinite_and_failed_reads_invalidate_snapshot(self):
+        """验证 NaN 读数立即清空旧快照，且连续三次 CAN 故障自动永久停用采样线程。"""
         robot = self.Robot()
         sampler = ActualFeedbackSampler(robot)
         self.assertTrue(sampler.sample_once())
@@ -403,6 +463,7 @@ class ActualFeedbackTests(unittest.TestCase):
         self.assertTrue(sampler._stop.is_set())  # 连续三次故障永久停用诊断
 
     def test_frequency_and_freshness_guards(self):
+        """验证采样频率硬限在 (0, 2.0] Hz，且未来时刻/过期快照的年龄返回 None。"""
         with self.assertRaises(ValueError):
             ActualFeedbackSampler(self.Robot(), hz=0.0)
         with self.assertRaises(ValueError):
@@ -416,7 +477,10 @@ class ActualFeedbackTests(unittest.TestCase):
 
 
 class CameraTimestampInterfaceTests(unittest.TestCase):
+    """Orbbec SDK 帧时间戳接口微秒/毫秒单位适配与缺失回退测试。"""
+
     def test_sdk_capability_and_unit_adapters(self):
+        """验证 ``_read_timestamp_seconds`` 正确换算 us/ms 接口并在无接口时返回 None。"""
         sdk = types.ModuleType("pyorbbecsdk")
         for name in ("Pipeline", "Config", "OBSensorType", "OBAlignMode", "OBFormat"):
             setattr(sdk, name, object)
@@ -449,7 +513,10 @@ class CameraTimestampInterfaceTests(unittest.TestCase):
 
 
 class CameraTimestampTests(unittest.TestCase):
+    """硬件时间戳到主机单调时钟的在线校准与异常回退（``CameraTimestampCalibrator``）测试。"""
+
     def test_mapping_and_clock_drift(self):
+        """验证正常连续硬件时间戳能平滑映射到主机时钟并跟踪小幅传输抖动。"""
         calibrator = CameraTimestampCalibrator()
         mapped, used = calibrator.update(100.0, 10.0)
         self.assertTrue(used)
@@ -460,6 +527,7 @@ class CameraTimestampTests(unittest.TestCase):
         self.assertGreaterEqual(mapped, 10.015)
 
     def test_backwards_and_jump_fall_back_to_host(self):
+        """验证硬件时钟倒退或大跳变当拍回退主机时钟，下一有效样本重新锚定。"""
         calibrator = CameraTimestampCalibrator()
         calibrator.update(100.0, 10.0)
         mapped, used = calibrator.update(99.0, 10.016)
@@ -474,6 +542,7 @@ class CameraTimestampTests(unittest.TestCase):
         self.assertTrue(used)
 
     def test_bad_api_values_and_transport_anomaly(self):
+        """验证非法返回值与异常超长传输延迟均安全回退为主机时间戳。"""
         calibrator = CameraTimestampCalibrator()
         for raw in (None, float("nan"), -1.0, "bad"):
             mapped, used = calibrator.update(raw, 20.0)
@@ -486,7 +555,10 @@ class CameraTimestampTests(unittest.TestCase):
 
 
 class DiagnosticTests(unittest.TestCase):
+    """非阻塞有界队列日志记录器（``DiagnosticRecorder``）与离线汇总去重测试。"""
+
     def test_bounded_queue_flush_and_offline_summary(self):
+        """验证有界队列满时丢弃不阻塞、关闭时完整刷盘且可被 ``summarize`` 正确解析。"""
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "servo.csv")
             recorder = DiagnosticRecorder(path, queue_size=128).start()
@@ -510,6 +582,7 @@ class DiagnosticTests(unittest.TestCase):
 
 
     def test_feedback_summary_deduplicates_repeated_samples(self):
+        """验证 100Hz 日志中重复引用的低频反馈按采样时刻去重后再统计分位数。"""
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "feedback.csv")
             rows = []
@@ -530,13 +603,17 @@ class DiagnosticTests(unittest.TestCase):
 
 
 class WorkspaceTests(unittest.TestCase):
+    """水平柱面软限位墙（``horizontal_radial_soft_wall``）70% 臂展安全约束测试。"""
+
     def test_outward_radial_velocity_is_removed(self):
+        """验证到达水平半径上限时仅剥离向外径向速度，保留切向分量。"""
         velocity, touched = horizontal_radial_soft_wall(
             [0.42, 0.0, 0.0], [0.20, 0.05, 0.0], 0.42)
         self.assertTrue(touched)
         np.testing.assert_allclose(velocity, [0.0, 0.05, 0.0], atol=1e-12)
 
     def test_inward_and_tangential_motion_are_not_blocked(self):
+        """验证边界上向内回收与纯切向滑动均不被软墙阻挡。"""
         inward, touched = horizontal_radial_soft_wall(
             [0.42, 0.0, 0.0], [-0.20, 0.0, 0.0], 0.42)
         self.assertFalse(touched)
@@ -547,18 +624,21 @@ class WorkspaceTests(unittest.TestCase):
         np.testing.assert_allclose(tangent, [0.0, 0.20, 0.0])
 
     def test_height_does_not_consume_horizontal_workspace(self):
+        """验证竖直高度 Z 不计入水平半径约束（柱面而非球面限位）。"""
         velocity, touched = horizontal_radial_soft_wall(
             [0.0, 0.0, 0.60], [0.20, -0.10, 0.15], 0.42)
         self.assertFalse(touched)
         np.testing.assert_allclose(velocity, [0.20, -0.10, 0.15])
 
     def test_vertical_motion_survives_at_horizontal_boundary(self):
+        """验证在水平边界削去外推分量时仍完整保留竖直升降速度。"""
         velocity, touched = horizontal_radial_soft_wall(
             [0.42, 0.0, 0.60], [0.20, 0.05, 0.15], 0.42)
         self.assertTrue(touched)
         np.testing.assert_allclose(velocity, [0.0, 0.05, 0.15], atol=1e-12)
 
     def test_nonfinite_pose_fails_to_zero(self):
+        """验证位姿含 NaN 时软墙触发保护并将输出速度安全归零。"""
         velocity, touched = horizontal_radial_soft_wall(
             [np.nan, 0.0, 0.0], [0.2, 0.0, 0.0], 0.42)
         self.assertTrue(touched)
@@ -566,13 +646,17 @@ class WorkspaceTests(unittest.TestCase):
 
 
 class AdaptiveLeadTests(unittest.TestCase):
+    """自适应前瞻权重门控（``AdaptiveLeadGate``）巡航/停靠/换向约束测试。"""
+
     def setUp(self):
+        """构造标称参数自适应前瞻门控实例。"""
         self.gate = AdaptiveLeadGate(
             speed_off=0.06, speed_on=0.13, near_dist=0.022,
             full_dist=0.045, direction_full_cos=0.50,
             attack_tau=0.025, release_tau=0.015)
 
     def settle(self, velocity, error, moving=True, valid=True, cycles=40):
+        """连续迭代 ``cycles`` 个 10ms 周期直至前瞻权重收敛。"""
         weight = target = 0.0
         for _ in range(cycles):
             weight, target = self.gate.update(
@@ -581,23 +665,27 @@ class AdaptiveLeadTests(unittest.TestCase):
         return weight, target
 
     def test_coherent_cruise_reaches_full_lead(self):
+        """验证高速同向巡航时前瞻权重平滑上升至满额 1.0。"""
         weight, target = self.settle([0.30, 0.0, 0.0], [0.10, 0.0, 0.0])
         self.assertAlmostEqual(target, 1.0, places=12)
         self.assertGreater(weight, 0.98)
 
     def test_static_residual_speed_has_zero_target_weight(self):
+        """验证低于下沿门槛的残余速度对应目标与实际前瞻权重均为 0。"""
         _, target = self.settle([0.059, 0.0, 0.0], [0.10, 0.0, 0.0])
         self.assertEqual(target, 0.0)
         weight, _ = self.settle([0.059, 0.0, 0.0], [0.10, 0.0, 0.0])
         self.assertEqual(weight, 0.0)
 
     def test_near_target_withdraws_lead(self):
+        """验证进入近目标区（< near_dist）时前瞻权重撤回为零以防停靠过冲。"""
         self.settle([0.30, 0.0, 0.0], [0.10, 0.0, 0.0])
         weight, target = self.settle([0.30, 0.0, 0.0], [0.020, 0.0, 0.0])
         self.assertEqual(target, 0.0)
         self.assertEqual(weight, 0.0)
 
     def test_reversal_cannot_push_past_target(self):
+        """验证误差与速度反向时目标前瞻立刻清零且权重快速回落。"""
         self.settle([0.30, 0.0, 0.0], [0.10, 0.0, 0.0])
         weight, target = self.gate.update(
             np.array([0.30, 0.0, 0.0]), np.array([-0.10, 0.0, 0.0]),
@@ -606,6 +694,7 @@ class AdaptiveLeadTests(unittest.TestCase):
         self.assertLess(weight, 0.50)
 
     def test_stationary_latch_and_invalid_measurement_reset_immediately(self):
+        """验证静止锁存或观测失效时前瞻权重无延迟立刻清零。"""
         self.settle([0.30, 0.0, 0.0], [0.10, 0.0, 0.0])
         weight, target = self.gate.update(
             np.array([0.30, 0.0, 0.0]), np.array([0.10, 0.0, 0.0]),
@@ -618,6 +707,7 @@ class AdaptiveLeadTests(unittest.TestCase):
         self.assertEqual((weight, target), (0.0, 0.0))
 
     def test_release_is_faster_than_attack(self):
+        """验证前瞻撤回时间常数快于建立时间常数（快收慢放抑振）。"""
         attack_gate = AdaptiveLeadGate()
         attack_w, _ = attack_gate.update(
             np.array([0.30, 0.0, 0.0]), np.array([0.10, 0.0, 0.0]),
@@ -632,6 +722,7 @@ class AdaptiveLeadTests(unittest.TestCase):
         self.assertLess(release_w, 1.0 - attack_w)
 
     def test_nonfinite_input_fails_safe(self):
+        """验证 NaN 速度输入安全归零且不污染内部权重状态。"""
         weight, target = self.gate.update(
             np.array([np.nan, 0.0, 0.0]), np.array([0.10, 0.0, 0.0]),
             0.01, True)
@@ -639,6 +730,7 @@ class AdaptiveLeadTests(unittest.TestCase):
         self.assertTrue(np.isfinite(self.gate.weight))
 
     def test_direction_threshold_is_continuous(self):
+        """验证方向余弦权重在阈值附近连续单调过渡而不阶跃跳变。"""
         gate = AdaptiveLeadGate(direction_full_cos=0.50)
         # 两者距离权重都已为 1，只让方向余弦跨过 0.5。
         below, _ = gate.update(
@@ -652,7 +744,10 @@ class AdaptiveLeadTests(unittest.TestCase):
 
 
 class JointScalingAndReversalTests(unittest.TestCase):
+    """关节速度等比/分组限幅（``scale_joint_velocities``）与分轴换向阻尼测试。"""
+
     def test_joint_velocity_proportional_scaling_preserves_direction(self):
+        """验证关节限速等比缩放保持运动方向不变，且分组模式解耦水平偏航与竖直俯仰。"""
         raw = np.array([3.0, -1.5, 0.75, 0.0, -0.3, 0.6])
         scaled = scale_joint_velocities(raw, 1.5, grouped=False)
         self.assertAlmostEqual(float(np.max(np.abs(scaled))), 1.5, places=12)
@@ -671,6 +766,7 @@ class JointScalingAndReversalTests(unittest.TestCase):
             np.zeros(3))
 
     def test_per_axis_reversal_damps_reversing_axis_without_hurting_orthogonal_axis(self):
+        """验证单轴换向阻尼仅收缩反向轴的残余速度，不影响正交同向巡航轴。"""
         v_target = np.array([-0.40, 0.50, 0.0])
         actual = np.array([0.40, 0.45, 0.0])
         prev = np.array([0.40, 0.45, 0.0])
@@ -686,7 +782,10 @@ class JointScalingAndReversalTests(unittest.TestCase):
 
 
 class DelayedTwistCompensatorTests(unittest.TestCase):
+    """滞后+低通匹配自运动补偿器（``DelayedTwistCompensator``）相位对齐与停机窗测试。"""
+
     def test_cancels_delayed_1_67hz_oscillation_without_phase_inversion(self):
+        """验证 1.67Hz 振荡下延迟匹配补偿可精确抵消滞后自运动，避免零延迟补偿反相放大。"""
         # 模拟 1.67Hz 振荡下机械臂相机速度经 100ms 延迟 + 80ms 一阶低通进入 KF 速度
         comp = DelayedTwistCompensator(delay_s=0.10, lpf_tau_s=0.08,
                                        local_window_s=0.04)
@@ -719,6 +818,7 @@ class DelayedTwistCompensatorTests(unittest.TestCase):
         self.assertLess(float(np.mean(matched_res)), 1e-6)
 
     def test_constant_moving_hand_survives_cruise_compensation(self):
+        """验证手掌与机械臂同步匀速巡航时，滞后补偿能完整恢复真实手掌速度。"""
         comp = DelayedTwistCompensator(delay_s=0.10, lpf_tau_s=0.08,
                                        local_window_s=0.04)
         palm = np.array([0.0, 0.0, 0.40])
@@ -730,6 +830,7 @@ class DelayedTwistCompensatorTests(unittest.TestCase):
         self.assertGreater(kv[0], 0.38)
 
     def test_near_stop_local_window_absorbs_extended_lag_drift(self):
+        """验证伸展态执行滞后漂移 +30ms 时，``near_stop`` 局部时间窗仍能压低假残速。"""
         # 伸展态实际滞后比标称多 30ms（130ms vs 100ms），near_stop 局部窗应能抵消
         comp = DelayedTwistCompensator(delay_s=0.10, lpf_tau_s=0.08,
                                        local_window_s=0.04)
@@ -750,6 +851,7 @@ class DelayedTwistCompensatorTests(unittest.TestCase):
         self.assertLess(float(np.linalg.norm(kv)), 0.03)
 
     def test_invalid_inputs_and_reset_fail_safe(self):
+        """验证 NaN 旋量输入被忽略、``reset()`` 清空缓冲且负延迟参数抛出 ValueError。"""
         comp = DelayedTwistCompensator()
         comp.push(np.array([np.nan, 0.0, 0.0, 0.0, 0.0, 0.0]), 0.01, 0.01)
         kv = comp.compensate(np.array([0.1, 0.0, 0.0]), np.zeros(3), now=0.01)
@@ -761,7 +863,10 @@ class DelayedTwistCompensatorTests(unittest.TestCase):
 
 
 class PostBrakeSettleGuardTests(unittest.TestCase):
+    """刹车后冷静窗与单次 KF 重锚守卫（``PostBrakeSettleGuard``）测试。"""
+
     def test_fresh_start_has_no_cooldown_and_brake_triggers_window(self):
+        """验证初启无冷静期、急停后触发伸展自适应冷静窗（抬高唤醒门槛）及单次 KF 重锚。"""
         guard = PostBrakeSettleGuard(base_settle_s=0.22, ext_extra_s=0.08)
         self.assertFalse(guard.in_cooldown(0.0))
         self.assertFalse(guard.in_cooldown(1.0))
@@ -786,7 +891,10 @@ class PostBrakeSettleGuardTests(unittest.TestCase):
 
 
 class ReachScheduleTests(unittest.TestCase):
+    """臂展半径自适应柔性调度（``compute_reach_schedule``）测试。"""
+
     def test_near_workspace_preserves_full_performance(self):
+        """验证近工作区（r=0.20m）所有增益、前馈、前瞻与限速倍率均维持满额 1.0。"""
         sched = compute_reach_schedule(reach_r=0.20, pos_err_norm=0.05)
         self.assertEqual(sched["ext_ratio"], 0.0)
         self.assertEqual(sched["vel_att_target"], 1.0)
@@ -797,6 +905,7 @@ class ReachScheduleTests(unittest.TestCase):
         self.assertEqual(sched["fast_start_dist_scale"], 1.0)
 
     def test_full_extension_softens_docking_and_preserves_far_cruise(self):
+        """验证满伸展态近区柔化停靠与抑振，同时大误差远距追赶仍保留满速。"""
         dock = compute_reach_schedule(reach_r=0.38, pos_err_norm=0.05)
         far = compute_reach_schedule(reach_r=0.38, pos_err_norm=0.30)
         self.assertAlmostEqual(dock["ext_ratio"], 1.0)
@@ -809,13 +918,17 @@ class ReachScheduleTests(unittest.TestCase):
         self.assertAlmostEqual(dock["fast_start_dist_scale"], 1.40)
 
     def test_nonfinite_inputs_fall_back_to_neutral(self):
+        """验证 NaN 半径输入安全回退至中性伸展比 0.0 与无衰减倍率 1.0。"""
         sched = compute_reach_schedule(reach_r=float("nan"), pos_err_norm=0.1)
         self.assertEqual(sched["vel_att_target"], 1.0)
         self.assertEqual(sched["ext_ratio"], 0.0)
 
 
 class OscillationDamperTests(unittest.TestCase):
+    """分轴极限环振荡检测与自适应阻尼器（``OscillationDamper``）测试。"""
+
     def test_single_move_single_reversal_and_slow_wave_never_trigger(self):
+        """验证单次换向、慢速挥手及少于确认次数的两连折返均不误触发振荡阻尼。"""
         damper = OscillationDamper(err_thresh=0.018, min_half_s=0.14,
                                    max_half_s=0.42, decay_tau_s=0.55)
         # 单程运动 + 单次折返：最多 1 次过零，绝不触发
@@ -848,6 +961,7 @@ class OscillationDamperTests(unittest.TestCase):
             np.testing.assert_array_equal(levels, np.zeros(3))
 
     def test_large_error_chase_releases_oscillation_damper(self):
+        """验证阻尼拉起后手掌主动大幅拉远（>= 0.15m）能清零连击并迅速释放阻尼。"""
         damper = OscillationDamper(err_thresh=0.018, min_half_s=0.14,
                                    max_half_s=0.42, decay_tau_s=0.55,
                                    confirm_reversals=3,
@@ -865,6 +979,7 @@ class OscillationDamperTests(unittest.TestCase):
         self.assertLess(damper.levels[0], 0.12)
 
     def test_1_7hz_limit_cycle_triggers_rapidly_only_on_oscillating_axis(self):
+        """验证 1.7Hz 悬臂极限环仅快速拉起振荡轴阻尼，正交巡航轴保持 0 阻尼。"""
         damper = OscillationDamper(err_thresh=0.018, min_half_s=0.14,
                                    max_half_s=0.42, decay_tau_s=0.55)
         max_x = 0.0
@@ -879,6 +994,7 @@ class OscillationDamperTests(unittest.TestCase):
         self.assertEqual(max_y, 0.0)  # 正交巡航轴丝毫不受影响
 
     def test_decays_after_settling_and_handles_invalid_inputs(self):
+        """验证振荡平息后阻尼指数衰减归零、NaN 安全清零且非法半周期上下界抛 ValueError。"""
         damper = OscillationDamper(decay_tau_s=0.30)
         for k in range(100):
             t = k * 0.01
@@ -896,7 +1012,10 @@ class OscillationDamperTests(unittest.TestCase):
 
 
 class CameraPoseHistoryTests(unittest.TestCase):
+    """滞后对齐相机位姿历史缓冲（``CameraPoseHistory``）SO(3) 正交性与史密斯混合测试。"""
+
     def test_static_world_point_invariant_under_translating_rotating_camera(self):
+        """验证机械臂平移+旋转滞后场景下，按曝光滞后查表重建的静止世界点精确不变且保持 SO(3)。"""
         hist = CameraPoseHistory(lpf_tau_s=0.0, max_history_s=0.60)
         T_tc = np.eye(4)
         T_tc[:3, 3] = np.array([0.02, -0.01, 0.05])
@@ -929,6 +1048,7 @@ class CameraPoseHistoryTests(unittest.TestCase):
                     reconstructed_world, world_hand, atol=2e-3)
 
     def test_blended_pose_interpolates_and_handles_invalid_inputs(self):
+        """验证 ``blended_pose`` 在滞后位姿与当前位姿间线性插值，且 ``push`` 拒绝 NaN。"""
         hist = CameraPoseHistory(lpf_tau_s=0.0, max_history_s=0.50)
         T_tc = np.eye(4)
         for k in range(25):
@@ -945,7 +1065,10 @@ class CameraPoseHistoryTests(unittest.TestCase):
 
 
 class OrientationPriorityAndJointLimitsTests(unittest.TestCase):
+    """v12 姿态柔性巡航、加权阻尼伪逆、关节软缓冲、双估计器共识、XY 局部更新与 ROI 裁剪测试。"""
+
     def test_orientation_weight_relaxes_in_far_cruise_and_guards_tilt_limit(self):
+        """验证大误差巡航时姿态权重平滑放宽，倾角逼近软上限时自动拉回 1.0 防止丢手。"""
         # 停靠区或未激活：保持 1.0 刚性姿态
         self.assertEqual(compute_orientation_cruise_weight(0.05, 0.01), 1.0)
         self.assertEqual(compute_orientation_cruise_weight(
@@ -962,6 +1085,7 @@ class OrientationPriorityAndJointLimitsTests(unittest.TestCase):
         self.assertEqual(w_guard, 1.0)
 
     def test_weighted_dls_matches_standard_at_unit_weight_and_frees_wrist(self):
+        """验证加权 DLS 在单位权重下恒等于标准伪逆，降低姿态权重后可减轻手腕 J4 负担。"""
         # 构造类似 B601 的竖直+俯仰耦合雅可比：z 靠 J2/J3，俯仰由 J2+J3+J4 决定
         J = np.eye(6, dtype=np.float64)
         J[2, 1] = 0.25
@@ -986,6 +1110,7 @@ class OrientationPriorityAndJointLimitsTests(unittest.TestCase):
         self.assertAlmostEqual(float((J @ dq_soft)[2]), float((J @ dq_rigid)[2]), places=2)
 
     def test_per_joint_vector_limits_free_wrist_without_exceeding_j2_j3(self):
+        """验证逐轴向量限速放宽手腕转速的同时严格守住承重轴 J2/J3 <= 2.0 rad/s 红线。"""
         limits = np.array([2.4, 2.0, 2.0, 2.8, 2.8, 2.2])
         # J4=2.6, J2=1.5, J3=1.4：按统一 2.0 会把 J2/J3 砍到 1.15/1.08；按 L2 向量不限速
         dq = np.array([1.8, 1.5, 1.4, 2.6, 1.8, 0.2])
@@ -998,6 +1123,7 @@ class OrientationPriorityAndJointLimitsTests(unittest.TestCase):
         self.assertTrue(np.all(np.abs(scaled_safe) <= limits + 1e-9))
 
     def test_consensus_velocity_suppresses_single_estimator_leak(self):
+        """验证双估计器共识速度在同向时取保守较小值、异向或单侧泄漏时直接抑制。"""
         # 真实运动：两估计器同向一致，取保守较小幅值
         v_ok = consensus_velocity([0.45, -0.30, 0.10], [0.40, -0.35, 0.12])
         np.testing.assert_allclose(v_ok, [0.40, -0.30, 0.10], atol=1e-9)
@@ -1008,6 +1134,7 @@ class OrientationPriorityAndJointLimitsTests(unittest.TestCase):
             consensus_velocity([np.nan, 0.1, 0.0], [0.1, 0.1, 0.0]), np.zeros(3))
 
     def test_joint_limit_cushion_softens_outward_and_preserves_inward(self):
+        """验证关节限位缓冲仅按余量线性衰减趋向限位的速度，离开限位方向不衰减。"""
         q_min = np.array([-2.0, 0.0, 0.17, -1.40, -2.0, -2.0])
         q_max = np.array([ 2.0, 2.0, 2.50,  1.40,  2.0,  2.0])
         # J4 距上限 0.04rad（margin=0.08 -> 50%），J3 距下限 0.02rad（25%）
@@ -1025,6 +1152,7 @@ class OrientationPriorityAndJointLimitsTests(unittest.TestCase):
         np.testing.assert_allclose(out_in, dq_in, atol=1e-9)
 
     def test_oscillation_damper_retains_memory_across_brief_stop_dip(self):
+        """验证振荡阻尼器在短暂失活（``active=False``）期间保留连击记忆，仅 ``hard_reset=True`` 清零。"""
         damper = OscillationDamper(err_thresh=0.018, min_half_s=0.14,
                                    max_half_s=0.42, decay_tau_s=0.55,
                                    confirm_reversals=3, large_err_release=0.15)
@@ -1048,6 +1176,7 @@ class OrientationPriorityAndJointLimitsTests(unittest.TestCase):
         np.testing.assert_array_equal(lv_rst, np.zeros(3))
 
     def test_kf_partial_xy_update_tracks_xy_without_touching_frozen_z(self):
+        """验证深度冻结期间 ``update_partial`` 仅更新垂直于光轴的 XY 子空间而绝不污染深度 Z。"""
         kf = KalmanTarget3D(q=2.0, r_xy=0.0023, r_z=0.0038)
         # 未初始化时不得用部分观测强行初始化
         self.assertFalse(kf.update_partial([0.1, 0.2], [[1, 0, 0], [0, 1, 0]], 0.02))
@@ -1080,6 +1209,7 @@ class OrientationPriorityAndJointLimitsTests(unittest.TestCase):
         self.assertAlmostEqual(z_after, z_before, places=9)
 
     def test_roi_box_hysteresis_and_exact_landmark_remapping(self):
+        """验证 ROI 裁剪框迟滞防抖、画面边界钳位及关键点映射回全图后的精确像素/捏合一致性。"""
         # 640x480 画面下 scale=0.68 -> 约 326x326 ROI
         box1 = compute_roi_box(640, 480, (320, 240), prev_box=None, scale=0.68)
         self.assertIsNotNone(box1)
@@ -1115,9 +1245,10 @@ class OrientationPriorityAndJointLimitsTests(unittest.TestCase):
 
 
 class MitExtensionP0Tests(unittest.TestCase):
-    """v13 P0：MIT 扩展配置、CAN 瞬时故障容错（S1）、反馈缓存与上游版本校验。"""
+    """v13 P0~P4：MIT 扩展配置、CAN 故障容错、P1 FOH/速度前馈、P3 重力/增益调度与 P4 安全监控测试。"""
 
     def _make_fake_upstream(self):
+        """构造轻量上游 ``ReBotRSMITController`` 假基类，供运行时子类化扩展逻辑单测。"""
         import contextlib
         import threading
 
@@ -1214,6 +1345,7 @@ class MitExtensionP0Tests(unittest.TestCase):
         return FakeUpstreamBase
 
     def test_config_validation_and_yaml_loading(self):
+        """验证 ``config/mit_ext.yaml`` 正常加载且所有越界/危险配置项均被校验拒绝。"""
         from mit_controller_ext import load_mit_ext_cfg, validate_mit_ext_cfg
 
         cfg = load_mit_ext_cfg()
@@ -1250,6 +1382,7 @@ class MitExtensionP0Tests(unittest.TestCase):
                 validate_mit_ext_cfg(bad)
 
     def test_can_fault_monitor_transient_vs_sustained(self):
+        """验证 ``CanFaultMonitor`` 容忍瞬时丢帧（成功即清零），仅连续超窗触发故障。"""
         from mit_controller_ext import CanFaultMonitor
 
         mon = CanFaultMonitor(window_s=0.03, control_hz=200.0)
@@ -1266,6 +1399,7 @@ class MitExtensionP0Tests(unittest.TestCase):
         self.assertEqual(mon.max_consecutive, 6)
 
     def test_upstream_compat_and_fallback(self):
+        """验证上游源码 SHA256 钉死校验失配或 ``enable=False`` 时自动回退原版控制器。"""
         from mit_controller_ext import check_upstream_compat, build_controller
 
         FakeBase = self._make_fake_upstream()
@@ -1284,6 +1418,7 @@ class MitExtensionP0Tests(unittest.TestCase):
         self.assertIs(type(ctrl2), FakeBase)
 
     def test_extended_controller_s1_tolerance_feedback_and_shutdown_retry(self):
+        """验证扩展控制器 S1 瞬时 CAN 容错、200Hz 录波、持续故障安全回零与停机重试。"""
         import threading
         import time
         from mit_controller_ext import make_extended_controller_class
@@ -1326,6 +1461,7 @@ class MitExtensionP0Tests(unittest.TestCase):
         self.assertEqual(ctrl.fail_next_sends, 0)
 
     def test_feedback_error_auto_disable_does_not_trip_can_fault(self):
+        """验证反馈采样连续异常仅自动降级关闭缓存，绝不误触发主控 CAN 停机故障。"""
         from mit_controller_ext import make_extended_controller_class
 
         FakeBase = self._make_fake_upstream()
@@ -1339,6 +1475,7 @@ class MitExtensionP0Tests(unittest.TestCase):
         self.assertEqual(ctrl._fault_monitor.total_failures, 0)
 
     def test_p1_foh_zero_ripple_watchdog_and_conflict_guards(self):
+        """验证 P1 200Hz FOH 零纹波插值、看门狗衰减不外推、方向冲突归零及硬限速钳制。"""
         from mit_controller_ext import compute_p1_mit_step
 
         # 1) 异步 100Hz→200Hz 连续匀速：任意线程相位 phi=3ms 下，每拍步长必须精确等于 v*5ms（零阶梯纹波）
@@ -1402,6 +1539,7 @@ class MitExtensionP0Tests(unittest.TestCase):
         self.assertLessEqual(dq_c, 2.0 + 1e-9)
 
     def test_p1_controller_sends_dq_isolates_j7_and_exits_on_legacy_call(self):
+        """验证 P1 控制器正确下发 J1~J6 速度前馈、严格隔离 J7=0、切回旧接口立刻清零及看门狗衰减。"""
         import threading
         import time
         from mit_controller_ext import make_extended_controller_class
@@ -1449,6 +1587,7 @@ class MitExtensionP0Tests(unittest.TestCase):
             t.join(timeout=1.0)
 
     def test_p3_gravity_tau_cradle_fade_caps_and_gain_scheduling(self):
+        """验证 P3 零位支架淡出、重力矩硬限幅/斜率限制/异常降矩、伸展 kd 调度与下垂反号保护。"""
         from mit_controller_ext import (
             cradle_zero_fade, compute_p3_gravity_tau, compute_p3_gains)
         from tools.p3_gravity_verify import check_sag_monotonic_safety
@@ -1506,6 +1645,7 @@ class MitExtensionP0Tests(unittest.TestCase):
         self.assertFalse(ok_bad)
 
     def test_p3_controller_sends_tau_ff_scheduled_kd_and_fades_at_zero(self):
+        """验证 P3 控制器端到端注入重力前馈与伸展阻尼、保持 J7 基线，并在回零时淡出归零。"""
         import threading
         import time
         from mit_controller_ext import make_extended_controller_class
@@ -1558,6 +1698,7 @@ class MitExtensionP0Tests(unittest.TestCase):
         self.assertAlmostEqual(ctrl.motors[0].mit_cmds[-1][3], 3.6, delta=0.15)
 
     def test_p4_safety_supervisor_collision_torque_thermal_and_soft_hold(self):
+        """验证 P4 安全监控的温升线性降速、跟踪误差/过载堵转软停机锁存（绝不空中失能）及故障恢复。"""
         from mit_controller_ext import (
             SafetySupervisor, validate_mit_ext_cfg, make_extended_controller_class)
 
@@ -1637,9 +1778,10 @@ class MitExtensionP0Tests(unittest.TestCase):
 
 
 class JointSysidAndProbeTests(unittest.TestCase):
-    """v13 P0：单关节阶跃/扫频辨识数学、只读探针评估与日志分析兼容测试。"""
+    """v13 P0/P2：单关节阶跃/扫频辨识数学、只读探针评估、日志分析与实测速度滤波测试。"""
 
     def test_step_and_sine_identification_recovers_second_order_params(self):
+        """验证延迟二阶斜坡卷积阶跃拟合与直流免疫扫频锁相能精确还原真值参数。"""
         from tools.joint_sysid import (
             _simulate_filtered_step, analyze_step_response,
             analyze_sine_segment, safe_sine_amp_rad)
@@ -1680,6 +1822,7 @@ class JointSysidAndProbeTests(unittest.TestCase):
         self.assertAlmostEqual(sr["phase_deg"], np.rad2deg(np.angle(H)), delta=1.5)
 
     def test_probe_evaluation_verdict_and_gravity_sign_check(self):
+        """验证只读探针评估正确判别 Mode A/B、重力矩符号一致及超 0.3° 偏差拒批 trusted。"""
         from tools.mit_feedback_probe import evaluate_probe_metrics
 
         mode_a = {"valid_ratio": 1.0, "period_p99_ms": 5.3, "change_ratio": 0.85}
@@ -1708,6 +1851,7 @@ class JointSysidAndProbeTests(unittest.TestCase):
         self.assertFalse(ev_bad["recommend_feedback_trusted"])
 
     def test_analyze_servo_log_summarizes_mit_cached_feedback(self):
+        """验证 ``analyze_servo_log.summarize`` 正确汇总 200Hz MIT 缓存跟踪误差、峰值力矩与温升。"""
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "mit_p0.csv")
             with open(path, "w", newline="", encoding="utf-8") as stream:
@@ -1737,6 +1881,7 @@ class JointSysidAndProbeTests(unittest.TestCase):
             self.assertEqual(summary["mit_can_fail_total"], 1)
 
     def test_p2_actual_velocity_filter_and_real_pose_sag_cancellation(self):
+        """验证 P2 实测速度滤波去噪限幅及基于真实 ``q_act`` 的静态重力下垂零误差反投影自洽性。"""
         # 1) ActualVelocityFilter：有效抑制 0.06 rad/s 静止白噪、保留真实速度、钳位尖峰并在失效时复位
         filt = ActualVelocityFilter(tau_s=0.020, max_speed=np.array([2.5, 2.0, 2.0, 3.0, 3.0, 2.5]))
         rng = np.random.default_rng(42)
