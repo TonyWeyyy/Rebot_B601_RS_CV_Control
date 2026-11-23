@@ -67,7 +67,6 @@ python3 tools/replay_digital_twin.py logs/servo_20261123_171409.csv --sweep gain
 # uv pip install --python ~/.venvs/mujoco-studio/bin/python "mujoco>=4.0.1"
 ./tools/launch_mujoco_twin.sh --native     # 本地原生桌面 3D 窗口（默认，无需浏览器与 Antigravity）
 ./tools/launch_mujoco_twin.sh --web        # 独立浏览器 Web 模式（http://localhost:8080/）
-./tools/launch_mujoco_twin.sh --sidecar    # Antigravity 侧边栏模式
 
 # 4. 实机 / 仿真联动（保持 MuJoCo Studio 打开即自动双机同步）
 conda activate rebot-cv
