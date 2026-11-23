@@ -10,48 +10,73 @@
 **一台 Gemini 2 相机、一次 MediaPipe 检测、一条 CAN 总线**，同时完成：
 手掌移动 → 机械臂跟随（保持固定距离与姿态）；拇指食指捏合 → 夹爪开合。
 
-> 日常调参只改 `config/follow.yaml`（v13 上层跟随）、`config/v14.yaml`（v14 模块化架构）、`config/grasp.yaml`（夹爪）和 `config/mit_ext.yaml`（MIT 底层扩展）；
+> 日常调参只改 `config/v14.yaml`（v14 主线架构）、`config/follow.yaml`（v13 经典单文件基线）、`config/grasp.yaml`（夹爪）和 `config/mit_ext.yaml`（MIT 底层扩展）；
 > 命令行参数临时覆盖。完整技术文档：
 > - 总体技术与踩坑手册：[技术手册.md](技术手册.md)
 > - MIT 底层通用辨识与标定指南：[MIT底层辨识与标定开发指南.md](MIT底层辨识与标定开发指南.md)
 > - 原版 vs 现版 MIT 控制全面对比：[MIT控制升级前后对比文档.md](MIT控制升级前后对比文档.md)
 
-## 开发版 v14.0（`develop` 分支：四层解耦架构 + 统一世界系 PBVS + 离线数字孪生）
+## 稳定定版 v14.0（四层解耦架构 + 统一世界系 PBVS + MuJoCo Studio 3D 实时数字孪生）
 
-在保留 `palm_follow_grasp.py`（v13.0 实机定版基线）100% 完好可对照的前提下，`develop` 分支落地了全新 **v14.0 模块化架构**（包 `servo_v14/` + 薄入口 `palm_follow_v14.py` + 配置文件 `config/v14.yaml`），彻底消灭全局变量、拆解 3,000+ 行单文件主循环，并引入可离线闭环评测的数字孪生：
+在保留 `palm_follow_grasp.py`（v13.0 实机定版基线）100% 完好可对照的前提下，v14.0 完成了全新**模块化四层解耦架构**（`servo_v14/` + 薄入口 `palm_follow_v14.py` + `config/v14.yaml`）与 **MuJoCo Studio 3D 实时数字孪生**（`mujoco_twin/` + 零阻塞 UDP 桥接），经真机高频日志验收，跟踪精度与控制性能**全面超越 v13.0**：
+
+### 核心架构升级
 
 - **四层高内聚解耦流水线（`servo_v14/pipeline.py`）**：
   1. **层 1 统一世界系估计器（`servo_v14/estimator.py`）**：以基座世界系为唯一真相源（基于 200Hz 真实 `q_act` FK 与 25ms 曝光滞后查表），取代双估计器过渡方案；完整保留 4 层深度保护链（`servo_v14/depth_guard.py`）及深度冻结期世界系 XY 正交子空间更新；
   2. **层 2 显式有限状态机（`servo_v14/state_machine.py`）**：显式 8 态（`IDLE / TRACKING / DOCKING / HOLDING / COASTING / LOST / FAULT_HOLD / RETURN_HOME`）清晰管理快启、折返防假停、冷静窗与 M6/硬墙最高优先级抢占；
-  3. **层 3 统一世界系 PBVS 控制器（`servo_v14/controller_pbvs.py`）**：严格锚定 `q_cmd` 雅可比与**固定参考光轴 `z_cam_init`**（彻底杜绝手腕 J4 触限倾斜引发的正反馈俯冲），支持世界系速度前馈、伸展调度、加权 DLS 与振荡阻尼安全网；
+  3. **层 3 统一世界系 PBVS 控制器（`servo_v14/controller_pbvs.py`）**：严格锚定连续 100Hz `q_cmd` 雅可比与**固定参考光轴 `z_cam_init`**（彻底杜绝手腕 J4 触限倾斜引发的正反馈俯冲），支持世界系速度前馈、伸展调度、加权 DLS 与振荡阻尼安全网；
   4. **层 4 不可绕过安全护盾（`servo_v14/safety_shield.py`）**：所有硬红线（`max_vel ≤ 0.85`、`J2/J3 ≤ 2.0 rad/s`、水平 `0.42m` 柱面软墙、硬墙 `>5cm` 自动回 HOME、奇异降速、活跃集关节限位列屏蔽重解 + 逆解后穿墙拦截、M6 软保持与热降额）统一收口，任何上层策略均不可绕过；
-- **可插拔硬件/数字孪生后端（`servo_v14/robot_backend.py`）**：
-  - `HardwareRobotBackend`：无缝复用经过 v13.0 实机验收的 `RebotAdapter` + `mit_controller_ext.py`（P0~P4）与安全回零链；
-  - `DigitalTwinBackend`：内置与 B601-RS URDF 精度对齐至 `0.02mm` 的纯 NumPy 运动学/重力引擎（亦优先支持 Pinocchio）+ 200Hz 辨识机电动力学积分器，与真机 100% 共用同一 `ServoV14Pipeline` 代码；
-- **离线数字孪生闭环回放（`tools/replay_digital_twin.py`）**：
-  - 可将任意真机 CSV 日志还原为真实人手世界轨迹并执行闭环重演与 `--sweep` 参数扫描；
-  - 在真机验收日志 `171409.csv` / `170617.csv` 上闭环回放实测：零硬墙越界、零 M6 误触发，运动 3D 误差中位数由 v13 实机 `10.50 / 9.66 cm` 降至 **`7.12 / 6.59 cm`**，停手耗时 **`0.190 s`**、静止速度 P95 **`0.0000 rad/s`**。
+- **可插拔硬件 / 离线数字孪生后端（`servo_v14/robot_backend.py`）**：
+  - `HardwareRobotBackend`：无缝复用经过实机验收的 `RebotAdapter` + `mit_controller_ext.py`（P0~P4）与安全回零链；
+  - `DigitalTwinBackend`：内置与 B601-RS URDF 精度对齐至 `0.02mm` 的运动学/重力引擎（优先 Pinocchio，支持纯 NumPy 回退）+ 200Hz 辨识机电动力学积分器，与真机共用同一控制流水线；
+- **MuJoCo Studio 3D 实时同步数字孪生（`mujoco_twin/` + `servo_v14/mujoco_bridge.py`）**：
+  - 基于官方 `ReBot_Arm_RS.urdf` 全 32 份视觉精模 STL（阳极银 / 电机黑 / Seeed 绿 / 铭牌）+ `joint_offset.json`（示教 HOME 下与 Pinocchio 正运动学偏差仅 **`0.017 mm`**）+ `hand_eye_calibration.json` 真实腕部 Gemini 2 相机模型与 0.40m 光轴瞄准线；
+  - 实时渲染 3D 人手掌心绿球、`q_cmd` 指令 TCP 青色幽灵标记与 `r = 0.42m` 水平工作空间安全软墙圆环；
+  - 进程完全隔离：真机控制（`rebot-cv`）经非阻塞本机 UDP（`127.0.0.1:19870`，单帧 `<20µs`）向 MuJoCo Studio（`mujoco>=4.0.1`）以 100Hz 同步状态，**绝不阻塞真机 100Hz/200Hz 实时闭环**；
+  - Dear ImGui 面板内置 6 轴 `q_act / q_cmd / Err / dq / Tau` 实时表、MOS 温度、3D 叠加开关、手动滑块测试及**一键回放任意 `logs/servo_*.csv` 实机日志**。
 
-### v14.0 快速运行与离线验证
+### v13.0 vs v14.0 实机验收对比
+
+| 指标 | v13.0 实机定版 (`171409.csv`) | v14.0 实机定版 (`210649.csv`) | 提升 |
+| --- | :---: | :---: | --- |
+| **运动 3D 误差 median** | `10.50 cm` | **`8.23 cm`** | **-21.6%** |
+| **运动 3D 误差 p95** | `19.40 cm` | **`14.99 cm`** | **-22.7%** |
+| **三轴中位误差 `\|ex\| / \|ey\| / \|ez\|`** | `3.08 / 6.25 / 1.27 cm` | **`2.28 / 3.04 / 1.21 cm`** | **三轴全面优于 v13** |
+| **停手稳定耗时 median** | `0.190 s` | **`0.190 s`** | 高速下同样干脆刹停 |
+| **静止残余关节速度 P95** | `0.0000 rad/s` | **`0.0000 rad/s`**（`0.0%` 漂移） | 零静抖完美保持 |
+| **6 轴执行器滞后（互相关）** | `20 ~ 40 ms` | **`20 ~ 40 ms`**（`r = 0.95 ~ 0.998`） | 全轴满速无锯齿 |
+| **6 轴跟踪误差 med / max** | `1.97° / 5.90°` | **`2.81° / 7.11°`** | 远低于 `12°` M6 阈值 |
+| **100Hz 控制耗时 P95 / overrun** | `0.76 ms / 0.0%` | **`0.59 ms / 0.0%`** | 计算更轻更稳 |
+| **200Hz MIT p99 / CAN 失败 / MOS 峰值** | `5.9 ms / 0 / 39°C` | **`5.96 ms / 0 / 36.0°C`** | 全程零异常 |
+
+### v14.0 快速运行、MuJoCo 数字孪生与离线验证
 
 ```bash
-# 1. 离线单元测试（v14 14项 + v13 96项 = 110项全绿）
+# 1. 离线单元测试与冒烟验证（v14 18项 + v13 96项 = 114项全绿，无需硬件）
 python3 tools/test_v14_architecture.py
 python3 tools/test_servo_upgrades.py
+python3 tools/offline_smoke_test.py
 
 # 2. 离线数字孪生闭环回放 & 参数扫描（无需硬件）
 python3 tools/replay_digital_twin.py logs/servo_20261123_171409.csv
 python3 tools/replay_digital_twin.py logs/servo_20261123_171409.csv --sweep gain=2.55,2.75,3.00
 
-# 3. 交互运行（数字孪生演练 → 低速真机验收 → 完整真机）
-python3 palm_follow_v14.py --sim
-python3 palm_follow_v14.py --no-gripper --gain 1.5 --max-vel 0.15
-python3 palm_follow_v14.py
+# 3. 启动 MuJoCo Studio 3D 数字孪生（首次使用需在独立 venv 安装 mujoco>=4.0.1）
+# uv venv ~/.venvs/mujoco-studio --python 3.12
+# uv pip install --python ~/.venvs/mujoco-studio/bin/python "mujoco>=4.0.1"
+./tools/launch_mujoco_twin.sh              # 浏览器打开 http://localhost:8080/
+
+# 4. 实机 / 仿真联动（保持 MuJoCo Studio 打开即自动双机同步）
+conda activate rebot-cv
+python3 palm_follow_v14.py --sim           # 真实 Gemini 2 相机驱动 MuJoCo 虚拟机械臂
+python3 palm_follow_v14.py --no-gripper --gain 1.5 --max-vel 0.15   # 低速实机验收
+python3 palm_follow_v14.py                 # 真实机械臂 + MuJoCo 虚拟臂同步实时运动（--no-mujoco-sync 可关闭同步）
 ```
 
 ---
 
-## 稳定定版 v13.0（MIT 底层闭环重构 P0~P4 + 实测位姿感知解耦与上层提速定版）
+## 历史版本 v13.0（MIT 底层闭环重构 P0~P4 + 实测位姿感知解耦与上层提速定版）
 
 本版突破了 v12.0「纯位置 MIT 斜坡（~140ms 闭环滞后）」的物理天花板。采用**方案 A（本仓库子类化 `mit_controller_ext.py` + SHA256 版本校验，上游 `rebot_control` 零修改）**，在严格守住 `max_vel ≤ 0.85 m/s`、承重关节 `J2/J3 ≤ 2.0 rad/s`、单 CAN 主机与安全回零全部红线的前提下，分 P0~P4 五个阶段逐级完成系统辨识、底层重构与实机高频验收定稿（配置文件 `config/follow_v13.yaml` + `config/mit_ext.yaml`，已同步至默认 `config/follow.yaml`）。
 
@@ -358,53 +383,71 @@ python3 tools/analyze_servo_log.py logs/servo_时间.csv --json
 
 ```
 rebot_palm_follow_grasp/
-├── palm_follow_grasp.py           ★ 主程序（跟随 + 夹爪，一个脚本）
-├── palm_follow_fixed_orientation.py   仅跟随版（原跟踪主程序，保留作对照调试）
+├── palm_follow_v14.py             ★ v14.0 主程序（四层解耦架构 + MuJoCo 实时同步 + --sim 模式）
+├── palm_follow_grasp.py           v13.0 稳定基线主程序（单文件对照保留）
+├── palm_follow_fixed_orientation.py   仅跟随版（历史基线对照）
+│
+├── servo_v14/                     ★ v14.0 四层解耦核心包
+│   ├── types.py                   强类型数据契约与 FSMMode 8 态枚举
+│   ├── config.py                  不可变 dataclass 配置与安全红线校验
+│   ├── depth_guard.py             4 层深度保护链
+│   ├── estimator.py               层 1：统一世界系估计器（q_act 滞后查表 + XY 冻结更新）
+│   ├── state_machine.py           层 2：显式 8 态有限状态机
+│   ├── controller_pbvs.py         层 3：固定参考光轴世界系 PBVS 控制器
+│   ├── safety_shield.py           层 4：不可绕过安全护盾（硬限速/软硬墙/奇异/限位/M6）
+│   ├── robot_backend.py           可插拔后端（HardwareRobotBackend + DigitalTwinBackend）
+│   ├── pipeline.py                四层流水线装配与遥测转换
+│   └── mujoco_bridge.py           非阻塞本机 UDP 实时遥测桥接（127.0.0.1:19870）
+│
+├── mujoco_twin/                   ★ MuJoCo Studio 4.0+ 3D 实时数字孪生工作区
+│   ├── scene_builder.py           B601-RS 精模 MjSpec 构建（32 STL + Gemini 2 + 安全环）
+│   ├── sim_plugin.py              热重载仿真插件（真机 UDP 实时镜像 + CSV 日志回放 + 手动测试）
+│   ├── viewer_plugin.py           Dear ImGui 实时仪表盘与回放控制台
+│   └── messages.py                Sim <-> Viewer 强类型 Snapshot / Event 定义
 │
 ├── gemini2_camera.py              相机层（Orbbec SDK，RGB+深度硬件对齐）
-├── palm_detection.py              检测层（掌心跟踪 + 捏合距离，共用一次检测）
+├── palm_detection.py              检测层（掌心跟踪 + ROI 裁剪 + LK 光流 + 捏合距离）
 ├── rebot_adapter.py               机械臂适配层（速度伺服 + FK/雅可比 + 独立重力模型 + J7 夹爪通道）
 ├── mit_controller_ext.py          MIT 底层扩展（方案 A 子类化：200Hz 反馈/速度前馈/FOH/重力补偿/阻尼调度/安全监督）
-├── servo_timing.py                时间校准/分轴Q/静止保持/速度停靠/lead/软墙/实测速度滤波
+├── kalman_target.py               3D 恒速卡尔曼滤波（含分轴 Q 与深度冻结 XY 子空间更新）
+├── servo_timing.py                时间校准/静止保持/速度停靠/lead/软墙/实测速度滤波
 ├── servo_diagnostics.py           低阻塞 CSV（含 200Hz MIT 状态快照）+ 可选低频实际反馈采样
 │
 ├── config/                        所有配置与标定产物
-│   ├── follow.yaml                ★ v13.0 最终版跟随参数（日常调参改这里）
-│   ├── mit_ext.yaml               ★ v13.0 MIT 底层扩展参数与逐级回退开关
-│   ├── follow_v13.yaml             v13.0 定版参数归档
-│   ├── follow_v12.yaml             v12.0 定版回退对照（L1+L2 纯位置 MIT）
-│   ├── follow_v11.yaml             v11.0 伸展稳停定版回退对照
-│   ├── follow_v10.yaml             v10.0 CV-only 回退对照
-│   ├── follow_v9_fallback.yaml     v9 参数回退对照
-│   ├── follow_v8_fallback.yaml     一键恢复实机认可的 v8.0 稳定行为
-│   ├── follow_v7.1_fallback.yaml   一键恢复更早的 v7.1 稳定行为
+│   ├── v14.yaml                   ★ v14.0 主线配置文件（日常调参改这里）
+│   ├── mit_ext.yaml               ★ MIT 底层扩展参数与逐级回退开关
+│   ├── follow.yaml                v13.0 跟随配置（供 palm_follow_grasp.py 使用）
+│   ├── follow_v13.yaml ~ v7.1     历史定版参数归档与回退对照
 │   ├── grasp.yaml                 捏合→夹爪映射与开合标定值
-│   ├── hand_eye_calibration.json  手眼标定结果（本项目实测，跟随必需）
-│   ├── joint_offset.json          关节零位修正（本项目实测，适配层自动加载）
-│   ├── home_pose.json             示教 HOME 位姿（本项目实测，启动优先加载）
-│   ├── viewpoint.json             联合标定示教点（重新标定时免重复示教）
-│   ├── handeye_joint_samples.npz  联合标定原始样本（重求解免重新采样）
+│   ├── hand_eye_calibration.json  手眼标定结果（实测，跟随与 MuJoCo 相机挂载必需）
+│   ├── joint_offset.json          关节零位修正（实测，Pinocchio 与 MuJoCo 共享）
+│   ├── home_pose.json             示教 HOME 位姿（启动优先加载）
+│   ├── viewpoint.json             联合标定示教点
+│   ├── handeye_joint_samples.npz  联合标定原始样本
 │   └── hand_landmarker.task       MediaPipe 手掌模型
 │
-├── tools/                         标定与诊断工具（按需运行，日常不用碰）
+├── tools/                         标定、仿真与验收工具
+│   ├── launch_mujoco_twin.sh      ★ 一键启动 MuJoCo Studio 3D 实时数字孪生
+│   ├── replay_digital_twin.py     v14.0 离线数字孪生闭环回放与 --sweep 参数扫描
+│   ├── test_v14_architecture.py   v14.0 架构、安全护盾、数字孪生与 UDP 桥接单测（18 项）
+│   ├── test_servo_upgrades.py     v13 核心与 MIT 扩展单元测试（96 项）
+│   ├── offline_smoke_test.py      假相机/假机械臂完整主程序冒烟测试
+│   ├── analyze_servo_log.py       高频日志离线 A/B 与 MIT 执行器指标分析
 │   ├── mit_feedback_probe.py      MIT 200Hz 反馈缓存精度 & 重力符号硬件探针（P0）
 │   ├── joint_sysid.py             单轴正弦扫频系统辨识（带宽/相位滞后/共振峰，P0~P3）
 │   ├── p3_gravity_verify.py       分级静态重力前馈下垂 & 符号防呆验收工具（P3）
 │   ├── gripper_j7_calibrate.py    夹爪开合标定（键盘点动 J7，结果写回 grasp.yaml）
 │   ├── teach_home.py              HOME 位姿示教
-│   ├── hand_eye_calibration.py    手眼标定（手动棋盘格 JOG 采样）
-│   ├── hand_eye_calibration_auto.py   手眼标定（ArUco + 关节空间自动扰动）
-│   ├── handeye_joint_calib.py     手眼+关节零位联合标定（精度最高，推荐）
-│   ├── hand_eye_solver.py         手眼标定求解器（OpenCV 5.0 移除了 calibrateHandEye）
-│   ├── calib_diagnose.py          标定体检（不标定，只定位问题）
-│   ├── camera_intrinsic_check.py  相机内参核对
-│   ├── test_servo_upgrades.py     升级逻辑离线单元测试（96 项）
-│   ├── analyze_servo_log.py       高频日志离线 A/B 与 MIT 执行器指标分析
-│   └── offline_smoke_test.py      假相机/假机械臂完整主程序冒烟测试
+│   ├── handeye_joint_calib.py     手眼+关节零位联合标定（推荐）
+│   ├── hand_eye_calibration*.py   手动/自动手眼标定与求解器（兼容 OpenCV 5.0）
+│   └── calib_diagnose.py / camera_intrinsic_check.py / benchmark_detector.py / enumerate_camera_modes.py
 │
 ├── requirements.txt
-├── 技术手册.md                     项目全部技术与技巧汇总（感知/标定/控制/稳定性/安全）
-└── README.md
+├── README.md                      快速开始、版本验收对比与架构总览
+├── 技术手册.md                     项目全部技术与工程踩坑手册（v14~v8 全演进）
+├── MIT底层辨识与标定开发指南.md     新机械臂通用的 MIT 底层辨识/标定/分级验收工程指南
+├── MIT控制升级前后对比文档.md       原版纯位置 PD 与升级后完整 MIT 五元组全面对比
+└── B601手掌跟随系统_定稿技术文档.md  早期系统定稿归档文档
 ```
 
 ## 快速开始
