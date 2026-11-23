@@ -1,0 +1,82 @@
+# reBot MIT 底层扩展配置（mit_controller_ext.py，v13.0 定版方案 A：本仓库子类化，上游 rebot_control 零改动）
+#
+# 包含 P0~P4 全部底层能力（实机验收定稿，日志 151911~171409）：
+#   - P0：200Hz 零开销真实反馈缓存 + S1 CAN 30ms 连续容错 + S3 非阻塞当前角读取
+#   - P1：MIT 速度前馈 dq_des + 200Hz FOH 一阶保持连续插值 + 40ms 看门狗衰减
+#   - P3：Pinocchio + 0.32kg Gemini 2 负载静态重力前馈 tau_ff（回零淡出）+ 伸展自适应阻尼 kd
+#   - P4：M6 200Hz 主动安全监督（碰撞/堵转软保持，绝不空中失能；90~110°C 线性热降额）
+#   - 基线电机参数：沿用上游 rebotarm_rs.yaml（J1=72/3.6, J2/J3=216/12, J4=50/5, J5~7=50/4）
+#
+# 独立一键回退开关（重启生效）：
+#   - supervisor_enable: false → 关闭 M6 主动安全监督
+#   - gain_sched_enable: false → 退回固定基线 kd
+#   - gravity_ff_enable: false → 关闭静态重力前馈（tau_ff=0）
+#   - vel_ff_enable: false     → 退回 P0 纯位置 MIT（dq_des=0）
+#   - enable: false            → 立即退回上游原版控制器（v12.0 行为）
+mit_ext:
+  enable: true                    # 启用扩展；false = 上游原版控制器（v12 行为）
+  require_pinned_upstream: true   # 上游 controller.py SHA256 必须与钉死版本一致，否则自动回退原版
+
+  # S1：CAN 瞬时故障容错（上游为“一次 send_mit 异常即立即失能”，屈肘姿态会下落）
+  can_fault_window_s: 0.03        # 连续发送失败持续 ≥30ms（200Hz 下 6 拍）才判定通信故障 [0.01, 0.10]
+  can_fault_action: return_to_zero  # 判定故障后：return_to_zero=缓慢回零后失能 | emergency=上游原逻辑立即失能
+  can_error_log_interval_s: 1.0   # 瞬时异常打印限频 (s)
+
+  # 200Hz 真实反馈缓存（motorbridge get_state()，读取 MIT 应答帧缓存，不发额外 CAN 请求）
+  feedback_cache: true
+  # 是否在每拍 MIT 发送后顺带调一次 poll_feedback_once() 排空 RX 队列。
+  # 已由 tools/mit_feedback_probe.py 实测确认 motorbridge 后台线程自动 100% 刷新，保持 false。
+  feedback_poll_once: false
+  # 缓存是否可替代阻塞式 0x7019 位置读取（S3）。
+  # 已由 tools/mit_feedback_probe.py（2026-11-23，零位 + HOME 双姿态 PASS_MODE_A）实机验证：
+  # 缓存 vs 0x7019 最大偏差 0.014°（<0.3°），200Hz 周期 p99=5.13ms，采样耗时 0.19ms（原 0x7019 阻塞 57.6ms）。
+  feedback_trusted: true
+  feedback_max_age_s: 0.05        # 缓存超过此年龄视为过期 (s)
+  record_max_s: 30.0              # 单次录波最长时长 (s)（探针/辨识工具使用）
+
+  # P1：MIT 速度前馈 dq_des + 200Hz 一阶保持连续插值 + 40ms 看门狗衰减
+  vel_ff_enable: true             # 设为 false 立即退回 P0 纯位置 MIT（dq_des=0）
+  # 分关节速度前馈比例 [0.0, 1.0]：
+  # - J1 实测 ζ=0.52（略欠阻尼），P3 调高 J1 kd 前保守取 0.70 避免放大超调；
+  # - J2/J3 实测 ζ=0.72~0.74，取 0.85；
+  # - J4/J5/J6 实测严重过阻尼（-3dB 带宽仅 1.5~2.0Hz，滞后 80~142ms），取 0.90 释放最大提速。
+  vel_ff_scale: [0.70, 0.85, 0.85, 0.90, 0.90, 0.90]
+  foh_interp_enable: true         # 200Hz 一阶保持连续插值（消除 100Hz→200Hz 阶梯纹波，且绝不越过目标/限位）
+  foh_upper_dt_s: 0.010           # 上层伺服标称周期 100Hz = 10ms
+  vel_ff_watchdog_s: 0.040        # 上层超 40ms 未更新则触发看门狗衰减 [0.015, 0.150]
+  vel_ff_watchdog_tau_s: 0.030    # 看门狗指数衰减时间常数 30ms [0.005, 0.100]
+  vel_ff_lpf_tau_s: 0.008         # 200Hz 前馈速度轻量低通 8ms（平滑速度台阶、抑制电机高频啸叫）
+
+  # P3 M2：Pinocchio + 末端 Gemini 2 相机质点静态重力补偿 tau_ff
+  # 严格只做静重力项 g(q)，不做高噪加速度逆动力学；近零位支架自动平滑淡出至 0 Nm。
+  gravity_ff_enable: true         # 设为 false 立即退回 P1/P2（tau_ff=0）
+  # 分轴补偿比例（经 tools/p3_gravity_verify.py HOME + extended 双位姿与 P4 跟随日志实测标定：
+  # J2=0.65 在正负力矩双侧均保持 ±0.05° 且不过补；J3=0.80/J4=0.80 将下垂压至 ~0.25°~0.45° 并留 ~15~20% 安全余量）
+  gravity_ff_scale: [0.0, 0.65, 0.80, 0.80, 0.0, 0.0]
+  gravity_ff_max_nm: [0.0, 12.0, 12.0, 2.5, 2.0, 1.0]  # 单轴硬力矩封顶 (Nm)；J1/J7 恒为 0
+  gravity_payload_mass_kg: 0.32   # 腕部外挂 Gemini 2 相机 + 支架等效质量（P0 双位姿实测反推）
+  gravity_payload_com_link6_m: [0.056, -0.011, 0.095]  # 相机质心在 link6 局部系坐标（对齐手眼标定外参）
+  gravity_ff_ramp_in_s: 0.50      # 启动使能斜坡淡入时长 (s)
+  gravity_ff_slew_nm_s: 30.0      # 力矩变化率硬上限 (Nm/s)，杜绝任何阶跃跳变
+
+  # P3 M3：伸展度自适应阻尼调度（在 P1 速度前馈开启后，提高 kd 只抑制跟踪误差和共振，不拖慢速度）
+  gain_sched_enable: true         # 设为 false 立即退回基线 rebotarm_rs.yaml 增益
+  gain_sched_r_min_m: 0.18        # 近区水平半径 (m)
+  gain_sched_r_max_m: 0.36        # 深伸展水平半径 (m)
+  # 实测依据：P1 扫频显示 J1~J3 在 2.5~3.0Hz 有 +1.9~2.35dB 微凸起，J1 伸展惯量增至 0.35 kg·m²；
+  # J4~J6 已经完全平坦且 >4Hz 带宽，保持基线不变；所有增益均硬钳制在 [0.8x, 1.8x] 基线内。
+  gain_sched_kd_near: [4.6, 13.5, 14.0, 5.0, 4.0, 4.0]
+  gain_sched_kd_far:  [6.4, 14.5, 15.0, 5.0, 4.0, 4.0]
+  gain_sched_kp_scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]  # 首版保持 kp 不变，先只调 kd 压平共振
+  gain_sched_slew_per_s: 10.0     # 增益变化斜率上限（每秒变化量），平滑过渡无冲击
+
+  # P4 M6：200Hz 主动安全监督层（碰撞/堵转软停机保持 + 温升前置降速，绝不半空失能）
+  supervisor_enable: true         # 设为 false 可关闭主动监督（保留三级过温与 CAN 容错）
+  track_err_limit_deg: 12.0       # 6 轴最大跟踪误差软停机门槛（P3 全速正常最大仅 5.77°）
+  track_err_window_s: 0.08        # 连续超限 ≥80ms 才触发软停机（抗单帧毛刺）
+  # 单轴实测力矩硬上限（约额定峰值的 75%；P3 正常峰值 [3.9, 15.4, 16.4, 6.4, 1.2, 0.4] Nm）
+  tau_limit_nm: [18.0, 28.0, 28.0, 10.0, 10.0, 10.0]
+  tau_limit_window_s: 0.08        # 连续超限 ≥80ms 才触发堵转软停机
+  thermal_derate_start_c: 90.0    # MOS 温度超过 90°C 开始平滑线性降速（正常仅 45~47°C）
+  thermal_derate_full_c: 110.0    # 达 110°C（上游一级报警点）时降至最小速度倍率
+  thermal_derate_min_scale: 0.40  # 高温降额最低速度倍率 [0.20, 1.0]

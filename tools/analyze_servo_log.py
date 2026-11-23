@@ -57,10 +57,14 @@ def summarize(path):
     for index in range(1, len(active)):
         if not flag(active[index - 1], "ff_moving") or flag(active[index], "ff_moving"):
             continue
-        for count in range(20, len(active) - index + 1):
-            window = active[index:index + count]
-            if len(window) < 20:
+        # 若停顿不足 0.20s 手掌即重新运动（快挥折返），不跨段扫描到十几秒后的下一次停手。
+        for count in range(1, len(active) - index + 1):
+            cur = active[index + count - 1]
+            if flag(cur, "ff_moving"):
                 break
+            if count < 20:
+                continue
+            window = active[index:index + count]
             if all(number(row, "joint_speed") < 0.05 for row in window[-20:]):
                 settle_times.append(number(window[-1], "host_time") -
                                     number(active[index], "host_time"))
@@ -84,6 +88,35 @@ def summarize(path):
             feedback_rows.append(row)
     feedback_reads = [number(row, "fb_read_ms") for row in feedback_rows]
     tracking_errors = [number(row, "tracking_err_max") for row in feedback_rows]
+    # v13 P0：MIT 扩展 200Hz 应答缓存指标（老版本日志无此列时优雅返回 None）
+    fbc_rows = [row for row in rows if flag(row, "fbc_valid")]
+    fbc_active_rows = [row for row in active if flag(row, "fbc_valid")]
+    fbc_ages = [number(row, "fbc_age_ms", math.nan) for row in fbc_rows]
+    fbc_ages = [v for v in fbc_ages if math.isfinite(v)]
+    fbc_track_deg = []
+    for row in fbc_active_rows:
+        diffs = []
+        for joint in range(1, 7):
+            qc = number(row, f"q_cmd_{joint}", math.nan)
+            qa = number(row, f"qa_{joint}", math.nan)
+            if math.isfinite(qc) and math.isfinite(qa):
+                diffs.append(abs(math.degrees(qc - qa)))
+        if len(diffs) == 6:
+            fbc_track_deg.append(max(diffs))
+    tau_abs_max = None
+    if fbc_rows:
+        peaks = []
+        for joint in range(1, 7):
+            vals = [abs(number(row, f"tau_{joint}", math.nan)) for row in fbc_rows]
+            vals = [v for v in vals if math.isfinite(v)]
+            peaks.append(round(max(vals), 3) if vals else None)
+        tau_abs_max = peaks
+    tmos_vals = [number(row, "tmos_max", math.nan) for row in rows]
+    tmos_vals = [v for v in tmos_vals if math.isfinite(v)]
+    mit_p99_vals = [number(row, "mit_period_p99_ms", math.nan) for row in rows]
+    mit_p99_vals = [v for v in mit_p99_vals if math.isfinite(v)]
+    can_fail_vals = [number(row, "can_fail_total", math.nan) for row in rows]
+    can_fail_vals = [int(v) for v in can_fail_vals if math.isfinite(v)]
     duration = number(rows[-1], "host_time") - number(rows[0], "host_time")
     result = {
         "file": str(path), "samples": len(rows), "duration_s": duration,
@@ -110,6 +143,15 @@ def summarize(path):
         "feedback_tracking_median_rad": percentile(tracking_errors, 0.50),
         "feedback_tracking_p95_rad": percentile(tracking_errors, 0.95),
         "feedback_tracking_max_rad": max(tracking_errors) if tracking_errors else None,
+        "mit_fbc_valid_ratio": (len(fbc_rows) / len(rows) if "fbc_valid" in rows[0] else None),
+        "mit_fbc_age_p95_ms": percentile(fbc_ages, 0.95),
+        "mit_tracking_err_median_deg": percentile(fbc_track_deg, 0.50),
+        "mit_tracking_err_p95_deg": percentile(fbc_track_deg, 0.95),
+        "mit_tracking_err_max_deg": max(fbc_track_deg) if fbc_track_deg else None,
+        "mit_tau_abs_max_nm": tau_abs_max,
+        "mit_tmos_max_c": max(tmos_vals) if tmos_vals else None,
+        "mit_period_p99_ms_max": max(mit_p99_vals) if mit_p99_vals else None,
+        "mit_can_fail_total": max(can_fail_vals) if can_fail_vals else None,
         "errors": sorted({row.get("error", "") for row in rows if row.get("error", "")}),
     }
     return result
@@ -148,6 +190,17 @@ def main():
               f"{result['feedback_tracking_max_rad']} rad")
         if result["feedback_samples"]:
             print("注意：低频反馈用于观察跟踪误差趋势，不能据此精确测量执行延迟。")
+        if result.get("mit_fbc_valid_ratio") is not None:
+            print(f"MIT 200Hz 缓存: 有效率 {result['mit_fbc_valid_ratio']*100:.1f}%，"
+                  f"age p95={result['mit_fbc_age_p95_ms']} ms，"
+                  f"六轴最大跟踪误差 median/p95/max="
+                  f"{result['mit_tracking_err_median_deg']}/"
+                  f"{result['mit_tracking_err_p95_deg']}/"
+                  f"{result['mit_tracking_err_max_deg']}°")
+            print(f"MIT 峰值力矩(Nm): {result['mit_tau_abs_max_nm']}，"
+                  f"最高 MOS 温度: {result['mit_tmos_max_c']}°C，"
+                  f"200Hz 周期 p99 最大值: {result['mit_period_p99_ms_max']} ms，"
+                  f"CAN 累计异常: {result['mit_can_fail_total']}")
 
 
 if __name__ == "__main__":

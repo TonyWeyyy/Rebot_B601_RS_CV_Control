@@ -1,19 +1,20 @@
 # ============================================================
-# 【v12.0 定版 / L1（世界系 KF + Smith 预估 + 双共识门控 + 软姿态 + ROI 加速）+ L2（分关节差异化限速）】
+# 【v13.0 定版 / MIT 底层闭环重构（P0~P4）+ 上层速度解放与实测位姿解耦】
 # ------------------------------------------------------------
-# 经多轮实机日志（210645 / 210848 / 212533 / 213740 / 214900）验收定稿：
-#   - L1 控制与感知升级：
-#     1) 滞后对齐世界系 KF + Smith 预估（CameraPoseHistory, delay=140ms, smith=0.55, ff=0.52）：
-#        世界系纯净手速前馈在 5.5~11cm 平滑切入、≤5.5cm 停靠区为 0，兼顾极低滞后与稳停；
-#     2) 非对称双估计器门控（consensus_velocity + kf_ff_stop_delay_s=0.08s）：折返过零不断档，
-#        停手唤醒与冷静窗严防二次回弹；振荡阻尼器短暂停手改衰减不清零，提前 1.2s 压死共振；
-#     3) 深度冻结期 XY 子空间持续更新（KalmanTarget3D.update_partial）：四层深度保护链 100% 不变，
-#        同时消除深度空洞恢复时的跳变拒收与 KF 重同步急刹；
-#     4) 轻量软姿态优先级（ori_cruise_weight_min=0.80, ≤10°）+ 关节软限位缓冲（~4.6° 平滑收紧）；
-#     5) 迟滞 ROI 裁剪 MediaPipe 推理（roi_crop_enable=true, 漏检同帧回退全图）+ 3 层金字塔 LK 光流。
-#   - L2 分关节差异化安全限速（max_vel=0.85, max_vel_joints=[2.50, 2.00, 2.00, 3.00, 3.00, 2.40]）：
-#     承重抗重力关节 J2/J3 严守 ≤2.00 rad/s 不变，仅放宽轻载手腕 J4/J5 与底座 J1，并在 ≤6.5cm
-#     停靠区、深伸展及振荡抑制时平滑收回至 ≤2.00 rad/s。
+# 经 P0~P4 五阶段实机标定与高频日志（151911 / 152733 / 155050 / 160158 /
+# 161334 / 161548 / 161837 / 170617 / 171409）验收定稿：
+#   - MIT 底层扩展（mit_controller_ext.py + config/mit_ext.yaml，方案 A 零入侵上游）：
+#     1) P0 200Hz 零开销真实反馈缓存 + CAN 连续容错（30ms 窗防偶发掉帧）+ 非阻塞起点读取；
+#     2) P1 速度前馈 dq_des + 200Hz FOH 一阶保持插值 + 40ms 看门狗：
+#        全 6 轴执行器滞后由 65~142ms 压至 20~30ms，J4~J6 -3dB 带宽 >4.0Hz；
+#     3) P2 真实物理 q_act/dq_act 驱动世界系 KF 与自运动补偿（delay 140ms→25ms, smith=1.00）：
+#        严格与控制雅可比/虚拟墙/关节指令积分（q_cmd）隔离，彻底消除虚拟延迟与静差；
+#     4) P3 静态重力力矩前馈 tau_ff（Pinocchio + 0.32kg Gemini 2 负载，回零光滑淡出）+
+#        伸展自适应阻尼 kd：J3/J4 静态下垂降 85%+，J1 3Hz 共振峰压降 >1dB；
+#     5) P4 200Hz 主动安全监督（碰撞/堵转软保持，绝不空中失能；90~110°C 线性热降额）+
+#        M5 上层增益/伸展速度/死区/冷静窗解放（保持 max_vel≤0.85 与 J2/J3≤2.0 安全红线）。
+#   - 实测验收（171409.csv）：停手稳定中位数 0.190s、静止速度 p95=0.0 rad/s、
+#     6 轴跟踪误差中位数 1.97°、深度误差 |ez|=1.27cm、CAN 失败 0 次、MOS 最高 39°C。
 # ============================================================
 
 follow:
@@ -21,9 +22,9 @@ follow:
   distance: 0.40          # 期望相机到掌心距离 (m)
                           # 【范围】0.20 ~ 0.60（代码硬性拒绝 <0.18 或 >0.60）
 
-  # ---- 增益（分方向）----
-  gain: 2.55              # 竖直/深度方向位置增益（Y/Z）：保持 v11.0 稳态小信号基准
-  gain_x: 2.02            # 水平方向增益（X，靠底座 J1 偏航）
+  # ---- 增益（分方向，v13 P4 M5 温和提速）----
+  gain: 2.75              # 竖直/深度方向位置增益（Y/Z）：P1~P3 滞后已压至 20~30ms、下垂降 85%
+  gain_x: 2.20            # 水平方向增益（X，靠底座 J1 偏航，M3 伸展 kd 护航）
 
   # ---- 速度上限（L2 分关节差异化限速，满用安全硬包络）----
   max_vel: 0.85           # 最大末端线速度 (m/s)（L2 安全硬上限 0.85）
@@ -34,20 +35,22 @@ follow:
   max_vel_angular: 2.00   # 最大角速度 (rad/s)
   joint_vel_grouped_cruise: true  # 非伸展、非振荡远距巡航启用 [J1,J5]/[J2,J3,J4,J6] 分组限速
 
-  # ---- L1-A 世界系卡尔曼滤波 + Smith 预估器 ----
-  world_kf_enable: true           # 开启滞后对齐世界系 KF + 非对称双共识速度 + Smith 预估
-  world_kf_pose_delay_s: 0.14     # 与实测 140ms 执行器/视觉闭环滞后对齐 (s)
-  world_kf_pose_lpf_tau_s: 0.04   # 匹配二阶 MIT 机电上升时间的位姿低通 (s)
-  world_kf_smith_blend: 0.55      # Smith 预估反投影混合比例 [0, 1]（降低滞后失配敏感度）
-  world_kf_ff_gain: 0.52          # 纯净世界系手速巡航前馈增益（≤5.5cm 为 0，5.5~11cm 切入）
+  # ---- L1-A 世界系卡尔曼滤波 + v13 P2 实测位姿接入 ----
+  world_kf_enable: true           # 开启世界系 KF + 非对称双共识速度
+  mit_actual_feedback_est_enable: true  # v13 P2：用 200Hz 真实 q_act/dq_act 驱动世界系 KF 与自运动补偿（false 退回 q_cmd）
+  mit_actual_vel_lpf_tau_s: 0.020       # 实测 dq_act 一阶低通 (s)，滤除 0.04~0.07 rad/s 静止量化噪声
+  world_kf_pose_delay_s: 0.025    # v13 P2：pose_history 已为真实物理 q_act，仅补偿相机曝光+USB 传输 ~25ms（原 0.14s）
+  world_kf_pose_lpf_tau_s: 0.012  # v13 P2：q_act 轻量平滑 (s)（原 0.04s）
+  world_kf_smith_blend: 1.00      # v13 P2：直接反投影至当前真实物理相机位姿 t0（零滞后、零下垂静差）
+  world_kf_ff_gain: 0.62          # v13 P4 M5：实测位姿世界系手速巡航前馈（原 0.52，≤5.5cm 为 0）
 
   # ---- L1-B 大误差巡航姿态软优先级（Weighted DLS）----
   ori_cruise_weight_min: 0.80     # J4 已达 3.0 rad/s，轻度让权即可保持高速画面更平稳
   ori_soft_max_deg: 10.0          # 软让权姿态保护角（接近 10° 自动平滑恢复 1.0 刚度）
 
-  # ---- 死区（静止稳定性）----
-  position_deadband: 0.025        # 3D 误差死区 (m)
-  deadband_hysteresis: 1.80       # 死区迟滞倍数（退出阈值 = 4.5cm）
+  # ---- 死区（静止稳定性，v13 P4 M5 收紧对中精度）----
+  position_deadband: 0.020        # 3D 误差死区 (m)（原 0.025）
+  deadband_hysteresis: 1.70       # 死区迟滞倍数（退出阈值 = 3.4cm，原 4.5cm）
   orientation_deadband_deg: 2.0   # 姿态误差死区（度）
 
   # ---- 目标速度前馈与近端 PD 阻尼刹停 ----
@@ -77,11 +80,11 @@ follow:
   kf_lead_release_tau: 0.012
   kf_ff_deadband_off: 0.06
   kf_ff_deadband_on: 0.130
-  kf_ff_exit_frames: 6            # L1-C 回调至 6 帧（60ms），与世界系 KF 配合进一步压实稳停
+  kf_ff_exit_frames: 5            # v13 P4 M5：50ms 敏捷唤醒（原 60ms）
   kf_ff_stop_delay_s: 0.08        # 死区外双估计器同时静默确认 80ms，彻底消除快挥折返假停顿
   kf_fast_start_enable: true
   kf_fast_start_frames: 2
-  kf_fast_start_dist: 0.032
+  kf_fast_start_dist: 0.028       # v13 P4 M5：更快静止起步（原 0.032）
   kf_fast_start_dir_cos: 0.80
   kf_hold_tol: 0.04
   kf_slow_follow_enable: false    # 静止保持当前机械臂位姿
@@ -118,40 +121,40 @@ follow:
   smooth_alpha: 0.50
   reversal_fast_response: true
 
-  # ---- 加速度限制 ----
-  max_accel: 3.55                 # 中近区提速（伸展与刹车仍受 reach_accel_min_scale 保护）
+  # ---- 加速度限制（v13 P4 M5：底层 20~30ms 滞后+重力补偿支撑更敏捷启停）----
+  max_accel: 4.25                 # 中近区与制动提速（原 3.55）
   reversal_accel_boost: 2.00
   reversal_residual_scale: 0.18
   depth_oe_min_cutoff: 0.85
   depth_oe_beta: 0.45
   z3d_max_jump: 0.08
 
-  # ---- 伸展度增益调度与大误差非线性追赶 ----
+  # ---- 伸展度增益调度与大误差非线性追赶（v13 P4 M5：M3 底层 kd 接管悬臂阻尼，解放伸展速度）----
   reach_soft_start: 0.24
   reach_soft_end: 0.38
-  reach_min_scale: 0.46
+  reach_min_scale: 0.70           # 深伸展速度从 46% 解放至 70%（+52%）
   reach_dock_dist: 0.25
-  reach_ff_min_scale: 0.45
-  reach_lead_min_scale: 0.25
-  reach_accel_min_scale: 0.60
-  reach_deadband_on_boost: 0.28   # L1-C 温和回调（0.22 → 0.28），消除伸展态停稳轻微二次解锁
-  reach_fast_start_boost: 0.30
-  far_gain_boost: 0.35            # >8cm 同向追赶增益上限（≤8cm 小信号区 0 变化）
+  reach_ff_min_scale: 0.65        # 原 0.45
+  reach_lead_min_scale: 0.30      # 原 0.25
+  reach_accel_min_scale: 0.75     # 原 0.60
+  reach_deadband_on_boost: 0.20   # 原 0.28（M3 阻尼压制回弹后，伸展区更快唤醒）
+  reach_fast_start_boost: 0.22    # 原 0.30
+  far_gain_boost: 0.40            # >8cm 同向追赶增益上限（原 0.35）
 
-  # ---- 相机系回退自运动补偿 & 刹车回弹冷静窗 ----
-  self_motion_delay_s: 0.14
-  self_motion_lpf_tau_s: 0.075
-  self_motion_local_window_s: 0.04
+  # ---- 相机系自运动补偿 & 刹车回弹冷静窗（v13 P2+P4）----
+  self_motion_delay_s: 0.025      # v13 P2：dq_act 已是物理实时角速度，仅对齐 ~25ms 相机延迟（原 0.14s）
+  self_motion_lpf_tau_s: 0.030    # v13 P2：匹配 KF 速度观测相位（原 0.075s）
+  self_motion_local_window_s: 0.025  # v13 P2：时序已精确对齐，收紧局部容错半窗（原 0.04s）
   ff_cruise_support: 0.30
-  post_brake_settle_s: 0.24
-  post_brake_ext_extra_s: 0.10
+  post_brake_settle_s: 0.16       # v13 P4 M5：执行器无弹簧回弹后大幅缩短冷静窗（原 0.24s）
+  post_brake_ext_extra_s: 0.06    # 原 0.10s
 
-  # ---- 分轴闭环自激振荡阻尼器 ----
+  # ---- 分轴闭环自激振荡阻尼器（保留作为安全网，降低误削强度）----
   osc_damp_enable: true
   osc_err_thresh: 0.018
   osc_min_half_s: 0.14
   osc_max_half_s: 0.42
-  osc_gain_cut: 0.45
+  osc_gain_cut: 0.30              # 原 0.45
   osc_decay_tau_s: 0.55
   osc_confirm_reversals: 3
   osc_large_err_release: 0.15

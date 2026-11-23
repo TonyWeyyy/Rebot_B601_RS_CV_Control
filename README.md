@@ -10,10 +10,65 @@
 **一台 Gemini 2 相机、一次 MediaPipe 检测、一条 CAN 总线**，同时完成：
 手掌移动 → 机械臂跟随（保持固定距离与姿态）；拇指食指捏合 → 夹爪开合。
 
-> 日常调参只改 `config/follow.yaml`（跟随）和 `config/grasp.yaml`（夹爪）两个文件；
+> 日常调参只改 `config/follow.yaml`（上层跟随）、`config/grasp.yaml`（夹爪）和 `config/mit_ext.yaml`（MIT 底层扩展）；
 > 命令行参数临时覆盖。完整的技术原理与踩坑记录见 [技术手册.md](技术手册.md)。
 
-## 最新版本 v12.0（L1 世界系 KF + L2 分关节差异化限速定版）
+## 最新版本 v13.0（MIT 底层闭环重构 P0~P4 + 实测位姿感知解耦与上层提速定版）
+
+本版突破了 v12.0「纯位置 MIT 斜坡（~140ms 闭环滞后）」的物理天花板。采用**方案 A（本仓库子类化 `mit_controller_ext.py` + SHA256 版本校验，上游 `rebot_control` 零修改）**，在严格守住 `max_vel ≤ 0.85 m/s`、承重关节 `J2/J3 ≤ 2.0 rad/s`、单 CAN 主机与安全回零全部红线的前提下，分 P0~P4 五个阶段逐级完成系统辨识、底层重构与实机高频验收定稿（配置文件 `config/follow_v13.yaml` + `config/mit_ext.yaml`，已同步至默认 `config/follow.yaml`）。
+
+### 核心升级行为（P0~P4）
+
+- **P0｜200Hz 零开销真实反馈缓存 + CAN 容错（S1）+ 非阻塞启动（S3）**：
+  - 直接从 MIT 应答帧缓存 `motor.get_state()` 获取 200Hz 真实 `(q_act, dq_act, tau_act, t_mos)`，实测与阻塞式 `0x7019` 偏差仅 `0.014°`、耗时 `0.19ms`（原 `57.6ms` 阻塞读取彻底消除）；
+  - `CanFaultMonitor` 将上游「单次 CAN 异常即空中失能」改为连续 `30ms`（6 拍）容错并执行 `return_to_zero` 缓慢回零，杜绝偶发总线毛刺导致的屈肘自由下落；
+- **P1｜MIT 速度前馈 `dq_des` + 200Hz FOH 一阶保持插值 + 40ms 看门狗**：
+  - 通过 `set_joint_mit_targets(angles_deg, velocities_deg_s)` 下发分轴速度前馈（`[0.70, 0.85, 0.85, 0.90, 0.90, 0.90]`）与 200Hz 线性插值，消除纯位置斜坡相位滞后与 100Hz→200Hz 阶梯纹波；上层超 `40ms` 未刷新自动平滑衰减至 `0`（J7 夹爪、限位接触轴、静止保持与回零始终强制 `dq_des=0`）；
+  - 实机扫频验收：全 6 轴执行器滞后由 `65~142ms` 砍至 **`20~30ms`**，手腕 J4~J6 `-3dB` 带宽从 `1.5~2.0Hz` 跃升至 **`>4.0Hz`**；
+- **P2｜200Hz 真实 `(q_act, dq_act)` 驱动感知估计（控制/感知严格解耦）**：
+  - 世界系 KF（`CameraPoseHistory`）与自运动补偿（`DelayedTwistCompensator` + `ActualVelocityFilter`）改用真实物理 `q_act / dq_act`，延迟补偿由 `140ms` 降至纯相机传输 `25ms`、`world_kf_smith_blend=1.00` 直接反投影至当前真实位姿；
+  - 控制雅可比 `J_robot`、工作空间软/硬墙、关节软限位与指令积分严格保持在 `q_cmd`，绝不引入内外环串扰；
+- **P3｜Pinocchio 静态重力前馈 `tau_ff` + 伸展自适应阻尼 `kd`**：
+  - 在独立隔离的 Pinocchio 模型（含 `link6` 上实测 `0.32 kg` Gemini 2 相机+支架等效质点）计算静重力力矩前馈（`scale=[0, 0.65, 0.80, 0.80, 0, 0]`，带 0.5s 淡入、30 Nm/s 斜率限制、单轴硬封顶与回零支架平滑淡出至 `0 Nm`）；实测 J3/J4 静态下垂降低 **85%+**（`2.1°~2.8° → 0.27°~0.49°`）；
+  - 按水平伸展半径 `[0.18, 0.36]m` 线性调度 J1~J3 阻尼 `kd`（J1 `4.6→6.4`、J2 `13.5→14.5`、J3 `14.0→15.0`），扫频实测 J1 3Hz 共振峰压降 `>1.0 dB` 且零滞后代价；
+- **P4｜200Hz 主动安全监督（M6）+ 上层速度与稳态解放（M5）**：
+  - `SafetySupervisor` 在 200Hz 监控 6 轴跟踪误差（`>12°` 持续 `≥80ms`）与实测力矩（`>[18,28,28,10,10,10] Nm` 持续 `≥80ms`），触发碰撞/堵转时进入**原地软保持（绝不半空失能）**，解除后按 `g` 恢复；MOS `90~110°C` 线性降速至 `40%`；
+  - 依托底层 20~30ms 滞后与重力/阻尼底座，上层适度释放增益（`2.75/2.20`）、加速度（`4.25 m/s²`）、世界系前馈（`0.62`）、深伸展速度（`reach_min_scale: 0.46→0.70`），并收紧死区（`2.0cm`）与冷静窗（`0.16s`）。
+
+### v12.0 vs v13.0 实机验收对比
+
+| 指标 | v12.0（`213740` / `214900`） | v13.0（`170617` / `171409`） | 提升 |
+| --- | --- | --- | --- |
+| 执行器闭环滞后（6 轴实测） | `~140 ms`（J4 达 `142 ms`） | **`20 ~ 30 ms`**（全轴 `r=0.97~0.998`） | **滞后砍掉 ~80%** |
+| 6 轴跟踪误差中位数 / 最大值 | `~3.4°`（P1 基准） | **`1.87°~1.97°` / `5.78°~5.90°`** | **误差减半（安全阈值 12° 一半内）** |
+| J3 / J4 静态重力下垂 | `2.10°~2.80°` | **`0.27°~0.49°`** | **下垂降低 85%+** |
+| 分轴跟随中位误差 `|ex| / |ey| / |ez|` | `4.30~5.68 / 6.10~6.22 / 1.95~2.50 cm` | **`2.68~3.08 / 5.51~6.25 / 1.27~1.52 cm`** | **X/Z 误差显著收紧** |
+| 停手稳定耗时中位数 | `0.19 ~ 0.23 s` | **`0.190 ~ 0.210 s`** | **高速下仍 0.19s 刹停** |
+| 稳态静止残余关节速度 P95 | `0.000 rad/s` | **`0.000 rad/s`**（`>0.05` 占比 `0.0%`） | **零静抖完美保持** |
+| 控制循环 / CAN / 温升健康度 | 100Hz 0 超时 | **工作耗时 P95 `0.76ms` / 0 超时 / 0 CAN 失败 / MOS `39°C`** | **200Hz 满载零异常** |
+
+### 独立分层回退开关
+
+- `config/mit_ext.yaml` 可逐级关闭任意底层模块（重启生效）：`supervisor_enable` / `gain_sched_enable` / `gravity_ff_enable` / `vel_ff_enable` / `enable: false`（一键退回上游原版控制器）；
+- `config/follow.yaml` 中 `mit_actual_feedback_est_enable: false` 可单独退回 `q_cmd` 感知估计，或用 `--follow-cfg config/follow_v12.yaml` 一键回到 v12.0 行为。
+
+### 离线验证与硬件诊断命令
+
+```bash
+# 离线验证（无需相机/机械臂）
+python3 tools/test_servo_upgrades.py    # 96 项单元测试全部通过（含 P0~P4 MIT 扩展）
+python3 tools/offline_smoke_test.py     # 正常/故障、--no-gripper、eye-in-hand 静止、v13~v7.1 及 mit_ext 校验
+python3 tools/analyze_servo_log.py logs/servo_时间.csv --json
+
+# 硬件标定与底层验证工具（需 CAN + 清空工作区）
+python3 tools/mit_feedback_probe.py --pose home          # P0：200Hz 缓存精度与重力符号探针
+python3 tools/joint_sysid.py --pose home --with-vel-ff   # P1/P3：单轴扫频辨识滞后与 -3dB 带宽
+python3 tools/p3_gravity_verify.py --pose home           # P3：分级静态重力下垂与符号防呆验证
+```
+
+---
+
+## 历史版本 v12.0（L1 世界系 KF + L2 分关节差异化限速定版）
 
 本版在 v11.0 伸展稳停与防共振基线之上，**不改动底层 MIT 控制协议、严守承重关节 `J2/J3 ≤ 2.0 rad/s`**，完整落地了 **L1（控制与感知架构升级）+ L2（分关节差异化安全限速）** 并行方案，现已通过多轮实机高频日志验收并定版（对应配置文件 `config/follow_v12.yaml`，已同步至默认 `config/follow.yaml`）。
 
@@ -270,12 +325,18 @@ rebot_palm_follow_grasp/
 │
 ├── gemini2_camera.py              相机层（Orbbec SDK，RGB+深度硬件对齐）
 ├── palm_detection.py              检测层（掌心跟踪 + 捏合距离，共用一次检测）
-├── rebot_adapter.py               机械臂适配层（速度伺服 + FK/雅可比 + J7 夹爪通道）
-├── servo_timing.py                时间校准/分轴Q/静止保持/速度停靠/lead/慢拖/软墙
-├── servo_diagnostics.py           低阻塞 CSV + 可选低频实际反馈采样
+├── rebot_adapter.py               机械臂适配层（速度伺服 + FK/雅可比 + 独立重力模型 + J7 夹爪通道）
+├── mit_controller_ext.py          MIT 底层扩展（方案 A 子类化：200Hz 反馈/速度前馈/FOH/重力补偿/阻尼调度/安全监督）
+├── servo_timing.py                时间校准/分轴Q/静止保持/速度停靠/lead/软墙/实测速度滤波
+├── servo_diagnostics.py           低阻塞 CSV（含 200Hz MIT 状态快照）+ 可选低频实际反馈采样
 │
 ├── config/                        所有配置与标定产物
-│   ├── follow.yaml                ★ 最终版 CV 跟随参数（日常调参改这里）
+│   ├── follow.yaml                ★ v13.0 最终版跟随参数（日常调参改这里）
+│   ├── mit_ext.yaml               ★ v13.0 MIT 底层扩展参数与逐级回退开关
+│   ├── follow_v13.yaml             v13.0 定版参数归档
+│   ├── follow_v12.yaml             v12.0 定版回退对照（L1+L2 纯位置 MIT）
+│   ├── follow_v11.yaml             v11.0 伸展稳停定版回退对照
+│   ├── follow_v10.yaml             v10.0 CV-only 回退对照
 │   ├── follow_v9_fallback.yaml     v9 参数回退对照
 │   ├── follow_v8_fallback.yaml     一键恢复实机认可的 v8.0 稳定行为
 │   ├── follow_v7.1_fallback.yaml   一键恢复更早的 v7.1 稳定行为
@@ -288,6 +349,9 @@ rebot_palm_follow_grasp/
 │   └── hand_landmarker.task       MediaPipe 手掌模型
 │
 ├── tools/                         标定与诊断工具（按需运行，日常不用碰）
+│   ├── mit_feedback_probe.py      MIT 200Hz 反馈缓存精度 & 重力符号硬件探针（P0）
+│   ├── joint_sysid.py             单轴正弦扫频系统辨识（带宽/相位滞后/共振峰，P0~P3）
+│   ├── p3_gravity_verify.py       分级静态重力前馈下垂 & 符号防呆验收工具（P3）
 │   ├── gripper_j7_calibrate.py    夹爪开合标定（键盘点动 J7，结果写回 grasp.yaml）
 │   ├── teach_home.py              HOME 位姿示教
 │   ├── hand_eye_calibration.py    手眼标定（手动棋盘格 JOG 采样）
@@ -296,8 +360,8 @@ rebot_palm_follow_grasp/
 │   ├── hand_eye_solver.py         手眼标定求解器（OpenCV 5.0 移除了 calibrateHandEye）
 │   ├── calib_diagnose.py          标定体检（不标定，只定位问题）
 │   ├── camera_intrinsic_check.py  相机内参核对
-│   ├── test_servo_upgrades.py     升级逻辑离线单元测试
-│   ├── analyze_servo_log.py       高频日志离线 A/B 指标分析
+│   ├── test_servo_upgrades.py     升级逻辑离线单元测试（96 项）
+│   ├── analyze_servo_log.py       高频日志离线 A/B 与 MIT 执行器指标分析
 │   └── offline_smoke_test.py      假相机/假机械臂完整主程序冒烟测试
 │
 ├── requirements.txt
@@ -387,11 +451,12 @@ python3 tools/handeye_joint_calib.py      # 手眼+零位联合标定（需先�
 
 ## 配置文件与参数优先级
 
-项目有两份配置文件，**日常调参只改这两个文件，不用动代码**：
+项目有三份配置文件，**日常调参只改这些文件，不用动代码**：
 
 | 文件 | 管什么 |
 | --- | --- |
-| `config/follow.yaml` | 跟随伺服全部参数：距离、增益、速度上限、死区/迟滞、前馈、滤波、虚拟墙 |
+| `config/follow.yaml` | 跟随伺服全部参数：距离、增益、速度上限、死区/迟滞、前馈、滤波、实测位姿接入、虚拟墙 |
+| `config/mit_ext.yaml` | MIT 底层扩展参数：200Hz 反馈缓存、CAN 容错、速度前馈/FOH/看门狗、重力补偿、伸展阻尼、安全监督与独立回退开关 |
 | `config/grasp.yaml` | 捏合→夹爪映射：像素阈值、滤波、开合标定角度、冻结开关 |
 
 **参数优先级：命令行参数 > yaml 配置 > 代码内置默认值。**

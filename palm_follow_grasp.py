@@ -56,7 +56,7 @@ from servo_timing import (AdaptiveLeadGate, FastStartGate, SlowFollowGate,
                           CameraTimestampCalibrator, AxisProcessNoiseGate,
                           StaticVelocityHold, DelayedTwistCompensator,
                           PostBrakeSettleGuard, OscillationDamper,
-                          CameraPoseHistory,
+                          CameraPoseHistory, ActualVelocityFilter,
                           compute_reach_schedule,
                           compute_orientation_cruise_weight,
                           compute_weighted_damped_pseudoinverse,
@@ -275,6 +275,9 @@ ORI_SOFT_MAX_DEG = 10.0           # 姿态软让权保护角度上限（接近�
 ORI_SOFT_MAX_RAD = np.deg2rad(ORI_SOFT_MAX_DEG)
 ROI_CROP_ENABLE = False           # true = MediaPipe 迟滞 ROI 裁剪推理加速（漏检同帧回退全图）
 ROI_CROP_SCALE = 0.68             # ROI 边长占画面短边比例（0.45~0.90）
+# v13 P2：200Hz 真实关节反馈接入感知估计层（仅用于 pose_history/自运动补偿，不闭环到指令积分）
+MIT_ACTUAL_FEEDBACK_EST_ENABLE = False  # true = 用真实 q_act/dq_act 驱动世界系 KF 与自运动补偿
+MIT_ACTUAL_VEL_LPF_TAU_S = 0.020        # 实测角速度 dq_act 一阶低通时间常数 (s)
 SETTLED_CONFIRM_FRAMES = max(1, round(0.08 / CTRL_RATE))
 
 CAMERA_FPS = 30               # 相机帧率；Gemini2 支持 640x480@60，
@@ -503,6 +506,8 @@ def load_follow_cfg(path):
                "ori_soft_max_deg": 10.0,
                "roi_crop_enable": False,
                "roi_crop_scale": 0.68,
+               "mit_actual_feedback_est_enable": False,
+               "mit_actual_vel_lpf_tau_s": 0.020,
                "damping_base": DAMPING_BASE,
                "damping_adaptive": DAMPING_ADAPTIVE,
                "manipulability_threshold": MANIPULABILITY_THRESHOLD,
@@ -560,6 +565,7 @@ def apply_follow_cfg(cfg):
     global WORLD_KF_SMITH_BLEND, WORLD_KF_FF_GAIN
     global ORI_CRUISE_WEIGHT_MIN, ORI_SOFT_MAX_DEG, ORI_SOFT_MAX_RAD
     global ROI_CROP_ENABLE, ROI_CROP_SCALE
+    global MIT_ACTUAL_FEEDBACK_EST_ENABLE, MIT_ACTUAL_VEL_LPF_TAU_S
     global WORKSPACE_MIN, WORKSPACE_MAX, WORKSPACE_RADIUS
     global SERVO_DIRECTION, KF_RESYNC_FRAMES, Z3D_MAX_RATE, Z_FREEZE_MAX
     global KF_ADAPT_ENABLE, KF_ADAPT_REF, KF_ADAPT_MAX, KF_ADAPT_DECAY
@@ -719,6 +725,10 @@ def apply_follow_cfg(cfg):
     ORI_SOFT_MAX_RAD = float(np.deg2rad(ORI_SOFT_MAX_DEG))
     ROI_CROP_ENABLE = bool(fcfg.get("roi_crop_enable", False))
     ROI_CROP_SCALE = float(fcfg.get("roi_crop_scale", 0.68))
+    MIT_ACTUAL_FEEDBACK_EST_ENABLE = bool(
+        fcfg.get("mit_actual_feedback_est_enable", False))
+    MIT_ACTUAL_VEL_LPF_TAU_S = float(
+        fcfg.get("mit_actual_vel_lpf_tau_s", 0.020))
     ws = cfg["workspace"]
     WORKSPACE_MIN = np.array(ws["min"], dtype=np.float64)
     WORKSPACE_MAX = np.array(ws["max"], dtype=np.float64)
@@ -856,6 +866,8 @@ def validate_follow_cfg(cfg):
          "大误差姿态软优先级参数超出安全范围"),
         (0.45 <= f["roi_crop_scale"] <= 0.90,
          "roi_crop_scale 须在 0.45~0.90"),
+        (0.0 <= f["mit_actual_vel_lpf_tau_s"] <= 0.10,
+         "mit_actual_vel_lpf_tau_s 须在 0.0~0.10s"),
     ]
     for ok, message in checks:
         if not ok:
@@ -1169,7 +1181,7 @@ def main():
         print(f"关节限速 (rad/s): {np.round(joint_speed_limits, 2).tolist()}  "
               f"世界系KF={'ON' if WORLD_KF_ENABLE else 'OFF'} "
               f"(delay={WORLD_KF_POSE_DELAY_S*1000:.0f}ms smith={WORLD_KF_SMITH_BLEND:.2f} "
-              f"ff={WORLD_KF_FF_GAIN:.2f})  "
+              f"ff={WORLD_KF_FF_GAIN:.2f} 实测位姿={'ON' if MIT_ACTUAL_FEEDBACK_EST_ENABLE else 'OFF'})  "
               f"姿态软权重={ORI_CRUISE_WEIGHT_MIN:.2f}(≤{ORI_SOFT_MAX_DEG:.0f}°)")
         if KF_ENABLE:
             print(f"卡尔曼: Q={KF_Q} R={KF_R} Rxy={KF_R_XY} Rz={KF_R_Z} "
@@ -1209,6 +1221,8 @@ def main():
             g_pressed[0] = not g_pressed[0]
             enabled = g_pressed[0]
             last_toggle[0] = now
+        if enabled and robot is not None and hasattr(robot, "clear_safety_fault"):
+            robot.clear_safety_fault()
         print("\n[跟随] 启动" if enabled else "\n[跟随] 停止（保持当前位置）")
 
     def on_press(key):
@@ -1234,11 +1248,14 @@ def main():
     # KF 观测是相机系掌心位置，机械臂自身运动必须从手掌速度中扣除，
     # 否则静止判定会被相机自运动反复触发。
     prev_camera_twist = [np.zeros(6)]
-    # 延迟+低通匹配的眼在手上相机自运动补偿器（匹配执行器+视觉 ~100ms + KF ~80ms 滞后）
+    # 延迟+低通匹配的眼在手上相机自运动补偿器（匹配执行器+视觉滞后）
     twist_comp = DelayedTwistCompensator(
         delay_s=SELF_MOTION_DELAY_S,
         lpf_tau_s=SELF_MOTION_LPF_TAU_S,
         local_window_s=SELF_MOTION_LOCAL_WINDOW_S)
+    actual_vel_filter = ActualVelocityFilter(
+        tau_s=MIT_ACTUAL_VEL_LPF_TAU_S,
+        max_speed=HARD_MAX_VEL_JOINTS)
     # 刹车后物理回弹冷静窗：防止伸展态机械回弹与视觉尾流在 70ms 后炸开静止锁存
     settle_guard = PostBrakeSettleGuard(
         base_settle_s=POST_BRAKE_SETTLE_S,
@@ -1340,6 +1357,14 @@ def main():
             print(f"[诊断] 实际关节采样启动失败，已禁用: {exc}")
             feedback_sampler = None
 
+    mit_feedback_getter = (getattr(robot, "get_feedback_state", None)
+                           if robot is not None else None)
+    mit_stats_getter = (getattr(robot, "get_mit_loop_stats", None)
+                        if robot is not None else None)
+    mit_safety_getter = (getattr(robot, "get_safety_status", None)
+                         if robot is not None else None)
+    mit_stats_cache = [None, -1.0]
+
     def servo_control_loop():
         next_deadline = time.monotonic()
         last_loop_time = None
@@ -1376,19 +1401,78 @@ def main():
             else:
                 lost_counter[0] = 0
 
-            # L1 世界系 KF 开启时，提前计算一次内存 FK 位姿并推入滞后对齐位姿历史缓冲
-            # （下方控制段直接复用 prefetched_fk，避免单周期重复计算 Pinocchio FK）。
+            # v13 P2：每周期先读一次 200Hz MIT 应答缓存快照（纯内存无 CAN I/O），
+            # 供感知估计（pose_history / 自运动补偿）与诊断日志共享复用。
+            fbc_tick = None
+            if mit_feedback_getter is not None:
+                try:
+                    fbc_tick = mit_feedback_getter()
+                except Exception:
+                    fbc_tick = None
+            actual_fb_ok = bool(MIT_ACTUAL_FEEDBACK_EST_ENABLE
+                                and fbc_tick is not None
+                                and fbc_tick.get("valid", False))
+            # v13 P4 M6：读取 200Hz 安全监督层状态（软停机保持 + 90~110°C 温升前置降速）
+            safety_tick = None
+            thermal_vel_scale = 1.0
+            if mit_safety_getter is not None:
+                try:
+                    safety_tick = mit_safety_getter()
+                except Exception:
+                    safety_tick = None
+            if safety_tick is not None:
+                _ts = float(safety_tick.get("thermal_scale", 1.0))
+                if np.isfinite(_ts):
+                    thermal_vel_scale = float(np.clip(_ts, 0.20, 1.0))
+                if following and safety_tick.get("fault", False):
+                    _reason = str(safety_tick.get("reason", "安全监督软停机"))
+                    with lock:
+                        g_pressed[0] = False
+                        control_status["joint_speed"] = 0.0
+                        control_status["active"] = False
+                        control_status["error"] = _reason
+                    robot.hold()
+                    actual_velocity[0] = np.zeros(6)
+                    prev_cmd_vel[0][:] = 0.0
+                    prev_camera_twist[0][:] = 0.0
+                    twist_comp.reset()
+                    actual_vel_filter.reset()
+                    settle_guard.reset()
+                    osc_damper.reset()
+                    osc_levels_now[0][:] = 0.0
+                    pose_history.reset()
+                    kf.reset()
+                    kf_world.reset()
+                    ff_moving[0] = False
+                    hold_latch[0] = None
+                    hold_world[0] = None
+                    last_joint_speed[0] = 0.0
+                    next_deadline = time.monotonic()
+                    continue
+
+            # 计算内存 FK 位姿并推入位姿历史缓冲：
+            # - 控制用 prefetched_fk（雅可比、工作空间软墙、限位缓冲）始终锚定 q_cmd，绝不闭环到噪声反馈；
+            # - 感知用 est_fk（世界系 KF、相机自运动补偿）在 P2 开启且缓存有效时采用真实物理 q_act，
+            #   同时消除执行器滞后错位与 4.7° 重力下垂盲区；缓存无效时无缝回退 q_cmd。
             prefetched_fk = None
-            if (WORLD_KF_ENABLE and following and robot is not None
-                    and T_tcp_camera is not None):
+            est_fk = None
+            if following and robot is not None and T_tcp_camera is not None:
                 try:
                     _pf_q = robot.get_command_pos()
                     _pf_pos, _pf_rot, _pf_J = compute_tcp_fk_and_jacobian(
                         robot, _pf_q)
-                    pose_history.push(t0, _pf_pos, _pf_rot, T_tcp_camera, dt)
                     prefetched_fk = (_pf_q, _pf_pos, _pf_rot, _pf_J)
+                    if actual_fb_ok:
+                        _act_pos, _act_rot, _act_J = compute_tcp_fk_and_jacobian(
+                            robot, fbc_tick["q"])
+                        est_fk = (_act_pos, _act_rot, _act_J)
+                    else:
+                        est_fk = (_pf_pos, _pf_rot, _pf_J)
+                    if WORLD_KF_ENABLE:
+                        pose_history.push(t0, est_fk[0], est_fk[1], T_tcp_camera, dt)
                 except Exception:
                     prefetched_fk = None
+                    est_fk = None
             use_world_kf = bool(KF_ENABLE and WORLD_KF_ENABLE and following
                                 and T_tcp_camera is not None
                                 and pose_history.has_data())
@@ -1881,6 +1965,7 @@ def main():
                         target_vel_f[0] = np.zeros(3)
                         prev_camera_twist[0][:] = 0.0
                         twist_comp.reset()
+                        actual_vel_filter.reset()
                         settle_guard.reset()
                         osc_damper.reset()
                         osc_levels_now[0][:] = 0.0
@@ -1895,9 +1980,12 @@ def main():
                     # 随机械臂自运动漂移的画面点。慢拖在 world_obs 上确认，
                     # 只会以受限速度迁移 hold_world，跟手性不靠相机系噪声。
                     if (T_tcp_camera is not None and hold_latch[0] is not None):
+                        _hw_pos, _hw_rot = ((est_fk[0], est_fk[1])
+                                            if est_fk is not None
+                                            else (tcp_pos, tcp_rot))
                         if hold_world[0] is None:
                             world_hold = camera_point_to_world(
-                                target_cam, tcp_pos, tcp_rot, T_tcp_camera)
+                                target_cam, _hw_pos, _hw_rot, T_tcp_camera)
                             if np.linalg.norm(world_hold) > 1e-6:
                                 hold_world[0] = world_hold
                                 slow_follow.reset(hold_world[0])
@@ -1906,7 +1994,7 @@ def main():
                             if (new_kf_meas and not frozen_meas
                                     and not kf_rejected_now[0]):
                                 world_obs = camera_point_to_world(
-                                    target_cam, tcp_pos, tcp_rot,
+                                    target_cam, _hw_pos, _hw_rot,
                                     T_tcp_camera)
                                 if np.linalg.norm(world_obs) > 1e-6:
                                     slow_active[0] = slow_follow.update(
@@ -1927,7 +2015,7 @@ def main():
                                     # 上下漂移。慢拖只由方向/帧确认的
                                     # SlowFollowGate 迁移。
                             held_cam = world_point_to_camera(
-                                hold_world[0], tcp_pos, tcp_rot, T_tcp_camera)
+                                hold_world[0], _hw_pos, _hw_rot, T_tcp_camera)
                             if np.linalg.norm(held_cam) > 1e-6:
                                 target_cam = held_cam
 
@@ -1943,6 +2031,8 @@ def main():
                     osc_max = float(np.max(osc_levels))
                     reach_r = float(np.hypot(tcp_pos[0], tcp_pos[1]))
                     reach_r_now[0] = reach_r
+                    if hasattr(robot, "set_reach_radius"):
+                        robot.set_reach_radius(reach_r)
                     reach_sched = compute_reach_schedule(
                         reach_r, pos_err_norm,
                         REACH_SOFT_START, REACH_SOFT_END, REACH_MIN_SCALE,
@@ -2083,7 +2173,7 @@ def main():
                                else REACH_ATT_TAU)
                     att_alpha = min(1.0, dt / max(att_tau, 1e-3))
                     reach_att[0] += (att_target - reach_att[0]) * att_alpha
-                    v_cam[:3] *= reach_att[0]
+                    v_cam[:3] *= reach_att[0] * thermal_vel_scale
 
                     angular_world = (K_ORIENTATION * ori_err
                                      if (hold_latch[0] is None
@@ -2233,23 +2323,34 @@ def main():
                         joint_vel[:] = 0.0
                     last_joint_speed[0] = float(np.linalg.norm(joint_vel))
 
-                    # 用适配层内部下发角（含 200Hz 斜坡）的差分估计本周
-                    # 实际相机 twist，送入延迟+低通匹配补偿器供后续周期扣除。
-                    if (T_tcp_camera is not None
-                            and prev_command_joints[0] is not None):
-                        qdot_cmd = ((current_joints - prev_command_joints[0])
-                                    / max(float(dt), 1e-3))
-                        # 控制周期抖动时防止差分被放大；正常斜坡本就在
-                        # joint_speed_limits 内，钳位只影响异常采样。
-                        qdot_cmd = np.clip(qdot_cmd,
-                                           -joint_speed_limits, joint_speed_limits)
-                        if np.all(np.isfinite(qdot_cmd)):
+                    # 估计本周期真实相机自运动 twist，送入延迟+低通匹配补偿器供后续周期扣除：
+                    # - P2 开启且 200Hz 反馈有效时，使用低通滤波后的真实角速度 dq_act 与真实位姿雅可比；
+                    # - 否则无缝回退适配层内部下发角 q_cmd 差分。
+                    _twist_computed = False
+                    if (T_tcp_camera is not None and actual_fb_ok
+                            and est_fk is not None):
+                        dq_act_f = actual_vel_filter.update(
+                            fbc_tick["dq"], dt, valid=True)
+                        if dq_act_f is not None:
                             prev_camera_twist[0] = camera_twist_from_tcp(
-                                J_robot @ qdot_cmd, tcp_rot, T_tcp_camera)
+                                est_fk[2] @ dq_act_f, est_fk[1], T_tcp_camera)
+                            _twist_computed = True
+                    else:
+                        actual_vel_filter.reset()
+                    if not _twist_computed:
+                        if (T_tcp_camera is not None
+                                and prev_command_joints[0] is not None):
+                            qdot_cmd = ((current_joints - prev_command_joints[0])
+                                        / max(float(dt), 1e-3))
+                            qdot_cmd = np.clip(
+                                qdot_cmd, -joint_speed_limits, joint_speed_limits)
+                            if np.all(np.isfinite(qdot_cmd)):
+                                prev_camera_twist[0] = camera_twist_from_tcp(
+                                    J_robot @ qdot_cmd, tcp_rot, T_tcp_camera)
+                            else:
+                                prev_camera_twist[0][:] = 0.0
                         else:
                             prev_camera_twist[0][:] = 0.0
-                    else:
-                        prev_camera_twist[0][:] = 0.0
                     twist_comp.push(prev_camera_twist[0], t0, dt)
                     prev_command_joints[0] = current_joints.copy()
 
@@ -2260,6 +2361,9 @@ def main():
                         if reach_att[0] < 0.95:
                             _status += ("" if not _status else " ") + \
                                 f"伸展衰减x{reach_att[0]:.2f}"
+                        if thermal_vel_scale < 0.99:
+                            _status += ("" if not _status else " ") + \
+                                f"高温降速x{thermal_vel_scale:.2f}"
                         control_status["error"] = _status
                         control_status["active"] = True
 
@@ -2267,6 +2371,7 @@ def main():
                     robot.hold()
                     prev_camera_twist[0][:] = 0.0
                     twist_comp.reset()
+                    actual_vel_filter.reset()
                     settle_guard.reset()
                     osc_damper.reset()
                     osc_levels_now[0][:] = 0.0
@@ -2289,6 +2394,7 @@ def main():
                 prev_target_cam[0] = None
                 prev_camera_twist[0][:] = 0.0
                 twist_comp.reset()
+                actual_vel_filter.reset()
                 settle_guard.reset()
                 osc_damper.reset()
                 osc_levels_now[0][:] = 0.0
@@ -2409,6 +2515,38 @@ def main():
                         feedback["actual"][joint] if feedback_fresh else "")
                     row[f"q_fb_cmd_{joint + 1}"] = (
                         feedback["command"][joint] if feedback_fresh else "")
+                # v13 P0/P2：复用本周期已读取的 200Hz MIT 应答缓存（纯内存，无 CAN I/O）。
+                fbc = fbc_tick
+                fbc_ok = bool(fbc is not None and fbc["valid"])
+                row["fbc_valid"] = int(fbc_ok)
+                row["fbc_age_ms"] = (fbc["age_s"] * 1000.0) if fbc is not None else ""
+                row["fbc_seq"] = fbc["seq"] if fbc is not None else ""
+                for joint in range(6):
+                    row[f"qa_{joint + 1}"] = fbc["q"][joint] if fbc_ok else ""
+                    row[f"dqa_{joint + 1}"] = fbc["dq"][joint] if fbc_ok else ""
+                    row[f"tau_{joint + 1}"] = fbc["tau"][joint] if fbc_ok else ""
+                if fbc is not None:
+                    _tm = fbc["t_mos"][np.isfinite(fbc["t_mos"])]
+                    row["tmos_max"] = float(np.max(_tm)) if _tm.size else ""
+                if mit_stats_getter is not None and t0 - mit_stats_cache[1] >= 0.5:
+                    try:
+                        mit_stats_cache[0] = mit_stats_getter()
+                    except Exception:
+                        mit_stats_cache[0] = None
+                    mit_stats_cache[1] = t0
+                if mit_stats_cache[0]:
+                    _p99 = mit_stats_cache[0].get("period_p99_ms")
+                    row["mit_period_p99_ms"] = _p99 if _p99 is not None else ""
+                    row["can_fail_total"] = mit_stats_cache[0].get("can_fail_total", "")
+                    row["mit_dq_ff_max"] = mit_stats_cache[0].get("dq_send_max_rad_s", "")
+                    _tff = mit_stats_cache[0].get("tau_ff_nm")
+                    if _tff and len(_tff) >= 4:
+                        row["tau_ff_2"] = _tff[1]
+                        row["tau_ff_3"] = _tff[2]
+                        row["tau_ff_4"] = _tff[3]
+                    _ckd = mit_stats_cache[0].get("cur_kd")
+                    if _ckd and len(_ckd) >= 1:
+                        row["kd_j1"] = _ckd[0]
                 diag_recorder.log(row)
             delay = next_deadline - time.monotonic()
             if delay > 0:

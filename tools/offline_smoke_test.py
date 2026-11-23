@@ -102,6 +102,7 @@ class FakeRobot:
 
     def __init__(self):
         self.q = np.zeros(6)
+        self.last_dq = np.zeros(6)
         self.commands = []
         self.stopped = False
         self.gripper = 0.0
@@ -131,8 +132,38 @@ class FakeRobot:
             raise RuntimeError("注入实际反馈 CAN 故障")
         return self.q.copy() - 0.005  # 固定小跟踪误差，仅用于日志验证
 
+    def get_feedback_state(self):
+        return {
+            "q": self.q.copy() - 0.003,
+            "dq": self.last_dq.copy(),
+            "tau": np.array([0.0, 4.0, -2.0, 0.3, 0.1, 0.0]),
+            "q_cmd": self.q.copy(),
+            "t_mos": np.full(7, 38.0),
+            "age_s": 0.002,
+            "seq": len(self.commands) + 1,
+            "valid": True,
+        }
+
+    def get_mit_loop_stats(self):
+        return {
+            "period_p99_ms": 5.2, "can_fail_total": 0,
+            "dq_send_max_rad_s": float(np.max(np.abs(self.last_dq))),
+            "tau_ff_nm": [0.0, 0.5, 6.2, 1.8, 0.0, 0.0],
+            "cur_kd": [4.6, 13.5, 14.0, 5.0, 4.0, 4.0],
+        }
+
+    def get_safety_status(self):
+        return {"enabled": True, "fault": False, "reason": "", "thermal_scale": 1.0}
+
+    def clear_safety_fault(self):
+        pass
+
+    def set_reach_radius(self, reach_r_m):
+        self.last_reach_r = float(reach_r_m)
+
     def joint_vel_cmd(self, dq):
         dq = np.asarray(dq, dtype=float)
+        self.last_dq = dq.copy()
         self.commands.append(dq.copy())
         self.q += dq * 0.01
 
@@ -220,6 +251,18 @@ main_module.validate_follow_cfg(v10_cfg)
 v11_cfg = main_module.load_follow_cfg(
     os.path.join(ROOT, "config", "follow_v11.yaml"))
 main_module.validate_follow_cfg(v11_cfg)
+v12_cfg = main_module.load_follow_cfg(
+    os.path.join(ROOT, "config", "follow_v12.yaml"))
+main_module.validate_follow_cfg(v12_cfg)
+main_module.apply_follow_cfg(v12_cfg)
+assert not main_module.MIT_ACTUAL_FEEDBACK_EST_ENABLE
+v13_cfg = main_module.load_follow_cfg(
+    os.path.join(ROOT, "config", "follow_v13.yaml"))
+main_module.validate_follow_cfg(v13_cfg)
+main_module.apply_follow_cfg(v13_cfg)
+assert main_module.MIT_ACTUAL_FEEDBACK_EST_ENABLE
+from mit_controller_ext import load_mit_ext_cfg
+load_mit_ext_cfg(os.path.join(ROOT, "config", "mit_ext.yaml"))
 fallback_cfg = main_module.load_follow_cfg(
     os.path.join(ROOT, "config", "follow_v7.1_fallback.yaml"))
 main_module.validate_follow_cfg(fallback_cfg)
@@ -307,6 +350,8 @@ for key, value in (("kf_r_xy", 0.0), ("kf_slow_follow_speed", 0.07),
                    ("ori_soft_max_deg", 25.0),
                    ("roi_crop_scale", 0.30),
                    ("roi_crop_scale", 0.95),
+                   ("mit_actual_vel_lpf_tau_s", -0.01),
+                   ("mit_actual_vel_lpf_tau_s", 0.20),
                    ("max_vel", 0.90),
                    ("max_vel_joints", [2.4, 2.5, 2.0, 2.8, 2.8, 2.2]),
                    ("max_vel_joints", [2.4, 2.0, 2.0, 3.5, 2.8, 2.2]),
@@ -377,6 +422,8 @@ def run_complete_smoke(extra_args=()):
         "静止观测必须使用配置的静止 Q 倍率"
     assert any(row["hw_time_used"] == "1" for row in rows), "有效硬件时间未进入校准链"
     assert any(row["hw_time_used"] == "0" for row in rows), "异常硬件时间未回退主机时刻"
+    assert any(row["fbc_valid"] == "1" and row["qa_2"] and row["tau_2"]
+               for row in rows), "MIT 200Hz 反馈缓存未写入诊断日志"
     assert all(not row["error"] for row in rows), f"伺服日志出现运行错误: {new_logs[0]}"
     return robot, rows, new_logs[0], len(nonzero), len(slow_rows)
 
