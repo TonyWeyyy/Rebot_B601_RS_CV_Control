@@ -73,7 +73,7 @@ class DepthProtectionChain:
         depth_scale: float,
     ) -> float:
         """
-        保护层 1：7×7 → 14×14 → 21×21 三级扩展窗口前景优先中值深度提取。
+        保护层 1：三级扩展窗口（7×7 → 13×13 → 19×19）+ 前景连续优先中值深度提取。
 
         Args:
             depth_img: 硬件对齐后的深度图（uint16 / float）。
@@ -86,11 +86,15 @@ class DepthProtectionChain:
         """
         if depth_img is None:
             return 0.0
-        for win in (7, 14, 21):
-            z = float(get_median_depth(depth_img, int(u), int(v), depth_scale, window=win))
-            if self.cfg.min_valid_m <= z <= self.cfg.max_valid_m:
-                return z
-        return 0.0
+        z = float(get_median_depth(
+            depth_img,
+            float(depth_scale),
+            int(u),
+            int(v),
+            ref_depth=self._z_ref,
+            max_jump=self.cfg.max_jump_m,
+        ))
+        return z if (self.cfg.min_valid_m <= z <= self.cfg.max_valid_m) else 0.0
 
     def update(self, raw_z_m: float, timestamp_s: float) -> DepthGuardResult:
         """

@@ -220,6 +220,7 @@ def main(argv=None) -> int:
     backend: Optional[RobotBackend] = None
     pipeline: Optional[ServoV14Pipeline] = None
     camera: Optional[Gemini2Camera] = None
+    detector: Optional[PalmDetector] = None
     diag: Optional[DiagnosticRecorder] = None
     kb_listener = None
 
@@ -295,15 +296,16 @@ def main(argv=None) -> int:
             color_exposure_ms=cfg.camera.color_exposure_ms,
         )
         detector = PalmDetector(
-            roi_crop_enable=cfg.camera.roi_crop_enable,
-            roi_crop_scale=cfg.camera.roi_crop_scale,
+            roi_enable=cfg.camera.roi_crop_enable,
+            roi_scale=cfg.camera.roi_crop_scale,
         )
         tracker = PalmTracker()
         lk_bridge = LKPalmBridge(
+            enable=cfg.camera.hybrid_track_enable,
             max_frames=cfg.camera.hybrid_max_frames,
             box_half=cfg.camera.hybrid_box_half,
             max_step_px=cfg.camera.hybrid_max_step_px,
-        ) if cfg.camera.hybrid_track_enable else None
+        )
         depth_guard = DepthProtectionChain(cfg.depth, target_distance_m=cfg.pbvs.distance)
         ts_cal = CameraTimestampCalibrator(
             max_transport_s=cfg.camera.hw_max_transport_s
@@ -316,7 +318,8 @@ def main(argv=None) -> int:
             log_path = os.path.join(
                 log_dir, f"servo_v14_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
             )
-            diag = DiagnosticRecorder(log_path, maxsize=cfg.camera.diag_queue_size)
+            diag = DiagnosticRecorder(log_path, queue_size=cfg.camera.diag_queue_size)
+            diag.start()
             print(f"[诊断] v14 高频日志: {log_path}")
 
         # ── 4. 启动 100Hz 伺服线程 ───────────────────────────────
@@ -358,7 +361,7 @@ def main(argv=None) -> int:
                         shared["err_norm"] = telem.error_norm_m
 
                     if diag is not None:
-                        diag.record(pipeline.telemetry_to_diag_row(telem, robot_state, following))
+                        diag.log(pipeline.telemetry_to_diag_row(telem, robot_state, following))
 
                     next_tick += dt_nom
                     sleep_s = next_tick - time.perf_counter()
@@ -400,38 +403,26 @@ def main(argv=None) -> int:
         lost_streak = 0
         while not stop_event.is_set():
             t0 = time.perf_counter()
-            color_img, depth_img = camera.get_frames(latest_only=True)
+            color_img, depth_img, depth_scale = camera.get_frames(latest_only=True)
             host_t = time.monotonic()
             if color_img is None:
                 time.sleep(0.002)
                 continue
 
-            timing = camera.get_last_frame_timing()
-            hw_ts = timing.get("color_hw_ts_s") if cfg.camera.hw_timestamp_enable else None
+            hw_ts_raw, _ = camera.get_last_frame_timing()
+            hw_ts = hw_ts_raw if cfg.camera.hw_timestamp_enable else None
             meas_t, hw_used = ts_cal.update(hw_ts, host_t)
 
-            det = detector.detect(color_img)
+            u_det, v_det, landmarks = detector.detect(color_img)
             proc_s = time.perf_counter() - t0
-            gray = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY) if lk_bridge is not None else None
 
-            used_lk = False
-            if det is not None:
-                if lk_bridge is not None and gray is not None:
-                    lk_bridge.seed(gray, det["palm_px"])
-                track = tracker.update(det["palm_px"])
-            elif lk_bridge is not None and gray is not None:
-                lk_pt = lk_bridge.track(gray)
-                if lk_pt is not None:
-                    used_lk = True
-                    track = tracker.update(lk_pt)
-                else:
-                    track = tracker.update(None)
-            else:
-                track = tracker.update(None)
+            det_uv = (u_det, v_det) if u_det is not None else None
+            out_u, out_v, src = lk_bridge.update(color_img, det_uv)
+            track = tracker.update((out_u, out_v) if out_u is not None else None)
 
-            # 夹爪通道：仅要求 2D 新鲜关键点（不依赖深度）
-            if enable_gripper and backend is not None and det is not None and (not used_lk):
-                p_px = pinch_distance_px(det["landmarks"], color_img.shape[1], color_img.shape[0])
+            # 夹爪通道：仅要求 2D 新鲜关键点（不依赖深度，LK 桥接帧无 landmarks 自动跳过）
+            if enable_gripper and backend is not None and landmarks is not None and src == "det":
+                p_px, _, _ = pinch_distance_px(landmarks, color_img.shape)
                 with state_lock:
                     cur_js = shared["joint_speed"]
                 g_deg = gripper_mapper.update(p_px, host_t, cur_js)
@@ -442,13 +433,15 @@ def main(argv=None) -> int:
             if track is not None and track["lost"] == 0:
                 lost_streak = 0
                 u, v = int(track["u"]), int(track["v"])
-                raw_z = depth_guard.extract_raw_depth(depth_img, u, v, camera.depth_scale)
+                eff_scale = depth_scale if depth_scale is not None else (camera.depth_scale or 0.001)
+                raw_z = depth_guard.extract_raw_depth(depth_img, u, v, eff_scale)
                 d_res = depth_guard.update(raw_z, host_t)
                 if d_res.valid:
                     p_cam = np.asarray(
                         pixel_to_3d(u, v, d_res.z_m, camera.fx, camera.fy, camera.cx, camera.cy),
                         dtype=np.float64,
                     )
+                    track["x3d"], track["y3d"], track["z3d"] = float(p_cam[0]), float(p_cam[1]), float(p_cam[2])
                     seq += 1
                     obs_new = Observation(
                         seq=seq,
@@ -484,10 +477,10 @@ def main(argv=None) -> int:
             # 可视化 HUD
             if not args.headless:
                 vis = color_img.copy()
-                if det is not None:
-                    draw_landmarks(vis, det["landmarks"])
+                if landmarks is not None:
+                    draw_landmarks(vis, landmarks)
                 if track is not None and track["lost"] == 0:
-                    draw_palm(vis, (int(track["u"]), int(track["v"])))
+                    draw_palm(vis, track, int(camera.cx), int(camera.cy))
                 hud = f"v14 [{cur_mode.value}] err={cur_err*100:.1f}cm"
                 cv2.putText(vis, hud, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.imshow("reBot v14 Palm Follow", vis)
@@ -507,6 +500,11 @@ def main(argv=None) -> int:
         if kb_listener is not None:
             try:
                 kb_listener.stop()
+            except Exception:
+                pass
+        if detector is not None:
+            try:
+                detector.close()
             except Exception:
                 pass
         if camera is not None:

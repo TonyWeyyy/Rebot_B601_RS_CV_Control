@@ -427,6 +427,69 @@ class DigitalTwinAndEndToEndTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             apply_cli_overrides(cfg, bad_args)
 
+    def test_v14_main_sim_end_to_end_smoke(self):
+        """端到端冒烟测试 `palm_follow_v14.main(--sim --headless)`：验证相机→检测→LK→4层深度→夹爪→100Hz伺服→日志→安全退出全链路。"""
+        from unittest import mock
+        import palm_follow_v14 as v14_mod
+
+        class _Lm:
+            def __init__(self, x, y):
+                self.x, self.y, self.z = x, y, 0.0
+
+        fake_lms = [_Lm(0.5, 0.5) for _ in range(21)]
+        fake_lms[4] = _Lm(0.45, 0.50)
+        fake_lms[8] = _Lm(0.55, 0.50)
+
+        frame_counter = {"n": 0}
+
+        class _FakeCam:
+            def __init__(self, fps=60, color_exposure_ms=6.0):
+                self.fx, self.fy, self.cx, self.cy = 518.0, 518.0, 320.0, 240.0
+                self.depth_scale = 0.001
+                self.stopped = False
+
+            def get_frames(self, latest_only=True):
+                frame_counter["n"] += 1
+                if frame_counter["n"] > 25:
+                    raise KeyboardInterrupt()
+                color = np.full((480, 640, 3), 120, dtype=np.uint8)
+                depth = np.full((480, 640), 400, dtype=np.uint16)  # 0.40m
+                return color, depth, self.depth_scale
+
+            def get_last_frame_timing(self):
+                return None, "host"
+
+            def stop(self):
+                self.stopped = True
+
+        class _FakeDet:
+            def __init__(self, roi_enable=False, roi_scale=0.68):
+                self.roi_enable = roi_enable
+                self.roi_scale = roi_scale
+                self.closed = False
+
+            def detect(self, color_bgr):
+                return 340, 240, fake_lms
+
+            def close(self):
+                self.closed = True
+
+        log_dir = os.path.join(ROOT, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        before_logs = {n for n in os.listdir(log_dir) if n.startswith("servo_v14_") and n.endswith(".csv")}
+
+        with mock.patch.object(v14_mod, "Gemini2Camera", _FakeCam), \
+             mock.patch.object(v14_mod, "PalmDetector", _FakeDet):
+            rc = v14_mod.main(["--sim", "--headless"])
+        self.assertEqual(rc, 0)
+
+        after_logs = {n for n in os.listdir(log_dir) if n.startswith("servo_v14_") and n.endswith(".csv")}
+        new_logs = after_logs - before_logs
+        self.assertEqual(len(new_logs), 1)
+        # 清理本次单测生成的临时日志，保持 logs/ 干净
+        for name in new_logs:
+            os.remove(os.path.join(log_dir, name))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
