@@ -3,4 +3,7 @@ __pycache__/
 *$py.class
 Log/
 logs/*.csv
+logs/*.json
+logs/*.npz
+AGENTS.md
 .DS_Store

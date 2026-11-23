@@ -16,7 +16,7 @@ from servo_timing import (AdaptiveLeadGate, FastStartGate, SlowFollowGate,
                           CameraTimestampCalibrator, AxisProcessNoiseGate,
                           StaticVelocityHold, DelayedTwistCompensator,
                           PostBrakeSettleGuard, OscillationDamper,
-                          CameraPoseHistory,
+                          CameraPoseHistory, ActualVelocityFilter,
                           compute_reach_schedule,
                           compute_orientation_cruise_weight,
                           compute_weighted_damped_pseudoinverse,
@@ -1112,6 +1112,666 @@ class OrientationPriorityAndJointLimitsTests(unittest.TestCase):
             (remapped[1].x - remapped[0].x) * 640.0,
             (remapped[1].y - remapped[0].y) * 480.0))
         self.assertAlmostEqual(pinch_px, float(np.hypot(60.0, 30.0)), places=6)
+
+
+class MitExtensionP0Tests(unittest.TestCase):
+    """v13 P0：MIT 扩展配置、CAN 瞬时故障容错（S1）、反馈缓存与上游版本校验。"""
+
+    def _make_fake_upstream(self):
+        import contextlib
+        import threading
+
+        class FakeMotor:
+            def __init__(self, idx):
+                self.idx = idx
+                self.state = types.SimpleNamespace(
+                    pos=0.0, vel=0.0, torq=0.5 * idx,
+                    t_mos=35.0 + idx, t_rotor=36.0 + idx, status_code=0)
+                self.fail_get_state = False
+                self.mit_cmds = []
+
+            def get_state(self):
+                if self.fail_get_state:
+                    raise RuntimeError("get_state err")
+                return self.state
+
+            def send_mit(self, pos, vel, kp, kd, tau):
+                self.mit_cmds.append((pos, vel, kp, kd, tau))
+
+        class FakeController:
+            def __init__(self):
+                self.poll_calls = 0
+
+            def poll_feedback_once(self):
+                self.poll_calls += 1
+
+        class FakeUpstreamBase:
+            def __init__(self):
+                self.control_hz = 200.0
+                self.motor_count = 7
+                _gains = [(72.0, 3.6), (216.0, 12.0), (216.0, 12.0),
+                          (50.0, 5.0), (50.0, 4.0), (50.0, 4.0), (50.0, 4.0)]
+                self.config = types.SimpleNamespace(
+                    motors=[types.SimpleNamespace(kp=kp, kd=kd) for kp, kd in _gains])
+                self.target_positions = [0.0] * 7
+                self.command_positions = [0.0] * 7
+                self.max_speeds_rad_s = [2.0] * 7
+                self.target_lock = threading.RLock()
+                self.io_lock = threading.RLock()
+                self.worker_stop_event = threading.Event()
+                self.shutdown_started = False
+                self.last_error = None
+                self.motors = [FakeMotor(i) for i in range(7)]
+                self.controller = FakeController()
+                self.send_calls = 0
+                self.fail_next_sends = 0
+                self.stop_calls = []
+
+            @contextlib.contextmanager
+            def _io_lock_guard(self, timeout=None):
+                with self.io_lock:
+                    yield
+
+            def _control_loop(self):
+                pass
+
+            def _send_mit_positions(self, positions_rad, *, lock_timeout=None):
+                self.send_calls += 1
+                if self.fail_next_sends > 0:
+                    self.fail_next_sends -= 1
+                    raise RuntimeError("transient CAN TX error")
+                for idx, motor in enumerate(self.motors):
+                    mc = self.config.motors[idx]
+                    motor.send_mit(float(positions_rad[idx]), 0.0,
+                                   float(mc.kp), float(mc.kd), 0.0)
+
+            def _read_positions_rad(self):
+                return [0.0] * 7
+
+            def request_stop(self, **kwargs):
+                self.stop_calls.append(kwargs)
+
+            def set_joint_angles(self, angles_deg):
+                with self.target_lock:
+                    self.target_positions[:] = [np.deg2rad(float(a)) for a in angles_deg]
+
+            def set_joint_angle(self, joint_id, angle_deg):
+                with self.target_lock:
+                    self.target_positions[joint_id - 1] = float(np.deg2rad(float(angle_deg)))
+
+            def get_command_angles(self):
+                return [0.0] * 7
+
+            def set_max_speeds(self, speeds_deg_s):
+                pass
+
+            def start(self, **kwargs):
+                pass
+
+            def stop(self, **kwargs):
+                pass
+
+        return FakeUpstreamBase
+
+    def test_config_validation_and_yaml_loading(self):
+        from mit_controller_ext import load_mit_ext_cfg, validate_mit_ext_cfg
+
+        cfg = load_mit_ext_cfg()
+        self.assertTrue(cfg["enable"])
+        self.assertTrue(cfg["feedback_trusted"])
+        self.assertFalse(cfg["feedback_poll_once"])
+        self.assertTrue(cfg["vel_ff_enable"])
+        self.assertEqual(len(cfg["vel_ff_scale"]), 6)
+        self.assertAlmostEqual(cfg["can_fault_window_s"], 0.03)
+        self.assertEqual(cfg["can_fault_action"], "return_to_zero")
+
+        for bad in (
+            {"unknown_key": 1},
+            {"can_fault_window_s": 0.005},
+            {"can_fault_window_s": 0.50},
+            {"can_fault_action": "drop"},
+            {"feedback_cache": False, "feedback_trusted": True},
+            {"enable": "yes"},
+            {"vel_ff_scale": [0.5, 0.5, 0.5]},
+            {"vel_ff_scale": [1.2, 0.8, 0.8, 0.8, 0.8, 0.8]},
+            {"vel_ff_scale": [-0.1, 0.8, 0.8, 0.8, 0.8, 0.8]},
+            {"vel_ff_watchdog_s": 0.005},
+            {"vel_ff_lpf_tau_s": 0.20},
+            {"gravity_ff_scale": [0.5, 0.5, 0.5, 0.5, 0.0, 0.0]},   # J1 必须为 0
+            {"gravity_ff_scale": [0.0, 1.1, 0.5, 0.5, 0.0, 0.0]},   # 超过 0.95
+            {"gravity_ff_max_nm": [0.0, 20.0, 12.0, 2.5, 2.0, 1.0]},  # 超代码级硬上限 14Nm
+            {"gain_sched_r_min_m": 0.35, "gain_sched_r_max_m": 0.30},
+            {"gain_sched_kd_far": [6.4, 14.5, 15.0, 6.0, 4.0, 4.0]},  # RS00 kd > 5.0
+            {"track_err_limit_deg": 2.0},
+            {"tau_limit_nm": [40.0, 28.0, 28.0, 10.0, 10.0, 10.0]},
+            {"thermal_derate_start_c": 100.0, "thermal_derate_full_c": 95.0},
+        ):
+            with self.assertRaises(ValueError):
+                validate_mit_ext_cfg(bad)
+
+    def test_can_fault_monitor_transient_vs_sustained(self):
+        from mit_controller_ext import CanFaultMonitor
+
+        mon = CanFaultMonitor(window_s=0.03, control_hz=200.0)
+        self.assertEqual(mon.threshold, 6)
+        # 5 次连续失败不触发，成功 1 次即清零
+        for _ in range(5):
+            self.assertFalse(mon.record_failure())
+        mon.record_success()
+        self.assertEqual(mon.consecutive, 0)
+        # 连续 6 次才触发故障
+        for i in range(5):
+            self.assertFalse(mon.record_failure(), f"step {i}")
+        self.assertTrue(mon.record_failure())
+        self.assertEqual(mon.max_consecutive, 6)
+
+    def test_upstream_compat_and_fallback(self):
+        from mit_controller_ext import check_upstream_compat, build_controller
+
+        FakeBase = self._make_fake_upstream()
+        ok, reason, _ = check_upstream_compat(FakeBase, require_pinned=False)
+        self.assertTrue(ok, reason)
+        # 钉死哈希不匹配时必须自动回退原版，且不得抛异常崩溃
+        ctrl, info = build_controller(
+            FakeBase,
+            cfg={"enable": True, "require_pinned_upstream": True})
+        self.assertFalse(info["active"])
+        self.assertIs(type(ctrl), FakeBase)
+
+        # 关闭开关同样回退原版
+        ctrl2, info2 = build_controller(FakeBase, cfg={"enable": False})
+        self.assertFalse(info2["active"])
+        self.assertIs(type(ctrl2), FakeBase)
+
+    def test_extended_controller_s1_tolerance_feedback_and_shutdown_retry(self):
+        import threading
+        import time
+        from mit_controller_ext import make_extended_controller_class
+
+        FakeBase = self._make_fake_upstream()
+        ExtCls = make_extended_controller_class(FakeBase)
+        ctrl = ExtCls(ext_cfg={"can_fault_window_s": 0.03,
+                               "can_fault_action": "return_to_zero",
+                               "feedback_cache": True,
+                               "feedback_poll_once": True})
+        # 先注入 3 次瞬时发送异常（< 6 拍阈值）：绝不能触发停机
+        ctrl.fail_next_sends = 3
+        t = threading.Thread(target=ctrl._control_loop, daemon=True)
+        t.start()
+        time.sleep(0.08)
+        self.assertEqual(ctrl.stop_calls, [])
+        snap = ctrl.get_feedback_snapshot()
+        self.assertIsNotNone(snap)
+        self.assertTrue(all(snap["valid"]))
+        self.assertGreater(ctrl.controller.poll_calls, 0)
+
+        # 录波功能验证
+        ctrl.start_recording()
+        time.sleep(0.04)
+        rows = ctrl.stop_recording()
+        self.assertGreaterEqual(len(rows), 3)
+
+        # 注入 10 次连续发送异常（≥ 6 拍阈值）：必须触发 return_to_zero（非 emergency 失能）
+        ctrl.fail_next_sends = 10
+        t.join(timeout=1.0)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(len(ctrl.stop_calls), 1)
+        self.assertTrue(ctrl.stop_calls[0]["return_to_zero"])
+        self.assertFalse(ctrl.stop_calls[0]["emergency"])
+
+        # 安全停机阶段瞬时异常必须自动重试并成功，不轻易中止回零
+        ctrl.shutdown_started = True
+        ctrl.fail_next_sends = 2
+        ctrl._send_mit_positions([0.0] * 7)
+        self.assertEqual(ctrl.fail_next_sends, 0)
+
+    def test_feedback_error_auto_disable_does_not_trip_can_fault(self):
+        from mit_controller_ext import make_extended_controller_class
+
+        FakeBase = self._make_fake_upstream()
+        ExtCls = make_extended_controller_class(FakeBase)
+        ctrl = ExtCls(ext_cfg={"feedback_cache": True})
+        ctrl.motors[0].fail_get_state = True
+        for _ in range(ctrl._fb_disable_threshold + 2):
+            ctrl._send_and_sample([0.0] * 7)
+        self.assertFalse(ctrl._fb_enabled)
+        self.assertEqual(ctrl.stop_calls, [])
+        self.assertEqual(ctrl._fault_monitor.total_failures, 0)
+
+    def test_p1_foh_zero_ripple_watchdog_and_conflict_guards(self):
+        from mit_controller_ext import compute_p1_mit_step
+
+        # 1) 异步 100Hz→200Hz 连续匀速：任意线程相位 phi=3ms 下，每拍步长必须精确等于 v*5ms（零阶梯纹波）
+        v = 1.0
+        period = 0.005
+        cmd = 0.0
+        dq_prev = 0.0
+        steps = []
+        for tick in range(8):
+            t_now = 0.003 + tick * period
+            update_idx = int(t_now // 0.010)
+            target = (update_idx + 1) * 0.010 * v
+            elapsed = t_now - update_idx * 0.010
+            new_cmd, dq_prev, wd = compute_p1_mit_step(
+                target, cmd, v, dq_prev, max_speed=2.0, period=period, elapsed=elapsed,
+                vel_ff_enable=True, vel_ff_scale=0.85, foh_enable=True,
+                foh_upper_dt_s=0.010, watchdog_s=0.040, watchdog_tau_s=0.030,
+                lpf_tau_s=0.008, mit_vel_mode=True)
+            steps.append(new_cmd - cmd)
+            cmd = new_cmd
+            self.assertFalse(wd)
+        # 首拍从 0 走到 0.003，之后每一拍必须严格等于 0.005（零 2x/0x 纹波）
+        self.assertAlmostEqual(steps[0], 0.003, places=6)
+        for st in steps[1:]:
+            self.assertAlmostEqual(st, 0.005, places=6)
+        self.assertGreater(dq_prev, 0.70)
+        self.assertLessEqual(dq_prev, 0.85 + 1e-6)
+
+        # 2) 上层卡死看门狗：cmd 绝不外推越过最后 target，dq_send 指数衰减归零
+        frozen_target = 0.040
+        cmd = frozen_target - 0.002
+        dq_s = 0.85
+        for k in range(40):
+            elapsed = 0.045 + k * period
+            cmd, dq_s, wd = compute_p1_mit_step(
+                frozen_target, cmd, 1.0, dq_s, max_speed=2.0, period=period,
+                elapsed=elapsed, vel_ff_enable=True, vel_ff_scale=0.85,
+                foh_enable=True, foh_upper_dt_s=0.010, watchdog_s=0.040,
+                watchdog_tau_s=0.030, lpf_tau_s=0.008, mit_vel_mode=True)
+            self.assertTrue(wd)
+            self.assertLessEqual(cmd, frozen_target + 1e-9)
+        self.assertLess(abs(dq_s), 0.01)
+
+        # 3) 方向冲突保护：dq_target 与 (target - cmd) 反向 >0.2° 时，前馈必须归零
+        _, dq_conf, _ = compute_p1_mit_step(
+            target=0.0, command=0.05, dq_target=+1.0, dq_prev_send=0.0,
+            max_speed=2.0, period=period, elapsed=0.005,
+            vel_ff_enable=True, vel_ff_scale=0.90, foh_enable=True,
+            foh_upper_dt_s=0.010, watchdog_s=0.040, watchdog_tau_s=0.030,
+            lpf_tau_s=0.0, mit_vel_mode=True)
+        self.assertEqual(dq_conf, 0.0)
+
+        # 4) 硬限速钳制：即使外部传入超大速度，步长和 dq_send 绝不越过 max_speed
+        cmd_c, dq_c, _ = compute_p1_mit_step(
+            target=1.0, command=0.0, dq_target=10.0, dq_prev_send=0.0,
+            max_speed=2.0, period=period, elapsed=0.005,
+            vel_ff_enable=True, vel_ff_scale=1.0, foh_enable=False,
+            foh_upper_dt_s=0.010, watchdog_s=0.040, watchdog_tau_s=0.030,
+            lpf_tau_s=0.0, mit_vel_mode=True)
+        self.assertLessEqual(cmd_c, 2.0 * period + 1e-9)
+        self.assertLessEqual(dq_c, 2.0 + 1e-9)
+
+    def test_p1_controller_sends_dq_isolates_j7_and_exits_on_legacy_call(self):
+        import threading
+        import time
+        from mit_controller_ext import make_extended_controller_class
+
+        FakeBase = self._make_fake_upstream()
+        ExtCls = make_extended_controller_class(FakeBase)
+        ctrl = ExtCls(ext_cfg={"vel_ff_enable": True,
+                               "vel_ff_scale": [0.7, 0.85, 0.85, 0.9, 0.9, 0.9],
+                               "vel_ff_watchdog_s": 0.04,
+                               "vel_ff_watchdog_tau_s": 0.02,
+                               "vel_ff_lpf_tau_s": 0.005})
+        # 非有限速度必须被立即拒绝
+        with self.assertRaises(ValueError):
+            ctrl.set_joint_mit_targets([0.0] * 7, [float("nan")] + [0.0] * 6)
+
+        t = threading.Thread(target=ctrl._control_loop, daemon=True)
+        t.start()
+        try:
+            # 连续喂 60ms 匀速轨迹（即便第 7 通道误传 100°/s，J7 也必须恒为 0）
+            for k in range(6):
+                ang = [0.0, 0.0, 0.0, (k + 1) * 0.573, 0.0, 0.0, 10.0]
+                vel = [0.0, 0.0, 0.0, 57.3, 0.0, 0.0, 100.0]
+                ctrl.set_joint_mit_targets(ang, vel)
+                time.sleep(0.01)
+            j4_vels = [c[1] for c in ctrl.motors[3].mit_cmds]
+            j7_vels = [c[1] for c in ctrl.motors[6].mit_cmds]
+            self.assertGreater(max(j4_vels), 0.5)
+            self.assertLessEqual(max(j4_vels), 0.95)
+            self.assertTrue(all(v == 0.0 for v in j7_vels), "J7 夹爪严禁透传速度前馈")
+
+            # 调用老接口 set_joint_angles（如 hold/move_to_joints）必须立刻清零速度前馈
+            ctrl.set_joint_angles([0.0, 0.0, 0.0, 3.4, 0.0, 0.0, 10.0])
+            time.sleep(0.025)
+            self.assertEqual(ctrl.motors[3].mit_cmds[-1][1], 0.0)
+
+            # 停更触发看门狗衰减验证
+            ctrl.set_joint_mit_targets([0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 10.0],
+                                       [0.0, 0.0, 0.0, 57.3, 0.0, 0.0, 0.0])
+            time.sleep(0.18)
+            stats = ctrl.get_loop_stats()
+            self.assertGreaterEqual(stats["watchdog_trips"], 1)
+            self.assertLess(abs(ctrl.motors[3].mit_cmds[-1][1]), 0.02)
+        finally:
+            ctrl.worker_stop_event.set()
+            t.join(timeout=1.0)
+
+    def test_p3_gravity_tau_cradle_fade_caps_and_gain_scheduling(self):
+        from mit_controller_ext import (
+            cradle_zero_fade, compute_p3_gravity_tau, compute_p3_gains)
+        from tools.p3_gravity_verify import check_sag_monotonic_safety
+
+        # 1) 零位支架淡出：零位为 0.0，HOME (J2≈19.6°, J3≈19.1°) 为 1.0
+        self.assertEqual(cradle_zero_fade([0.0] * 6), 0.0)
+        self.assertAlmostEqual(cradle_zero_fade([0.0, 0.34, 0.37, 0.09, 0.0, 0.0]), 1.0)
+
+        # 2) 重力矩计算：硬限幅、J1 恒为 0、变化率限制与异常平滑归零
+        q_home = [-0.43, 0.34, 0.37, 0.09, 0.0, 0.0]
+        raw_fn = lambda q: [9.0, 20.0, 20.0, 5.0, 1.0, 0.5]
+        tau = [0.0] * 6
+        for _ in range(150):
+            tau, err = compute_p3_gravity_tau(
+                q_home, tau, raw_fn, period=0.005, enabled=True,
+                scales=[0.0, 0.8, 0.8, 0.8, 0.0, 0.0],
+                max_nm=[0.0, 12.0, 12.0, 2.5, 2.0, 1.0],
+                ramp_factor=1.0, slew_nm_s=30.0)
+            self.assertFalse(err)
+        self.assertEqual(tau[0], 0.0)          # J1 恒为 0
+        self.assertAlmostEqual(tau[1], 12.0)   # 20*0.8=16 被硬钳位到 12.0
+        self.assertAlmostEqual(tau[2], 12.0)
+        self.assertAlmostEqual(tau[3], 2.5)    # 5*0.8=4 被硬钳位到 2.5
+        self.assertEqual(tau[4], 0.0)
+
+        # 回调异常时不能崩，必须平滑降力矩并报 err=True
+        tau_err, err = compute_p3_gravity_tau(
+            q_home, tau, lambda q: [float("nan")] * 6, period=0.005,
+            enabled=True, scales=[0.0, 0.8, 0.8, 0.8, 0.0, 0.0],
+            max_nm=[0.0, 12.0, 12.0, 2.5, 2.0, 1.0],
+            ramp_factor=1.0, slew_nm_s=30.0)
+        self.assertTrue(err)
+        self.assertAlmostEqual(tau[2] - tau_err[2], 30.0 * 0.005, places=6)
+
+        # 3) 伸展阻尼调度：平滑升至目标且严格落在 [0.8x, 1.8x] 基线内
+        base_kp = [72.0, 216.0, 216.0, 50.0, 50.0, 50.0]
+        base_kd = [3.6, 12.0, 12.0, 5.0, 4.0, 4.0]
+        kp, kd = list(base_kp), list(base_kd)
+        for _ in range(100):
+            kp, kd = compute_p3_gains(
+                base_kp, base_kd, kp, kd, reach_r=0.38, period=0.005,
+                enabled=True, r_min=0.18, r_max=0.36,
+                kd_near=[4.6, 13.5, 14.0, 5.0, 4.0, 4.0],
+                kd_far=[8.0, 14.5, 15.0, 5.0, 4.0, 4.0],  # 8.0 超 1.8*3.6=6.48 必须被钳位
+                kp_scale=[1.0] * 6, slew_per_s=10.0)
+        self.assertAlmostEqual(kd[0], 1.8 * 3.6, places=4)
+        self.assertAlmostEqual(kd[1], 14.5, places=4)
+        self.assertAlmostEqual(kd[2], 15.0, places=4)
+        self.assertAlmostEqual(kd[3], 5.0, places=4)
+
+        # 4) 静态核验反向保护逻辑
+        ok, _ = check_sag_monotonic_safety([0, 0.2, 2.0, 2.7, 0, 0], [0, 0.1, 1.2, 1.6, 0, 0])
+        self.assertTrue(ok)
+        ok_bad, _ = check_sag_monotonic_safety([0, 0.2, 2.0, 2.7, 0, 0], [0, 0.2, 2.8, 2.7, 0, 0])
+        self.assertFalse(ok_bad)
+
+    def test_p3_controller_sends_tau_ff_scheduled_kd_and_fades_at_zero(self):
+        import threading
+        import time
+        from mit_controller_ext import make_extended_controller_class
+
+        FakeBase = self._make_fake_upstream()
+        ExtCls = make_extended_controller_class(FakeBase)
+        ctrl = ExtCls(ext_cfg={
+            "gravity_ff_enable": True,
+            "gravity_ff_scale": [0.0, 0.5, 0.5, 0.5, 0.0, 0.0],
+            "gravity_ff_ramp_in_s": 0.05,
+            "gravity_ff_slew_nm_s": 60.0,
+            "gain_sched_enable": True,
+            "gain_sched_slew_per_s": 40.0,
+        })
+        ctrl.set_gravity_torque_fn(lambda q: [0.0, 2.0, 8.0, 2.4, 0.0, 0.0])
+        # 设为 HOME 悬臂位姿 + 深伸展半径
+        q_home = [-0.43, 0.34, 0.37, 0.09, 0.0, 0.0, 0.0]
+        ctrl.target_positions[:] = q_home
+        ctrl.command_positions[:] = q_home
+        for i, qv in enumerate(q_home):
+            ctrl.motors[i].state.pos = qv
+        ctrl.set_reach_radius(0.36)
+
+        t = threading.Thread(target=ctrl._control_loop, daemon=True)
+        t.start()
+        try:
+            time.sleep(0.18)
+        finally:
+            ctrl.worker_stop_event.set()
+            t.join(timeout=1.0)
+
+        # J3 应收到约 8.0*0.5 = 4.0 Nm；J4 约 1.2 Nm；J1 tau_ff=0 且 kd 升至 6.4；J7 恒基线
+        j1_last = ctrl.motors[0].mit_cmds[-1]
+        j3_last = ctrl.motors[2].mit_cmds[-1]
+        j4_last = ctrl.motors[3].mit_cmds[-1]
+        j7_last = ctrl.motors[6].mit_cmds[-1]
+        self.assertEqual(j1_last[4], 0.0)
+        self.assertAlmostEqual(j1_last[3], 6.4, delta=0.15)
+        self.assertAlmostEqual(j3_last[4], 4.0, delta=0.15)
+        self.assertAlmostEqual(j4_last[4], 1.2, delta=0.10)
+        self.assertEqual(j7_last[1], 0.0)
+        self.assertEqual(j7_last[3], 4.0)
+        self.assertEqual(j7_last[4], 0.0)
+
+        # 回零过程（shutdown_started）：到达零位支架时 tau_ff 必须平滑淡出至 0，kd 回基线
+        ctrl.shutdown_started = True
+        for _ in range(40):
+            ctrl._send_mit_positions([0.0] * 7)
+        self.assertAlmostEqual(ctrl.motors[2].mit_cmds[-1][4], 0.0, delta=0.05)
+        self.assertAlmostEqual(ctrl.motors[0].mit_cmds[-1][3], 3.6, delta=0.15)
+
+    def test_p4_safety_supervisor_collision_torque_thermal_and_soft_hold(self):
+        from mit_controller_ext import (
+            SafetySupervisor, validate_mit_ext_cfg, make_extended_controller_class)
+
+        cfg = validate_mit_ext_cfg({
+            "supervisor_enable": True,
+            "track_err_limit_deg": 12.0,
+            "track_err_window_s": 0.05,   # 200Hz -> 10 拍
+            "tau_limit_nm": [18.0, 28.0, 28.0, 10.0, 10.0, 10.0],
+            "tau_limit_window_s": 0.05,
+            "thermal_derate_start_c": 90.0,
+            "thermal_derate_full_c": 110.0,
+            "thermal_derate_min_scale": 0.40,
+        })
+        sup = SafetySupervisor(cfg, control_hz=200.0)
+        q0 = [0.0] * 6
+        tau0 = [0.0] * 6
+        ok6 = [True] * 6
+
+        # 1) 温升前置降速：80°C=1.0，100°C=0.70，115°C=0.40
+        sup.update(q0, q0, tau0, [80.0] * 7, ok6)
+        self.assertAlmostEqual(sup.thermal_scale, 1.0)
+        sup.update(q0, q0, tau0, [100.0] * 7, ok6)
+        self.assertAlmostEqual(sup.thermal_scale, 0.70, places=3)
+        sup.update(q0, q0, tau0, [115.0] * 7, ok6)
+        self.assertAlmostEqual(sup.thermal_scale, 0.40, places=3)
+        self.assertFalse(sup.fault)
+
+        # 2) 短时毛刺（9 拍 < 10 拍）不误触发，恢复即清零
+        q_bad = [0.0, 0.0, np.deg2rad(15.0), 0.0, 0.0, 0.0]
+        for _ in range(9):
+            self.assertFalse(sup.update(q_bad, q0, tau0, [45.0] * 7, ok6))
+        self.assertFalse(sup.update(q0, q0, tau0, [45.0] * 7, ok6))
+        self.assertFalse(sup.fault)
+
+        # 3) 持续 10 拍跟踪误差超限必须触发软停机锁存
+        for _ in range(9):
+            self.assertFalse(sup.update(q_bad, q0, tau0, [45.0] * 7, ok6))
+        self.assertTrue(sup.update(q_bad, q0, tau0, [45.0] * 7, ok6))
+        self.assertTrue(sup.fault)
+        self.assertIn("跟踪误差", sup.fault_reason)
+
+        # 清除后测试力矩堵转保护
+        sup.clear_fault()
+        self.assertFalse(sup.fault)
+        tau_stall = [0.0, 0.0, 30.0, 0.0, 0.0, 0.0]
+        for _ in range(9):
+            self.assertFalse(sup.update(q0, q0, tau_stall, [45.0] * 7, ok6))
+        self.assertTrue(sup.update(q0, q0, tau_stall, [45.0] * 7, ok6))
+        self.assertTrue(sup.fault)
+        self.assertIn("力矩", sup.fault_reason)
+
+        # 4) 端到端控制器测试：堵转软停机锁存必须锚定当前位姿、清零 dq_des，且绝不调用失能！
+        FakeBase = self._make_fake_upstream()
+        ExtCls = make_extended_controller_class(FakeBase)
+        ctrl = ExtCls(ext_cfg=cfg)
+        ctrl.target_positions[2] = 0.5
+        ctrl.command_positions[2] = 0.3
+        ctrl.motors[2].state.pos = 0.3
+        ctrl._mit_vel_mode = True
+        ctrl._target_velocities[2] = 1.0
+        ctrl.motors[2].state.torq = 31.0  # 注入 J3 堵转力矩
+        for _ in range(12):
+            ctrl._send_and_sample(ctrl.command_positions.copy())
+        st = ctrl.get_safety_status()
+        self.assertTrue(st["fault"])
+        self.assertIn("力矩", st["reason"])
+        self.assertEqual(ctrl.stop_calls, [])  # 绝不紧急失能
+        self.assertAlmostEqual(ctrl.target_positions[2], ctrl.command_positions[2])
+        self.assertFalse(ctrl._mit_vel_mode)
+        # 锁存期间新的速度指令被拒绝；清除后可恢复
+        ctrl.set_joint_mit_targets([0.0] * 7, [0.0, 0.0, 30.0, 0.0, 0.0, 0.0, 0.0])
+        self.assertFalse(ctrl._mit_vel_mode)
+        ctrl.clear_safety_fault()
+        ctrl.motors[2].state.torq = 5.0
+        ctrl.set_joint_mit_targets([0.0] * 7, [0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0])
+        self.assertTrue(ctrl._mit_vel_mode)
+
+
+class JointSysidAndProbeTests(unittest.TestCase):
+    """v13 P0：单关节阶跃/扫频辨识数学、只读探针评估与日志分析兼容测试。"""
+
+    def test_step_and_sine_identification_recovers_second_order_params(self):
+        from tools.joint_sysid import (
+            _simulate_filtered_step, analyze_step_response,
+            analyze_sine_segment, safe_sine_amp_rad)
+
+        dt = 0.005
+        t = np.arange(0.0, 1.4, dt)
+        u = np.clip((t - 0.20) / 0.02, 0.0, 1.0)
+        step_rad = np.deg2rad(2.5)
+        true_delay = 0.015
+        true_wn = 2.0 * np.pi * 1.80
+        true_zeta = 0.35
+        q_cmd = u * step_rad
+        q_act = _simulate_filtered_step(t, u, true_delay, true_wn, true_zeta) * step_rad
+
+        res = analyze_step_response(t, q_cmd, q_act, kp=72.0, pre_s=0.15)
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["fit"]["ok"])
+        self.assertGreater(res["fit"]["r2"], 0.995)
+        self.assertAlmostEqual(res["fit"]["delay_ms"], 15.0, delta=2.0)
+        self.assertAlmostEqual(res["fit"]["wn_hz"], 1.80, delta=0.06)
+        self.assertAlmostEqual(res["fit"]["zeta"], 0.35, delta=0.03)
+        self.assertGreater(res["overshoot_pct"], 25.0)
+        self.assertIsNotNone(res["fit"]["kd_for_zeta_07"])
+
+        # 扫频锁相：在有直流重力偏置的情况下应精确还原 1.8Hz 共振峰值与相位滞后
+        f = 1.8
+        ts = np.arange(0.0, 4.0 / f, dt)
+        amp = safe_sine_amp_rad(2.0, f)
+        self.assertLessEqual(2.0 * np.pi * f * amp, 0.80 + 1e-9)
+        w = 2.0 * np.pi * f
+        H = (true_wn ** 2 / ((true_wn ** 2 - w ** 2) + 1j * 2.0 * true_zeta * true_wn * w)
+             * np.exp(-1j * w * true_delay))
+        qc = amp * np.sin(w * ts)
+        qa = amp * abs(H) * np.sin(w * ts + np.angle(H)) + 0.035  # 2° 直流下垂
+        sr = analyze_sine_segment(ts, qc, qa, f)
+        self.assertTrue(sr["ok"])
+        self.assertAlmostEqual(sr["mag_ratio"], abs(H), delta=0.02)
+        self.assertAlmostEqual(sr["phase_deg"], np.rad2deg(np.angle(H)), delta=1.5)
+
+    def test_probe_evaluation_verdict_and_gravity_sign_check(self):
+        from tools.mit_feedback_probe import evaluate_probe_metrics
+
+        mode_a = {"valid_ratio": 1.0, "period_p99_ms": 5.3, "change_ratio": 0.85}
+        mode_b = {"valid_ratio": 1.0, "period_p99_ms": 5.8, "change_ratio": 0.90}
+        q_ref = np.array([0.0, 0.35, 0.37, 0.10, 0.0, 0.0])
+        q_cache = q_ref + np.deg2rad([0.02, -0.04, 0.03, 0.01, 0.0, 0.0])
+        q_cmd = q_ref + np.deg2rad([0.0, 1.8, -0.9, 0.4, 0.0, 0.0])
+        tau_pin = np.array([0.0, 6.5, -2.8, 0.45, 0.05, 0.0])
+        tau_act = np.array([0.02, 7.8, -3.2, 0.55, 0.03, 0.0])
+        kp = np.array([72.0, 216.0, 216.0, 50.0, 50.0, 50.0])
+        ev = evaluate_probe_metrics(mode_a, mode_b, q_cache, q_ref, q_cmd,
+                                    tau_act, tau_pin, kp)
+        self.assertTrue(ev["pos_match_ok"])
+        self.assertTrue(ev["recommend_feedback_trusted"])
+        self.assertFalse(ev["recommend_feedback_poll_once"])
+        # J2/J3/J4 符号全部一致
+        self.assertTrue(ev["gravity_check"][1]["sign_match"])
+        self.assertTrue(ev["gravity_check"][2]["sign_match"])
+        self.assertTrue(ev["gravity_check"][3]["sign_match"])
+
+        # 若位置偏差 > 0.3° 必须拒绝启用 trusted
+        ev_bad = evaluate_probe_metrics(
+            mode_a, mode_b, q_ref + np.deg2rad(1.0), q_ref, q_cmd,
+            tau_act, tau_pin, kp)
+        self.assertFalse(ev_bad["pos_match_ok"])
+        self.assertFalse(ev_bad["recommend_feedback_trusted"])
+
+    def test_analyze_servo_log_summarizes_mit_cached_feedback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "mit_p0.csv")
+            with open(path, "w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=DIAG_FIELDS)
+                writer.writeheader()
+                for i in range(10):
+                    row = {k: "" for k in DIAG_FIELDS}
+                    row.update({
+                        "host_time": f"{i * 0.01:.6f}", "dt_s": "0.010000",
+                        "following": 1, "visible": 1, "ff_moving": 1,
+                        "error_norm": 0.05, "ctrl_work_ms": 0.5, "overrun": 0,
+                        "fbc_valid": 1, "fbc_age_ms": 2.5, "fbc_seq": i + 1,
+                        "tmos_max": 42.5 + i * 0.1, "mit_period_p99_ms": 5.3,
+                        "can_fail_total": 1,
+                    })
+                    for j in range(1, 7):
+                        row[f"q_cmd_{j}"] = 0.2
+                        row[f"qa_{j}"] = 0.2 - np.deg2rad(1.5 if j == 2 else 0.2)
+                        row[f"dqa_{j}"] = 0.0
+                        row[f"tau_{j}"] = 6.0 if j == 2 else 0.5
+                    writer.writerow(row)
+            summary = summarize(path)
+            self.assertAlmostEqual(summary["mit_fbc_valid_ratio"], 1.0)
+            self.assertAlmostEqual(summary["mit_tracking_err_median_deg"], 1.5, delta=0.05)
+            self.assertAlmostEqual(summary["mit_tau_abs_max_nm"][1], 6.0)
+            self.assertAlmostEqual(summary["mit_tmos_max_c"], 43.4, delta=0.05)
+            self.assertEqual(summary["mit_can_fail_total"], 1)
+
+    def test_p2_actual_velocity_filter_and_real_pose_sag_cancellation(self):
+        # 1) ActualVelocityFilter：有效抑制 0.06 rad/s 静止白噪、保留真实速度、钳位尖峰并在失效时复位
+        filt = ActualVelocityFilter(tau_s=0.020, max_speed=np.array([2.5, 2.0, 2.0, 3.0, 3.0, 2.5]))
+        rng = np.random.default_rng(42)
+        noise_outs = [filt.update(rng.normal(0.0, 0.06, size=6), dt=0.01) for _ in range(100)]
+        self.assertLess(float(np.std(noise_outs)), 0.045)
+        # 真实匀速阶跃后快速收敛且被硬钳制在 max_speed 内
+        for _ in range(15):
+            out = filt.update(np.array([5.0, 1.0, 0.0, 0.0, 0.0, 0.0]), dt=0.01)
+        self.assertAlmostEqual(out[0], 2.5, delta=0.02)
+        self.assertAlmostEqual(out[1], 1.0, delta=0.02)
+        # 异常/失效输入必须返回 None 并复位内部状态
+        self.assertIsNone(filt.update(np.array([np.nan] * 6), dt=0.01))
+        self.assertIsNone(filt.update(np.zeros(6), dt=0.01, valid=False))
+        out_fresh = filt.update(np.zeros(6), dt=0.01, valid=True)
+        self.assertTrue(np.allclose(out_fresh, 0.0))
+
+        # 2) 静态重力下垂自洽性：pose_history 存真实 q_act（含 4.7° 俯仰下垂），
+        #    前向查表与 smith_blend=1.0 反投影同用 q_act 时，静止掌心反投影误差精确为 0
+        hist = CameraPoseHistory(lpf_tau_s=0.012)
+        ang = np.deg2rad(4.7)
+        R_sag = np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, np.cos(ang), -np.sin(ang)],
+            [0.0, np.sin(ang), np.cos(ang)],
+        ])
+        p_sag = np.array([0.14, 0.06, 0.29])
+        T_tc = np.eye(4)
+        for k in range(10):
+            hist.push(k * 0.01, p_sag, R_sag, T_tc, dt=0.01)
+        p_d, R_d = hist.lookup(0.09 - 0.025, use_lpf=True)
+        p_now, R_now = hist.blended_pose(0.09, delay_s=0.025, smith_blend=1.0)
+        palm_cam = np.array([0.0, 0.0, 0.40])
+        palm_w = p_d + R_d @ palm_cam
+        reproj = R_now.T @ (palm_w - p_now)
+        self.assertTrue(np.allclose(reproj, palm_cam, atol=1e-9))
 
 
 if __name__ == "__main__":

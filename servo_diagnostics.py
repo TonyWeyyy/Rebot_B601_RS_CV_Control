@@ -21,6 +21,14 @@ DIAG_FIELDS = [
     "q_act_1", "q_act_2", "q_act_3", "q_act_4", "q_act_5", "q_act_6",
     "q_fb_cmd_1", "q_fb_cmd_2", "q_fb_cmd_3", "q_fb_cmd_4", "q_fb_cmd_5",
     "q_fb_cmd_6", "hw_time_used", "error",
+    # v13 P0：MIT 扩展 200Hz 应答缓存（内存读取，无 CAN I/O）
+    "fbc_valid", "fbc_age_ms", "fbc_seq",
+    "qa_1", "qa_2", "qa_3", "qa_4", "qa_5", "qa_6",
+    "dqa_1", "dqa_2", "dqa_3", "dqa_4", "dqa_5", "dqa_6",
+    "tau_1", "tau_2", "tau_3", "tau_4", "tau_5", "tau_6",
+    "tmos_max", "mit_period_p99_ms", "can_fail_total", "mit_dq_ff_max",
+    # v13 P3：静态重力前馈力矩与伸展调度阻尼诊断
+    "tau_ff_2", "tau_ff_3", "tau_ff_4", "kd_j1",
 ]
 
 

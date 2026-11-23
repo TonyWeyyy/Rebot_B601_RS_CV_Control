@@ -1322,6 +1322,50 @@ def remap_roi_landmarks(landmarks, roi_box, frame_w, frame_h):
     ]
 
 
+class ActualVelocityFilter:
+    """对 200Hz 电机实测角速度 dq_act 做轻量一阶低通（v13 P2）。
+
+    过滤静止时的编码器速度量化噪声（P0 实测 ~0.04~0.07 rad/s），同时保持
+    真实物理速度的相位准确度，供眼在手上自运动补偿使用。
+    异常/无效输入自动复位并返回 None，调用方无缝回退 q_cmd 差分。
+    """
+
+    def __init__(self, tau_s=0.020, max_speed=None):
+        self.tau_s = float(tau_s)
+        if not math.isfinite(self.tau_s) or self.tau_s < 0.0:
+            raise ValueError("实际角速度滤波时间常数必须为非负有限值")
+        self.max_speed = (None if max_speed is None
+                          else np.asarray(max_speed, dtype=np.float64).copy())
+        self._vel = None
+
+    def reset(self):
+        self._vel = None
+
+    def update(self, dq_act, dt, valid=True):
+        if not valid or dq_act is None:
+            self.reset()
+            return None
+        try:
+            dq = np.asarray(dq_act, dtype=np.float64)
+            step = float(dt)
+        except (TypeError, ValueError):
+            self.reset()
+            return None
+        if (dq.shape != (6,) or not np.all(np.isfinite(dq))
+                or not math.isfinite(step) or step <= 0.0):
+            self.reset()
+            return None
+        if self.max_speed is not None:
+            dq = np.clip(dq, -self.max_speed, self.max_speed)
+        if self._vel is None or self.tau_s <= 1e-4:
+            self._vel = dq.copy()
+        else:
+            alpha = 1.0 - math.exp(-step / self.tau_s)
+            self._vel = self._vel + (dq - self._vel) * alpha
+        return self._vel.copy()
+
+
+
 
 
 
