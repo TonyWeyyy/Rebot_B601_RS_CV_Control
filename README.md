@@ -10,10 +10,48 @@
 **一台 Gemini 2 相机、一次 MediaPipe 检测、一条 CAN 总线**，同时完成：
 手掌移动 → 机械臂跟随（保持固定距离与姿态）；拇指食指捏合 → 夹爪开合。
 
-> 日常调参只改 `config/follow.yaml`（上层跟随）、`config/grasp.yaml`（夹爪）和 `config/mit_ext.yaml`（MIT 底层扩展）；
-> 命令行参数临时覆盖。完整的技术原理与踩坑记录见 [技术手册.md](技术手册.md)。
+> 日常调参只改 `config/follow.yaml`（v13 上层跟随）、`config/v14.yaml`（v14 模块化架构）、`config/grasp.yaml`（夹爪）和 `config/mit_ext.yaml`（MIT 底层扩展）；
+> 命令行参数临时覆盖。完整技术文档：
+> - 总体技术与踩坑手册：[技术手册.md](技术手册.md)
+> - MIT 底层通用辨识与标定指南：[MIT底层辨识与标定开发指南.md](MIT底层辨识与标定开发指南.md)
+> - 原版 vs 现版 MIT 控制全面对比：[MIT控制升级前后对比文档.md](MIT控制升级前后对比文档.md)
 
-## 最新版本 v13.0（MIT 底层闭环重构 P0~P4 + 实测位姿感知解耦与上层提速定版）
+## 开发版 v14.0（`develop` 分支：四层解耦架构 + 统一世界系 PBVS + 离线数字孪生）
+
+在保留 `palm_follow_grasp.py`（v13.0 实机定版基线）100% 完好可对照的前提下，`develop` 分支落地了全新 **v14.0 模块化架构**（包 `servo_v14/` + 薄入口 `palm_follow_v14.py` + 配置文件 `config/v14.yaml`），彻底消灭全局变量、拆解 3,000+ 行单文件主循环，并引入可离线闭环评测的数字孪生：
+
+- **四层高内聚解耦流水线（`servo_v14/pipeline.py`）**：
+  1. **层 1 统一世界系估计器（`servo_v14/estimator.py`）**：以基座世界系为唯一真相源（基于 200Hz 真实 `q_act` FK 与 25ms 曝光滞后查表），取代双估计器过渡方案；完整保留 4 层深度保护链（`servo_v14/depth_guard.py`）及深度冻结期世界系 XY 正交子空间更新；
+  2. **层 2 显式有限状态机（`servo_v14/state_machine.py`）**：显式 8 态（`IDLE / TRACKING / DOCKING / HOLDING / COASTING / LOST / FAULT_HOLD / RETURN_HOME`）清晰管理快启、折返防假停、冷静窗与 M6/硬墙最高优先级抢占；
+  3. **层 3 统一世界系 PBVS 控制器（`servo_v14/controller_pbvs.py`）**：严格锚定 `q_cmd` 雅可比与**固定参考光轴 `z_cam_init`**（彻底杜绝手腕 J4 触限倾斜引发的正反馈俯冲），支持世界系速度前馈、伸展调度、加权 DLS 与振荡阻尼安全网；
+  4. **层 4 不可绕过安全护盾（`servo_v14/safety_shield.py`）**：所有硬红线（`max_vel ≤ 0.85`、`J2/J3 ≤ 2.0 rad/s`、水平 `0.42m` 柱面软墙、硬墙 `>5cm` 自动回 HOME、奇异降速、活跃集关节限位列屏蔽重解 + 逆解后穿墙拦截、M6 软保持与热降额）统一收口，任何上层策略均不可绕过；
+- **可插拔硬件/数字孪生后端（`servo_v14/robot_backend.py`）**：
+  - `HardwareRobotBackend`：无缝复用经过 v13.0 实机验收的 `RebotAdapter` + `mit_controller_ext.py`（P0~P4）与安全回零链；
+  - `DigitalTwinBackend`：内置与 B601-RS URDF 精度对齐至 `0.02mm` 的纯 NumPy 运动学/重力引擎（亦优先支持 Pinocchio）+ 200Hz 辨识机电动力学积分器，与真机 100% 共用同一 `ServoV14Pipeline` 代码；
+- **离线数字孪生闭环回放（`tools/replay_digital_twin.py`）**：
+  - 可将任意真机 CSV 日志还原为真实人手世界轨迹并执行闭环重演与 `--sweep` 参数扫描；
+  - 在真机验收日志 `171409.csv` / `170617.csv` 上闭环回放实测：零硬墙越界、零 M6 误触发，运动 3D 误差中位数由 v13 实机 `10.50 / 9.66 cm` 降至 **`7.12 / 6.59 cm`**，停手耗时 **`0.190 s`**、静止速度 P95 **`0.0000 rad/s`**。
+
+### v14.0 快速运行与离线验证
+
+```bash
+# 1. 离线单元测试（v14 14项 + v13 96项 = 110项全绿）
+python3 tools/test_v14_architecture.py
+python3 tools/test_servo_upgrades.py
+
+# 2. 离线数字孪生闭环回放 & 参数扫描（无需硬件）
+python3 tools/replay_digital_twin.py logs/servo_20261123_171409.csv
+python3 tools/replay_digital_twin.py logs/servo_20261123_171409.csv --sweep gain=2.55,2.75,3.00
+
+# 3. 交互运行（数字孪生演练 → 低速真机验收 → 完整真机）
+python3 palm_follow_v14.py --sim
+python3 palm_follow_v14.py --no-gripper --gain 1.5 --max-vel 0.15
+python3 palm_follow_v14.py
+```
+
+---
+
+## 稳定定版 v13.0（MIT 底层闭环重构 P0~P4 + 实测位姿感知解耦与上层提速定版）
 
 本版突破了 v12.0「纯位置 MIT 斜坡（~140ms 闭环滞后）」的物理天花板。采用**方案 A（本仓库子类化 `mit_controller_ext.py` + SHA256 版本校验，上游 `rebot_control` 零修改）**，在严格守住 `max_vel ≤ 0.85 m/s`、承重关节 `J2/J3 ≤ 2.0 rad/s`、单 CAN 主机与安全回零全部红线的前提下，分 P0~P4 五个阶段逐级完成系统辨识、底层重构与实机高频验收定稿（配置文件 `config/follow_v13.yaml` + `config/mit_ext.yaml`，已同步至默认 `config/follow.yaml`）。
 
