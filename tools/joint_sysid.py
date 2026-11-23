@@ -32,20 +32,34 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-# 安全硬上限
-MAX_STEP_DEG = 4.0
-MAX_SINE_AMP_DEG = 3.0
-MAX_SINE_PEAK_VEL_RAD_S = 0.80
-LIMIT_SAFETY_MARGIN_DEG = 5.0
-MAX_MOS_TEMP_C = 95.0
-DEFAULT_FREQS_HZ = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0)
+# 安全硬上限（防止辨识激励触发过流、机械碰撞或超速）
+MAX_STEP_DEG = 4.0                # 单次阶跃最大允许幅值（deg）
+MAX_SINE_AMP_DEG = 3.0            # 正弦扫频最大允许幅值（deg）
+MAX_SINE_PEAK_VEL_RAD_S = 0.80    # 正弦扫频峰值角速度硬上限 w*A <= 0.80 rad/s
+LIMIT_SAFETY_MARGIN_DEG = 5.0     # 被测轴距软件限位 q_min/q_max 最小安全余量（deg）
+MAX_MOS_TEMP_C = 95.0             # 实时看护 MOS 温度硬熔断上限（°C）
+DEFAULT_FREQS_HZ = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0)  # 覆盖臂展悬臂共振峰 (1~2Hz) 至带宽滚降区
 
 
 # ─────────────────────────────────────────────────────────────
 # 纯数学辨识函数（可独立离线单测）
 # ─────────────────────────────────────────────────────────────
 def second_order_step_model(t, delay_s, wn_rad_s, zeta, gain=1.0):
-    """标准延迟二阶系统单位阶跃响应 y(t)（支持欠阻尼/临界阻尼/过阻尼）。"""
+    """标准延迟二阶系统单位阶跃响应 y(t)（支持欠阻尼/临界阻尼/过阻尼）。
+
+    对应连续传递函数：
+        G(s) = gain * wn^2 / (s^2 + 2 * zeta * wn * s + wn^2) * exp(-s * delay_s)
+
+    参数:
+        t (array-like): 时间采样序列（单位: s）。
+        delay_s (float): 纯传输/执行延迟 Td（单位: s）。
+        wn_rad_s (float): 无阻尼自然角频率 wn（单位: rad/s，内部下限钳位 1e-3）。
+        zeta (float): 阻尼比（无量纲，内部下限钳位 0.02）。
+        gain (float): 直流稳态增益（默认 1.0）。
+
+    返回:
+        np.ndarray: 与 ``t`` 同形状的阶跃响应序列（tau <= 0 段严格为 0）。
+    """
     t_arr = np.asarray(t, dtype=np.float64)
     tau = t_arr - float(delay_s)
     y = np.zeros_like(t_arr, dtype=np.float64)
@@ -56,13 +70,16 @@ def second_order_step_model(t, delay_s, wn_rad_s, zeta, gain=1.0):
     wn = max(float(wn_rad_s), 1e-3)
     z = max(float(zeta), 0.02)
     if z < 0.999:
+        # 欠阻尼解析解（有阻尼振荡频率 wd = wn * sqrt(1 - zeta^2)）
         wd = wn * math.sqrt(1.0 - z * z)
         env = np.exp(-z * wn * tm)
         ym = 1.0 - env * (np.cos(wd * tm) + (z / math.sqrt(1.0 - z * z)) * np.sin(wd * tm))
     elif z <= 1.001:
+        # 临界阻尼解析解（避免分母 sqrt(|1 - zeta^2|) 数值奇异）
         env = np.exp(-wn * tm)
         ym = 1.0 - env * (1.0 + wn * tm)
     else:
+        # 过阻尼双实极点解析解（极点 -r1, -r2）
         s = math.sqrt(z * z - 1.0)
         r1 = wn * (z - s)
         r2 = wn * (z + s)
@@ -72,7 +89,25 @@ def second_order_step_model(t, delay_s, wn_rad_s, zeta, gain=1.0):
 
 
 def _simulate_filtered_step(t, u_norm, delay_s, wn_rad_s, zeta, gain=1.0):
-    """用输入斜坡 u_norm(t) 与延迟二阶脉冲响应离散卷积，精确兼容 200Hz 有限斜率指令。"""
+    """用输入斜坡 u_norm(t) 与延迟二阶阶跃响应差分卷积，精确兼容 200Hz 有限斜率指令。
+
+    因为 MIT 底层对目标角有斜率限速，实际下发的 ``q_cmd`` 是约 15~30ms 的斜坡而非理想阶跃。
+    根据线性时不变系统叠加原理（离散杜哈梅积分）：
+        y[k] = sum_{m=0..k} du[m] * s[k - m]
+    其中 ``du[m] = u[m] - u[m-1]`` 为每拍指令增量，``s`` 为单位阶跃响应。
+    这样拟合出的 ``delay_s`` 反映真实执行纯滞后，不会把指令斜坡时长误算作延迟。
+
+    参数:
+        t (array-like): 均匀采样时间序列（单位: s）。
+        u_norm (array-like): 归一化后的实际下发指令波形（约从 0 过渡到 1）。
+        delay_s (float): 纯延迟 Td（单位: s）。
+        wn_rad_s (float): 自然角频率 wn（单位: rad/s）。
+        zeta (float): 阻尼比。
+        gain (float): 稳态增益。
+
+    返回:
+        np.ndarray: 卷积预测的归一化关节实际响应序列。
+    """
     t_arr = np.asarray(t, dtype=np.float64)
     u = np.asarray(u_norm, dtype=np.float64)
     if t_arr.size < 4:
@@ -86,9 +121,23 @@ def _simulate_filtered_step(t, u_norm, delay_s, wn_rad_s, zeta, gain=1.0):
 
 
 def analyze_step_response(t, q_cmd, q_act, kp=None, pre_s=0.15):
-    """
-    分析单次阶跃段（包含阶跃前稳态与阶跃后至少 0.6s 响应）。
-    返回 delay_ms, rise_ms, overshoot_pct, settle_ms, ss_gain, fit_{delay_ms, wn_hz, zeta, r2, j_eff, kd_zeta07}。
+    """分析单次阶跃段（包含阶跃前稳态与阶跃后至少 0.6s 响应）并拟合延迟二阶模型。
+
+    物理参数换算关系（忽略摩擦近似刚体关节）：
+        - 等效转动惯量: ``J_eff = kp / wn^2``（单位: kg·m²）
+        - 目标阻尼比 ``zeta = 0.70`` 推荐 MIT 微分阻尼: ``kd_0.7 = 2 * 0.70 * sqrt(kp * J_eff)``
+
+    参数:
+        t (array-like): 采样时间戳序列（单位: s）。
+        q_cmd (array-like): 底层下发指令关节角序列（单位: rad）。
+        q_act (array-like): 200Hz 实测关节角序列（单位: rad）。
+        kp (float | None): 当前关节 MIT 位置刚度（单位: Nm/rad）；提供时推算 ``J_eff`` 与 ``kd_for_zeta_07``。
+        pre_s (float): 阶跃前基线稳态窗口时长（单位: s，默认 0.15s）。
+
+    返回:
+        dict: 包含 ``ok`` 标志、指令/实际阶跃幅值（deg）、稳态增益 ``ss_gain``、
+            10%/50% 延迟与 10%~90% 上升时间（ms）、超调百分比、5% 稳定时间（ms）
+            以及非线性最小二乘拟合结果字典 ``fit``（含 ``delay_ms, wn_hz, zeta, gain, r2, j_eff_kgm2, kd_for_zeta_07``）。
     """
     t = np.asarray(t, dtype=np.float64)
     qc = np.asarray(q_cmd, dtype=np.float64)
@@ -98,6 +147,7 @@ def analyze_step_response(t, q_cmd, q_act, kp=None, pre_s=0.15):
     if t.size < 20:
         return {"ok": False, "reason": "样本不足"}
 
+    # 用段首 pre_s 与段尾 20% 的中位数估计阶跃前后稳态角，免疫偶发噪点
     t = t - t[0]
     n_pre = max(5, int(np.searchsorted(t, pre_s)))
     if n_pre >= t.size - 10:
@@ -112,13 +162,15 @@ def analyze_step_response(t, q_cmd, q_act, kp=None, pre_s=0.15):
     if abs(cmd_delta) < np.deg2rad(0.3):
         return {"ok": False, "reason": "指令阶跃幅值过小"}
 
+    # u_norm/y_norm 以指令幅值归一化（用于拟合稳态增益），y_ss 以实际稳态幅值归一化（用于时域指标）
     u_norm = (qc - qc0) / cmd_delta
     y_norm = (qa - qa0) / cmd_delta
     ss_gain = float(act_delta / cmd_delta)
     y_ss = (qa - qa0) / act_delta if abs(act_delta) > 1e-6 else y_norm
 
-    # 指令与实际穿过 10% / 50% / 90% 的时刻
+    # 指令与实际穿过 10% / 50% / 90% 的时刻（线性插值消除 5ms 采样栅格量化误差）
     def _first_cross(sig, level):
+        """线性插值求信号首次上穿给定阈值 level 的精确时刻（s）。"""
         idx = np.where(sig >= level)[0]
         if idx.size == 0:
             return None
@@ -157,11 +209,13 @@ def analyze_step_response(t, q_cmd, q_act, kp=None, pre_s=0.15):
         t_fit = t - t[0]
 
         def _resid(p):
+            """非线性最小二乘残差：p = [delay_s, wn_rad_s, zeta, gain]。"""
             pred = _simulate_filtered_step(t_fit, u_norm, p[0], p[1], p[2], gain=p[3])
             return pred - y_norm
 
         p0 = [max(0.005, (delay_10_ms or 15.0) / 1000.0 * 0.6), 15.0, 0.6,
               float(np.clip(ss_gain, 0.5, 1.5))]
+        # 参数物理上下界：delay∈[0, 0.25]s, wn∈[3, 120]rad/s, zeta∈[0.08, 5.0], gain∈[0.5, 1.5]
         bounds = ([0.0, 3.0, 0.08, 0.5], [0.25, 120.0, 5.0, 1.5])
         res = least_squares(_resid, p0, bounds=bounds, max_nfev=400)
         d_s, wn_rad, zeta, gain_f = [float(v) for v in res.x]
@@ -170,6 +224,7 @@ def analyze_step_response(t, q_cmd, q_act, kp=None, pre_s=0.15):
         ss_tot = float(np.sum((y_norm - np.mean(y_norm)) ** 2))
         r2 = 1.0 - ss_res / max(ss_tot, 1e-12)
         wn_hz = wn_rad / (2.0 * math.pi)
+        # 由刚度 kp 与自然频率 wn 反推等效惯量 J_eff，并给出 zeta=0.70 临界偏欠阻尼推荐 kd
         j_eff = (float(kp) / (wn_rad * wn_rad)
                  if (kp is not None and kp > 0.0 and wn_rad > 1e-3) else None)
         kd_zeta07 = (2.0 * 0.70 * math.sqrt(float(kp) * j_eff)
@@ -202,9 +257,24 @@ def analyze_step_response(t, q_cmd, q_act, kp=None, pre_s=0.15):
 
 
 def analyze_sine_segment(t, q_cmd, q_act, freq_hz, discard_cycles=1.0):
-    """
-    锁相（最小二乘正弦投影）提取单频点的幅值比 |H(jw)|、相位滞后（度）与等效延迟（ms）。
-    天然免疫直流重力静差和宽带噪声。
+    """锁相（正交最小二乘正弦投影）提取单频点的幅值比 |H(jw)|、相位滞后（度）与等效延迟（ms）。
+
+    将指令与实测波形分别投影到基函数 ``[1, cos(wt), sin(wt)]`` 上：
+    - 常数项 ``c0`` 自动吸收直流重力静差与中心角偏置；
+    - 复相量比 ``H(jw) = z_act / z_cmd`` 对宽带测量噪声与高次谐波天然免疫；
+    - 丢弃段首 ``discard_cycles`` 个周期以跳过起振暂态与淡入包络。
+
+    参数:
+        t (array-like): 采样时间戳序列（单位: s）。
+        q_cmd (array-like): 指令关节角序列（单位: rad）。
+        q_act (array-like): 实测关节角序列（单位: rad）。
+        freq_hz (float): 当前正弦激励频率（单位: Hz）。
+        discard_cycles (float): 段首丢弃的暂态周期数（默认 1.0）。
+
+    返回:
+        dict: 包含 ``ok``、频点 ``freq_hz``、指令/实际基波幅值（deg）、幅值比 ``mag_ratio``、
+            增益 ``mag_db``（dB）、展开后的相位滞后 ``phase_deg``（deg，负值表示滞后）、
+            等效延迟 ``equiv_delay_ms``（ms）及基波拟合优度 ``r2``。
     """
     t = np.asarray(t, dtype=np.float64)
     qc = np.asarray(q_cmd, dtype=np.float64)
@@ -222,7 +292,7 @@ def analyze_sine_segment(t, q_cmd, q_act, freq_hz, discard_cycles=1.0):
     tm, qcm, qam = t[mask], qc[mask], qa[mask]
 
     w = 2.0 * math.pi * float(freq_hz)
-    # 拟合 c0 + a*cos(wt) + b*sin(wt)
+    # 拟合 c0 + a*cos(wt) + b*sin(wt)，其中 c0 吸收静态重力下垂等直流偏置
     A = np.column_stack([np.ones_like(tm), np.cos(w * tm), np.sin(w * tm)])
     coef_c, *_ = np.linalg.lstsq(A, qcm, rcond=None)
     coef_a, *_ = np.linalg.lstsq(A, qam, rcond=None)
@@ -237,12 +307,12 @@ def analyze_sine_segment(t, q_cmd, q_act, freq_hz, discard_cycles=1.0):
     H = z_act / z_cmd
     mag = abs(H)
     phase_rad = math.atan2(H.imag, H.real)
-    # 相位滞后展开到 (-2*pi, 0.35]（允许高频滞后超过 180°）
+    # 相位滞后展开到 (-2*pi, 0.35]（允许高频滞后超过 180°，同时容忍轻微超前误差）
     if phase_rad > 0.35:
         phase_rad -= 2.0 * math.pi
     phase_deg = math.degrees(phase_rad)
     equiv_delay_ms = (-phase_rad / w) * 1000.0
-    # 拟合质量（基波占比）
+    # 拟合质量（基波占比）：R2 越接近 1 说明非线性/摩擦畸变越小
     pred_a = A @ coef_a
     ss_res = float(np.sum((qam - pred_a) ** 2))
     ss_tot = float(np.sum((qam - np.mean(qam)) ** 2))
@@ -261,7 +331,18 @@ def analyze_sine_segment(t, q_cmd, q_act, freq_hz, discard_cycles=1.0):
 
 
 def safe_sine_amp_rad(amp_deg, freq_hz):
-    """按硬幅值上限与峰值速度上限 0.80 rad/s 计算安全扫频幅值（弧度）。"""
+    """按硬幅值上限与峰值速度上限 0.80 rad/s 计算安全扫频幅值（弧度）。
+
+    高频段自动按 ``A <= MAX_SINE_PEAK_VEL_RAD_S / (2*pi*f)`` 收缩幅值，防止高速正弦
+    引发过流或触发底层限速截断（削波会破坏正弦基波假设）。
+
+    参数:
+        amp_deg (float): 期望扫频幅值（单位: deg）。
+        freq_hz (float): 激励频率（单位: Hz）。
+
+    返回:
+        float: 钳位后的安全正弦幅值（单位: rad）。
+    """
     amp = np.deg2rad(min(float(amp_deg), MAX_SINE_AMP_DEG))
     vel_cap = MAX_SINE_PEAK_VEL_RAD_S / max(2.0 * math.pi * float(freq_hz), 1e-6)
     return float(min(amp, vel_cap))
@@ -271,6 +352,14 @@ def safe_sine_amp_rad(amp_deg, freq_hz):
 # 离线仿真自检（不访问硬件）
 # ─────────────────────────────────────────────────────────────
 def run_offline_simulation():
+    """用已知参数的延迟二阶合成系统验证阶跃拟合与扫频锁相算法精度（零硬件依赖）。
+
+    合成真值：``delay = 15.0 ms``、``wn = 1.80 Hz``、``zeta = 0.35``、``kp = 72.0 Nm/rad``，
+    并在正弦响应中叠加直流重力偏置验证锁相抗直流偏移能力。
+
+    返回:
+        int: 固定返回 0。
+    """
     dt = 0.005
     t = np.arange(0.0, 1.4, dt)
     u = np.clip((t - 0.20) / 0.02, 0.0, 1.0)
@@ -309,6 +398,18 @@ def run_offline_simulation():
 # 实机安全激励流程
 # ─────────────────────────────────────────────────────────────
 def _check_safety_guard(robot, q_center, joint_idx, max_dev_rad):
+    """实机激励期高频安全看护：监测 MOS 过温与被测关节异常偏离。
+
+    参数:
+        robot (RebotAdapter): 机械臂适配器。
+        q_center (np.ndarray): 激励基准中心角（6 轴，单位: rad）。
+        joint_idx (int): 当前被测关节 0-based 索引（0~5）。
+        max_dev_rad (float): 允许偏离中心角的最大绝对值（单位: rad，通常为幅值 + 6°）。
+
+    异常:
+        RuntimeError: 当任意电机 MOS 温度 ``>= MAX_MOS_TEMP_C`` 或被测关节偏离超出
+            ``max_dev_rad`` 时抛出，触发外层 ``finally`` 恢复限速并安全回零。
+    """
     fb = robot.get_feedback_state(max_age_s=0.15)
     if fb is None or not fb["valid"]:
         return
@@ -323,6 +424,15 @@ def _check_safety_guard(robot, q_center, joint_idx, max_dev_rad):
 
 
 def _sleep_guarded(robot, duration_s, q_center, joint_idx, max_dev_rad):
+    """带 50Hz 安全看护轮询的等待函数，替代裸 ``time.sleep``。
+
+    参数:
+        robot (RebotAdapter): 机械臂适配器。
+        duration_s (float): 期望等待时长（单位: s）。
+        q_center (np.ndarray): 激励基准中心角（6 轴，单位: rad）。
+        joint_idx (int): 当前被测关节 0-based 索引（0~5）。
+        max_dev_rad (float): 允许最大角度偏离（单位: rad）。
+    """
     t_end = time.monotonic() + float(duration_s)
     while time.monotonic() < t_end:
         _check_safety_guard(robot, q_center, joint_idx, max_dev_rad)
@@ -331,6 +441,25 @@ def _sleep_guarded(robot, duration_s, q_center, joint_idx, max_dev_rad):
 
 def _run_joint_step(robot, q_center, joint_idx, step_rad, kp, hold_s=1.0,
                     step_speed_rad_s=1.8):
+    """对单个关节依次执行正向（``pos``）与负向（``neg``）小幅阶跃并录波辨识。
+
+    其余 5 个非被测轴保持在 ``q_center`` 且限速压至 0.5 rad/s；被测轴临时放宽至
+    ``min(step_speed_rad_s, 1.8) rad/s`` 使斜坡在 ~20ms 内完成。无论成败 ``finally``
+    都会回归中心位并恢复原有限速。
+
+    参数:
+        robot (RebotAdapter): 机械臂适配器。
+        q_center (np.ndarray): 6 轴中心位姿（单位: rad）。
+        joint_idx (int): 被测关节索引（0~5）。
+        step_rad (float): 阶跃幅值（单位: rad）。
+        kp (float): 被测轴当前 MIT 位置刚度（单位: Nm/rad）。
+        hold_s (float): 阶跃后稳态保持采样时长（单位: s，默认 1.0s）。
+        step_speed_rad_s (float): 被测轴阶跃斜坡限速上限（单位: rad/s，默认 1.8）。
+
+    返回:
+        tuple[dict, dict]: ``(results, raw_segments)``，分别包含 ``pos/neg`` 两向分析指标
+            与原始 200Hz 波形字典（供 ``.npz`` 归档）。
+    """
     max_dev = abs(step_rad) + np.deg2rad(6.0)
     # 临时提高被测轴斜坡限速，使指令阶跃本身在 ~20ms 内完成（仍远低于 HARD_MAX_JOINT_SPEED）
     limits = np.full(6, 0.5, dtype=np.float64)
@@ -346,6 +475,7 @@ def _run_joint_step(robot, q_center, joint_idx, step_rad, kp, hold_s=1.0,
             robot.set_joint_targets_direct(q_center)
             _sleep_guarded(robot, 0.35, q_center, joint_idx, max_dev)
 
+            # 录制 0.20s 阶跃前基线 + hold_s 阶跃响应
             robot.start_feedback_recording()
             _sleep_guarded(robot, 0.20, q_center, joint_idx, max_dev)
             robot.set_joint_targets_direct(q_step)
@@ -374,6 +504,26 @@ def _run_joint_step(robot, q_center, joint_idx, step_rad, kp, hold_s=1.0,
 
 def _run_joint_sine(robot, q_center, joint_idx, amp_deg, freqs_hz,
                     with_vel_ff=False):
+    """对单个关节按离散频点列表执行 100Hz 正弦扫频激励并提取幅相频响。
+
+    支持两种激励模式用于 P0 vs P1 A/B 对比：
+    - ``with_vel_ff=False``（P0 基线）：仅发送位置参考 ``q_des``，底层 ``dq_des = 0``；
+    - ``with_vel_ff=True``（P1 速度前馈）：按 100Hz 积分器约定将 ``q_des`` 对齐到区间末端
+      ``elapsed + dt``、解析速度 ``dq_des`` 取区间中点 ``elapsed + 0.5*dt``，与 200Hz FOH
+      插值器无相位失配地配合。
+
+    参数:
+        robot (RebotAdapter): 机械臂适配器。
+        q_center (np.ndarray): 6 轴中心位姿（单位: rad）。
+        joint_idx (int): 被测关节索引（0~5）。
+        amp_deg (float): 目标扫频幅值（单位: deg，内部经 ``safe_sine_amp_rad`` 速度限幅）。
+        freqs_hz (Sequence[float]): 扫频离散频率列表（单位: Hz）。
+        with_vel_ff (bool): 是否启用 P1 解析速度前馈透传。
+
+    返回:
+        tuple[list[dict], dict]: ``(freq_results, raw_sines)``，分别为各频点锁相辨识结果
+            与原始 200Hz 波形字典。
+    """
     limits = np.full(6, 0.5, dtype=np.float64)
     limits[joint_idx] = 1.5
     robot.override_joint_speed_limits(limits)
@@ -384,6 +534,7 @@ def _run_joint_sine(robot, q_center, joint_idx, amp_deg, freqs_hz,
         for f in freqs_hz:
             amp_rad = safe_sine_amp_rad(amp_deg, f)
             max_dev = amp_rad + np.deg2rad(6.0)
+            # 低频保证至少 3.5 个周期（扣 1 周期暂态后仍余 >=2.5 周期），高频封顶 6 周期控温
             cycles = max(3.5, min(6.0, float(f) * 2.0))
             duration_s = cycles / float(f)
             robot.set_joint_targets_direct(q_center)
@@ -392,7 +543,7 @@ def _run_joint_sine(robot, q_center, joint_idx, amp_deg, freqs_hz,
             robot.start_feedback_recording()
             t0 = time.monotonic()
             next_t = t0
-            dt = 0.01  # 100Hz 喂正弦参考
+            dt = 0.01  # 100Hz 喂正弦参考（模拟视觉伺服控制线程更新节拍）
             w = 2.0 * math.pi * float(f)
             while True:
                 now = time.monotonic()
@@ -445,6 +596,18 @@ def _run_joint_sine(robot, q_center, joint_idx, amp_deg, freqs_hz,
 
 
 def main():
+    """命令行入口：执行离线仿真自检或实机逐轴小幅阶跃/正弦扫频系统辨识。
+
+    安全红线:
+        - 参数校验严格限制阶跃 ``<= 4.0°``、扫频幅值 ``<= 3.0°``；
+        - 实机模式默认要求交互式输入 ``yes`` 二次确认，并校验基准位姿水平半径 ``<= 0.38m``、
+          高度 ``z >= 0.08m`` 及各被测轴距软件限位至少保留 5° 余量；
+        - 退出路径（含 Ctrl+C 或看护异常）始终先恢复关节限速，再执行 ``hold() -> stop()``
+          缓慢回零后失能。
+
+    返回:
+        int: 进程退出码（0 表示成功或用户取消，1 表示参数非法、环境/位姿不满足安全条件）。
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--simulate", action="store_true",
                         help="离线仿真自检（不访问硬件）")
@@ -534,7 +697,7 @@ def main():
             robot.move_to_joints(q_center, speed_deg_s=15.0, wait=True, timeout=20.0)
             time.sleep(0.5)
 
-        # 读取真实基准位姿与重力核验
+        # 读取真实基准位姿与重力核验，并同步水平伸展半径供 P3 阻尼调度生效
         fk = robot.forward_kinematics()
         tcp_r = float(np.hypot(fk["position"][0], fk["position"][1]))
         if hasattr(robot, "set_reach_radius"):
@@ -574,6 +737,7 @@ def main():
         if hasattr(robot.io.arm, "set_vel_ff_enable"):
             robot.io.arm.set_vel_ff_enable(bool(args.with_vel_ff))
 
+        # 逐轴执行阶跃与正弦扫频，每轴激励前均检查距软件限位的双向安全余量
         for j_num in args.joints:
             ji = j_num - 1
             need = max(step_rad, np.deg2rad(args.sine_deg)) + margin_rad
@@ -657,6 +821,7 @@ def main():
         print("=" * 70)
         return 0
     finally:
+        # 硬件安全红线：先还原被测轴临时限速，再 hold 稳住姿态并通过 stop() 安全回零失能
         if robot is not None:
             print("[辨识] 执行安全停机（恢复限速 → 保持 → 缓慢回零 → 失能）...")
             try:

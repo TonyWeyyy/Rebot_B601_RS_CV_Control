@@ -27,13 +27,27 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-MAX_VERIFY_MOS_C = 85.0
+# 安全监控阈值与默认渐进重力补偿比例档位
+MAX_VERIFY_MOS_C = 85.0  # 验证期 MOS 温度硬熔断上限（°C），低于正式运行热降速起点 90°C
 DEFAULT_SCALES = (0.0, 0.35, 0.60, 0.80)
 
 
 def check_sag_monotonic_safety(base_sag_deg, cur_sag_deg, tol_deg=0.45):
-    """核验主要承载轴（J3/J4）下垂是否改善而未反向放大。返回 (ok, reason)。"""
-    for j in (2, 3):  # J3, J4
+    """核验主要承载轴（J3/J4）下垂是否改善而未反向放大。
+
+    用于捕获重力模型符号反号或负载参数严重偏大导致的反向推力：在悬臂基准下垂角
+    ``|base_sag| >= 0.8°`` 的关节上，开启正向重力补偿后静态下垂绝对值应单调缩小；
+    若反而超出基准 ``tol_deg`` 以上，则立即熔断并要求切回 ``tau_ff = 0``。
+
+    参数:
+        base_sag_deg (Sequence[float]): ``scale = 0.0`` 基准档位的 6 轴静态下垂角（单位: deg）。
+        cur_sag_deg (Sequence[float]): 当前补偿档位的 6 轴静态下垂角（单位: deg）。
+        tol_deg (float): 允许的测量抖动容差（单位: deg，默认 0.45°）。
+
+    返回:
+        tuple[bool, str]: ``(是否安全, 判定说明)``，不安全时返回具体异常轴与角度变化。
+    """
+    for j in (2, 3):  # J3, J4（悬臂姿态下最显著的重力承载关节）
         b = abs(float(base_sag_deg[j]))
         c = abs(float(cur_sag_deg[j]))
         if b >= 0.8 and c > b + tol_deg:
@@ -43,6 +57,19 @@ def check_sag_monotonic_safety(base_sag_deg, cur_sag_deg, tol_deg=0.45):
 
 
 def main():
+    """命令行入口：在悬臂静止位姿下分级验证 P3 重力前馈补偿与反号熔断保护。
+
+    核心步骤:
+        1. 校验 ``--scales`` 均位于 ``[0.0, 0.90]`` 安全范围，防止过补偿失稳；
+        2. 先强制关闭运行时重力前馈，以 15°/s 移至 ``home`` 或 ``extended`` 悬臂位姿；
+        3. 逐档平滑切换 J2/J3/J4 重力补偿系数（J1/J5/J6 恒为 0），在每档后半段采样稳态
+           中位角度与力矩，实时监测 MOS 温度及下垂单调改善安全门；
+        4. 保存 JSON 核验报告，并在 ``finally`` 中严格执行 ``hold() -> stop()`` 安全回零
+           （回零过程由 ``mit_controller_ext.cradle_zero_fade`` 平滑淡出重力矩至 0 Nm）。
+
+    返回:
+        int: 进程退出码（0 表示全档通过，1 表示参数非法、MIT 扩展未启用或安全熔断）。
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pose", choices=("home", "extended"), default="home",
                         help="测试悬臂位姿：home（默认）或 extended（温和前伸 r≈0.19m）")
@@ -52,10 +79,12 @@ def main():
                         help="每档稳态观察时长 (s)，默认 2.0s")
     args = parser.parse_args()
 
+    # 禁止超过 0.90 的补偿比例，预留 10% 余量防止模型误差引起负刚度抬头漂移
     if any(s < 0.0 or s > 0.90 for s in args.scales):
         print("❌ --scales 必须在 [0.0, 0.90] 范围内")
         return 1
 
+    # 延迟导入硬件适配器，允许离线单测直接导入 check_sag_monotonic_safety
     from rebot_adapter import RebotAdapter
 
     robot = None
@@ -74,6 +103,7 @@ def main():
             q_home = np.array(json.load(stream)["home_joint_pos"], dtype=np.float64)
         q_target = q_home.copy()
         if args.pose == "extended":
+            # 在 HOME 基础上温和前伸（J2/J3 前倾、J4 抬头），各轴距软限位保留至少 10° 余量
             q_target[1] = min(float(robot.q_max[1]) - np.deg2rad(10.0),
                               float(q_home[1]) + np.deg2rad(20.0))
             q_target[2] = max(float(robot.q_min[2]) + np.deg2rad(10.0),
@@ -86,10 +116,12 @@ def main():
               f"{np.rad2deg(q_target).round(1).tolist()}° ...")
         robot.move_to_joints(q_target, speed_deg_s=15.0, wait=True, timeout=20.0)
         fk = robot.forward_kinematics()
+        # 计算水平臂展半径并同步给底层增益调度器，用于观察当前伸展态下生效的 kd
         tcp_r = float(np.hypot(fk["position"][0], fk["position"][1]))
         robot.set_reach_radius(tcp_r)
         time.sleep(0.6)
 
+        # 读取静态指令角与裸 URDF / 含 Gemini 2 相机负载两套 Pinocchio 重力矩预测值作对照
         q_cmd = robot.get_command_pos()
         tau_urdf = robot.gravity_torque(q_target, include_payload=False)
         tau_full = robot.gravity_torque(q_target, include_payload=True)
@@ -103,9 +135,10 @@ def main():
         abort_reason = ""
 
         for s in args.scales:
+            # 仅对重力承载轴 J2/J3/J4 施加补偿比例；J1 竖直回转轴与腕部 J5/J6 恒为 0
             scale_vec = [0.0, s, s, s, 0.0, 0.0]
             arm.set_gravity_ff_runtime(enabled=(s > 0.0), scale=scale_vec)
-            # 等待斜率限速与机械响应平稳
+            # 等待斜率限速（30 Nm/s）与机械响应平稳，全程 20Hz 轮询温升
             t_wait_end = time.monotonic() + max(0.8, args.hold_s)
             samples_q = []
             samples_tau = []
@@ -122,7 +155,7 @@ def main():
                         aborted = True
                         abort_reason = f"MOS 温度过高 ({tmos_peak:.1f}°C)"
                         break
-                # 后半段采集稳态均值
+                # 后半段采集稳态均值（跳过前半段力矩斜坡过渡与机械微振）
                 if t_wait_end - time.monotonic() <= args.hold_s * 0.5:
                     samples_q.append(fb["q"].copy())
                     samples_tau.append(fb["tau"].copy())
@@ -138,6 +171,7 @@ def main():
             tau_ff = stats.get("tau_ff_nm", [0.0] * 6)
             cur_kd = stats.get("cur_kd", [])
 
+            # 首档（通常为 scale=0.0）记录无补偿基准下垂；后续各档执行反号恶化熔断核验
             if base_sag_deg is None:
                 base_sag_deg = sag_deg.copy()
             else:
@@ -190,6 +224,7 @@ def main():
         print("=" * 70)
         return 1 if aborted else 0
     finally:
+        # 硬件安全红线：先 hold 稳姿，再由 robot.stop() 缓慢回零并自动淡出重力前馈后失能
         if robot is not None:
             print("[P3核验] 执行安全停机（保持 → 缓慢回零并自动淡出重力矩 → 失能）...")
             try:

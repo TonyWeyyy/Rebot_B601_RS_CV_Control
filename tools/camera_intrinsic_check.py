@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 """
-相机内参/畸变裁决测试 —— 纯相机，不动机械臂
-==============================================
-诊断已确认：PnP 重投影误差 89px（应 <2px），说明
-「检测到的角点像素」与「内参 K + 畸变 dist」几何模型不自洽。
+Orbbec Gemini 2 相机内参/畸变模型裁决工具 —— 纯相机测试，不驱动机械臂。
+========================================================================
+背景与用途：
+    当手眼标定诊断发现 PnP 重投影误差异常（例如高达 ~89 px，正常应 <2 px）时，
+    说明「图像角点像素」与「内参矩阵 K + 畸变系数 dist」所描述的成像模型不自洽。
+    特别地，Orbbec SDK v2 上报的畸变参数（k1/k2 等）不适用于 OpenCV Brown 模型，
+    项目最终结论是在 gemini2_camera.py 中强制 `dist_coeffs = np.zeros(5)`。
 
-本脚本对同一帧图像用 3 种假设分别跑 solvePnP，裁决哪种是对的：
-  假设 A：K + SDK 给的畸变系数（当前代码用法）
-  假设 B：K + 零畸变（SDK 可能已输出过去畸变的图，或畸变字段语义不对）
-  假设 C：K×2 + 零畸变（内参实际对应 1280 宽、图像却是 640 宽的情形）
+    本脚本在同一帧最清晰的 ArUco 标记图像上，用 3 种内参/畸变假设分别运行
+    cv2.solvePnP（IPPE_SQUARE），并与硬件 D2C 对齐后的深度图距离交叉验证：
+        假设 A：K + SDK 上报畸变系数（排查畸变模型语义冲突）
+        假设 B：K + 零畸变（验证去畸变输出或禁用畸变系数）
+        假设 C：K×2 + 零畸变（排查内参对应 1280 宽而彩色图实际为 640 宽的分辨率错配）
 
-判据（同时满足才算健康）：
-  1. 重投影误差 < 2 px
-  2. PnP 距离 ≈ 深度图中位数（差 < 15%）
+健康判据（两项同时满足才算通过）：
+    1. 4 角点平均重投影误差 < 2.0 px
+    2. PnP 估计距离 ‖t_cam_marker‖ 与深度图窗口中位数相对偏差 < 15%
 
-用法：把 ArUco 标记（4X4_50, ID=0）放在相机正前方 20~40cm，
-      python camera_intrinsic_check.py
-      会自动采 30 帧取最稳定的一帧做裁决，并打印修复建议。
+用法：
+    将 ArUco 标记（DICT_4X4_50, ID=0，边长 100mm）置于相机正前方 20~40cm：
+        python tools/camera_intrinsic_check.py
+    脚本自动采集 30 帧有效检测，选取标记像素宽度最大的一帧做裁决并打印修复建议。
 """
 
 import os
@@ -29,13 +34,30 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from gemini2_camera import Gemini2Camera
 
+# ArUco 标记字典与尺寸约定（单位：m）
 ARUCO_DICT = cv2.aruco.DICT_4X4_50
 EXPECTED_ID = 0
-MARKER_SIZE = 0.10   # 米；尺寸错误不影响重投影误差，只影响 z 的比例，
-                     # z 与深度的一致性会顺带暴露尺寸问题
+MARKER_SIZE = 0.10   # 黑边外边长（米）；尺寸错误不影响重投影误差，只缩放 z，
+                     # 因此 PnP z 与深度图一致性会顺带暴露尺寸写错问题
 
 
 def solve_and_score(obj_pts, img_pts, K, dist):
+    """在给定内参与畸变假设下求解正方形 ArUco 标记位姿并计算重投影误差。
+
+    使用 cv2.SOLVEPNP_IPPE_SQUARE 专为共面正方形标记求解 T_camera_marker，
+    随后将 4 个 3D 角点投影回像素平面并计算平均欧氏像素误差。
+
+    参数:
+        obj_pts (np.ndarray): (4, 3) 标记局部坐标系 3D 角点（单位：m，Z=0 平面）。
+        img_pts (np.ndarray): (4, 2) 检测到的图像 2D 角点像素坐标（单位：px）。
+        K (np.ndarray): 3×3 相机内参矩阵（float64，单位：px）。
+        dist (np.ndarray | None): 畸变系数向量；传 None 表示零畸变假设。
+
+    返回:
+        tuple[float, np.ndarray] | None: 求解失败返回 None；成功返回
+            (reproj_px, tvec)，其中 reproj_px 为平均重投影误差（单位：px），
+            tvec 为形状 (3,) 的标记原点在相机系下的平移向量（单位：m）。
+    """
     ok, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, K, dist,
                                   flags=cv2.SOLVEPNP_IPPE_SQUARE)
     if not ok:
@@ -46,6 +68,7 @@ def solve_and_score(obj_pts, img_pts, K, dist):
 
 
 def main():
+    """主流程：采集 30 帧 ArUco 图像，选出最优帧并在 3 种内参假设下完成重投影与深度一致性裁决。"""
     cam = Gemini2Camera()
     K = cam.camera_matrix.astype(np.float64)
     dist_sdk = cam.dist_coeffs.astype(np.float64)
@@ -53,6 +76,7 @@ def main():
 
     aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT)
     detector = cv2.aruco.ArucoDetector(aruco_dict, cv2.aruco.DetectorParameters())
+    # OpenCV ArUco 角点顺序为：左上 → 右上 → 右下 → 左下（标记局部系，单位：m）
     s = MARKER_SIZE / 2.0
     obj_pts = np.array([[-s, s, 0], [s, s, 0], [s, -s, 0], [-s, -s, 0]],
                        dtype=np.float32)
@@ -74,6 +98,7 @@ def main():
         if len(m) == 0:
             continue
         img_pts = corners[m[0]].reshape(4, 2).astype(np.float32)
+        # 选取标记像素宽度最大的帧（视角最正/最近，角点定位信噪比最高）
         width_px = float(np.linalg.norm(img_pts[0] - img_pts[1]))
         n += 1
         if best is None or width_px > best[0]:
@@ -87,15 +112,16 @@ def main():
     width_px, img_pts, depth_raw, scale, color = best
     print(f"标记图像宽度: {width_px:.0f} px")
 
-    # 标记中心的深度真值（用角点质心像素，与 PnP 无关，最可靠）
+    # 标记中心的深度真值（用角点质心像素在 13×13 邻域取有效深度中位数，与 PnP 独立）
     cu, cv_ = img_pts.mean(axis=0).astype(int)
     h, w = depth_raw.shape
     win = depth_raw[max(0,cv_-6):cv_+7, max(0,cu-6):cu+7].astype(np.float32) * scale
-    win = win[(win > 0.15) & (win < 2.0)]
+    win = win[(win > 0.15) & (win < 2.0)]  # 过滤无效零值及超出 Gemini 2 近距有效范围的点
     z_depth = float(np.median(win)) if len(win) > 10 else None
     print(f"深度图测得标记距离: {z_depth*1000:.0f} mm" if z_depth
           else "深度图该位置无有效值（太近/反光）")
 
+    # 构造假设 C 所需的 2 倍缩放内参（测试 1280 vs 640 宽度错配）
     K2 = K.copy(); K2[0, 0] *= 2; K2[1, 1] *= 2; K2[0, 2] *= 2; K2[1, 2] *= 2
     hypotheses = [
         ("A: K + SDK畸变（现状）", K, dist_sdk),
@@ -113,6 +139,7 @@ def main():
         reproj, tvec = r
         z_pnp = float(np.linalg.norm(tvec))
         dz = abs(z_pnp - z_depth) / z_depth * 100 if z_depth else float('nan')
+        # 双判据联合判定：几何重投影精度 + 绝对尺度一致性
         ok = reproj < 2.0 and (z_depth is None or dz < 15)
         results.append((name, ok, reproj, z_pnp))
         print(f"{name:<28}{reproj:>10.2f}{z_pnp*1000:>12.0f}"

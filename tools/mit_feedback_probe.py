@@ -35,7 +35,30 @@ sys.path.insert(0, ROOT)
 
 def evaluate_probe_metrics(mode_a, mode_b, q_cache_rad, q_0x7019_rad,
                            q_cmd_rad, tau_act, tau_pin, kp):
-    """纯数学评估函数（可离线单测）：核对位置精度、刷新率与重力矩符号/比例。"""
+    """纯数学评估函数（可离线单测）：核对位置精度、刷新率与重力矩符号/比例。
+
+    参数:
+        mode_a (dict): Mode A（关闭 ``poll_feedback_once``）采样统计字典，含
+            ``valid_ratio``、``period_p99_ms``、``change_ratio`` 等字段。
+        mode_b (dict): Mode B（每拍调用 ``poll_feedback_once``）采样统计字典。
+        q_cache_rad (array-like): 200Hz 反馈缓存中位关节角（6 轴，单位: rad）。
+        q_0x7019_rad (array-like): 同步 ``0x7019`` 寄存器读取的参考关节角（6 轴，单位: rad）。
+        q_cmd_rad (array-like): 控制器当前下发的目标指令关节角（6 轴，单位: rad）。
+        tau_act (array-like): 电机上报的静态实测力矩中位数（6 轴，单位: Nm）。
+        tau_pin (array-like): Pinocchio 动力学模型预测的静态重力力矩（6 轴，单位: Nm）。
+        kp (array-like): 6 轴 MIT 位置刚度系数（单位: Nm/rad）。
+
+    返回:
+        dict: 包含位置偏差（deg）、实测/理论下垂角（deg）、逐轴重力符号/比例核对列表、
+            推荐配置标志（``recommend_feedback_poll_once`` / ``recommend_feedback_trusted``）
+            以及可读结论字符串 ``verdict``。
+
+    判定准则:
+        - 位置精度门限：六轴缓存与 ``0x7019`` 最大绝对误差 ``<= 0.30°``；
+        - 有效性门限：``valid_ratio >= 0.95``；
+        - 实时性门限：200Hz 环路周期 ``p99 <= 8.0 ms``（标称 5.0 ms）；
+        - 刷新活性门限：静态数值变化率 ``change_ratio >= 0.15``。
+    """
     q_cache = np.asarray(q_cache_rad, dtype=np.float64)
     q_ref = np.asarray(q_0x7019_rad, dtype=np.float64)
     q_cmd = np.asarray(q_cmd_rad, dtype=np.float64)
@@ -43,9 +66,13 @@ def evaluate_probe_metrics(mode_a, mode_b, q_cache_rad, q_0x7019_rad,
     tau_p = np.asarray(tau_pin, dtype=np.float64)
     kp_arr = np.asarray(kp, dtype=np.float64)
 
+    # 缓存角度 vs 0x7019 寄存器同步读取基准角度的逐轴误差（转为度便于人工判读）
     pos_diff_deg = np.rad2deg(q_cache - q_ref)
     max_pos_diff_deg = (float(np.max(np.abs(pos_diff_deg)))
                         if np.all(np.isfinite(pos_diff_deg)) else math.inf)
+    # 静态重力下垂对比：
+    # - 实测下垂 = 指令角 - 实际角（MIT PD 稳态下 kp*(q_cmd - q_act) ≈ tau_gravity）
+    # - 理论下垂 = Pinocchio 重力矩 / kp（对 kp 做 1e-6 下界保护防除零）
     sag_meas_deg = np.rad2deg(q_cmd - q_ref)
     sag_pred_deg = np.rad2deg(tau_p / np.maximum(kp_arr, 1e-6))
 
@@ -74,6 +101,7 @@ def evaluate_probe_metrics(mode_a, mode_b, q_cache_rad, q_0x7019_rad,
             "sign_match": sign_match,
         })
 
+    # 提取 Mode A / Mode B 关键健康指标，准备四分支推荐决策
     a_valid = bool(mode_a.get("valid_ratio", 0.0) >= 0.95)
     b_valid = bool(mode_b.get("valid_ratio", 0.0) >= 0.95)
     a_p99 = mode_a.get("period_p99_ms")
@@ -94,6 +122,7 @@ def evaluate_probe_metrics(mode_a, mode_b, q_cache_rad, q_0x7019_rad,
         rec_trusted = True
         verdict = "PASS_MODE_B: 需启用 feedback_poll_once=true 以实时刷新，且耗时与精度达标，可启用 feedback_trusted=true"
     elif pos_ok and (a_valid or b_valid):
+        # 静态下编码器与力矩噪声极小时 change_ratio 可能偏低，不直接判 FAIL，提示结合动态录波复核
         rec_poll = bool(b_change > a_change * 1.5 and b_timing_ok)
         rec_trusted = False
         verdict = ("WARN_LOW_CHANGE_RATE: 静止下数值变化率偏低（可能静止噪声极小，属正常），"
@@ -117,6 +146,19 @@ def evaluate_probe_metrics(mode_a, mode_b, q_cache_rad, q_0x7019_rad,
 
 
 def _sample_mode(robot, poll_once, duration_s):
+    """在指定反馈轮询模式下执行一段 200Hz 静置录波并汇总性能/精度指标。
+
+    参数:
+        robot (RebotAdapter): 已连接硬件且启用 MIT 扩展的机械臂适配器。
+        poll_once (bool): ``False`` 对应 Mode A（仅 ``motor.get_state()``），
+            ``True`` 对应 Mode B（每拍附加调用 ``controller.poll_feedback_once()``）。
+        duration_s (float): 录波持续时长（单位: s）。
+
+    返回:
+        dict: 包含采样点数、有效帧率、总/逐关节数值变化率、200Hz 环路周期与发送/采样耗时
+            p50/p99/max（ms）、CAN 累计异常数、以及 6 轴 ``q`` 中位数（rad）、``dq`` 标准差
+            （rad/s）和 ``tau`` 中位数（Nm）。
+    """
     arm = robot.io.arm
     arm.set_feedback_poll_once(poll_once)
     time.sleep(0.15)  # 等当前模式稳定
@@ -131,6 +173,7 @@ def _sample_mode(robot, poll_once, duration_s):
     tau = rec["tau"]
     n = len(rec["t"])
     if n > 0:
+        # 仅统计 6 轴位置与力矩全为有限值的样本，剔除尚未刷新或异常 NaN 帧
         finite_mask = np.all(np.isfinite(q), axis=1) & np.all(np.isfinite(tau), axis=1)
         valid_ratio = float(np.mean(finite_mask))
         q_med = np.nanmedian(q, axis=0) if np.any(finite_mask) else np.full(6, math.nan)
@@ -175,6 +218,16 @@ def _sample_mode(robot, poll_once, duration_s):
 
 
 def main():
+    """命令行入口：依次采样 Mode A/B、核对 0x7019 精度与重力模型并生成 JSON 报告。
+
+    安全红线:
+        - 默认零运动保持当前位姿，仅显式指定 ``--move-home`` 时才以 15°/s 缓慢移至 HOME；
+        - 无论中途正常完成或抛出异常，``finally`` 块均严格执行 ``hold() -> stop()``
+          （内部安全回零并等待到位后再失能），杜绝悬空掉臂。
+
+    返回:
+        int: 进程退出码（0 表示探针执行完成，1 表示 MIT 扩展未激活）。
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duration", type=float, default=2.5,
                         help="每种模式采样时长 (s)，默认 2.5s")
@@ -184,6 +237,7 @@ def main():
                         help="报告输出路径（默认 logs/mit_probe_<timestamp>.json）")
     args = parser.parse_args()
 
+    # 延迟导入硬件适配器，确保离线单测导入 evaluate_probe_metrics 时不依赖 Pinocchio/CAN
     from rebot_adapter import RebotAdapter
 
     robot = None
@@ -209,6 +263,7 @@ def main():
             print("[探针] 零运动模式：保持当前姿态进行只读探测（可用 --move-home 测悬臂重力下垂）")
             time.sleep(0.3)
 
+        # 依次在 Mode A（无主动 poll）与 Mode B（每拍主动 poll）下采样，对比刷新率与环路抖动
         print(f"[探针] Mode A（feedback_poll_once=False）采样 {args.duration:.1f}s ...")
         mode_a = _sample_mode(robot, poll_once=False, duration_s=args.duration)
         print(f"[探针] Mode B（feedback_poll_once=True） 采样 {args.duration:.1f}s ...")
@@ -216,12 +271,13 @@ def main():
         # 恢复配置原值
         robot.io.arm.set_feedback_poll_once(bool(ext_info["cfg"]["feedback_poll_once"]))
 
-        # 同步读一次 0x7019 作为精度基准
+        # 同步读一次 0x7019 作为精度基准（同时测量阻塞 CAN 读取耗时用于对比 200Hz 缓存收益）
         q_cmd = robot.get_command_pos()
         t_r0 = time.perf_counter()
         q_0x7019 = robot.get_current_pos()
         read_0x7019_ms = (time.perf_counter() - t_r0) * 1000.0
         fb_now = robot.get_feedback_state(max_age_s=0.20)
+        # 优先选取有效率更高的模式中位数作为缓存读数代表值
         q_cache = (np.asarray(mode_a["q_med_rad"], dtype=np.float64)
                    if mode_a["valid_ratio"] >= mode_b["valid_ratio"]
                    else np.asarray(mode_b["q_med_rad"], dtype=np.float64))
@@ -229,6 +285,7 @@ def main():
                    if mode_a["valid_ratio"] >= mode_b["valid_ratio"]
                    else np.asarray(mode_b["tau_med_nm"], dtype=np.float64))
 
+        # 用 0x7019 实测角计算 Pinocchio 重力矩并结合 MIT 刚度 kp 做综合评估
         tau_pin = robot.gravity_torque(q_0x7019)
         kp, kd = robot.get_mit_gains()
         eval_res = evaluate_probe_metrics(
@@ -260,6 +317,7 @@ def main():
             json.dump(report, stream, ensure_ascii=False, indent=2)
 
         def _fmt(v):
+            """将可选浮点指标格式化为保留两位小数的字符串，None 显示为 N/A。"""
             return "N/A" if v is None else f"{v:.2f}"
 
         print("\n" + "=" * 70)
@@ -287,6 +345,7 @@ def main():
         print("=" * 70)
         return 0
     finally:
+        # 硬件安全红线：始终先 hold 稳住当前姿态，再经由 robot.stop() 缓慢回零后失能
         if robot is not None:
             print("[探针] 执行安全停机（保持 → 缓慢回零 → 失能）...")
             try:

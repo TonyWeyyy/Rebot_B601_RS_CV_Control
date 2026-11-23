@@ -4,29 +4,54 @@
 =================================================================
 一个脚本同时实现两个功能（共用一台相机、一次 MediaPipe 检测、一条 CAN 总线）：
 
-  【跟随】掌心 3D（相机系）→ 误差 e = P_cam - [0,0,d]
-         → 目标速度前馈 + 分方向增益 → tanh 软饱和
-         → 相机系速度 → 伴随变换到 TCP → 世界系 twist
-         → 阻尼伪逆雅可比（可操作度奇异保护）→ 关节速度 → 适配层积分下发
-         （控制数学与 palm_follow_fixed_orientation.py 一致，
-           新增前馈/分方向增益/软饱和/反转清惯性四项高速跟随改进）
+  【跟随】掌心 3D（相机系）→ 4 层深度保护链 → 相机系/世界系双卡尔曼滤波
+         → 眼在手上自运动补偿 + 非对称双估计器共识门控 → 误差 e = P_cam - [0,0,d]
+         → 双模态目标速度前馈 + 伸展度联动调度 + 振荡阻尼 + tanh 软饱和
+         → 相机系速度 → 伴随变换到 TCP → 世界系 twist → 虚拟软墙 + 奇异保护
+         → 加权阻尼伪逆雅可比 → L2 分关节限速 + 软限位缓冲 → 100Hz 适配层积分下发
+         （基础控制数学与 palm_follow_fixed_orientation.py 保持一致，
+           并集成 v11~v13 高速跟随、静态零抖动、世界系 Smith 预估与 MIT 实测反馈估计）
 
-  【抓取】拇指尖(4)—食指尖(8) 像素距离 → One Euro 滤波 → 线性映射为
-         夹爪 J7 目标角度（度）→ 随 100Hz 关节指令经 rebot_control
-         第 7 通道下发（单一 CAN 主机，无总线冲突）。
+  【抓取】拇指尖(4)—食指尖(8) 像素距离（仅依赖 2D 新鲜关键点，不依赖深度）
+         → One Euro / EMA 滤波 → 线性映射为夹爪 J7 目标角度（度）
+         → 手臂运动中自动冻结（防手腕相机抖动）→ 随 100Hz 关节指令经
+         rebot_control 第 7 通道下发（单一 CAN 主机，无总线冲突）。
+
+线程与控制架构：
+    1. 视觉/主线程（30/60fps）：相机取流与硬件时间戳校准、MediaPipe + LK 光流桥接、
+       4 层深度保护链、捏合夹爪映射、OpenCV 可视化与 2s 相机掉线看门狗重连。
+    2. 伺服控制线程（100Hz，`servo_control_loop`）：独占 Pinocchio FK/雅可比计算、
+       卡尔曼状态估计、视觉伺服速度闭环、软/硬工作空间墙保护与高频 CSV 非阻塞日志。
+    3. 键盘监听线程（`pynput`）：全局响应 `g`/空格 启停跟随、`q`/Esc 统一退出。
+    4. 底层执行线程（由 `RebotAdapter` / `mit_controller_ext` 管理）：200Hz MIT
+       电机闭环、速度前馈、重力补偿及 M6 安全监督（软停机保持 + 温升前置降速）。
+
+坐标系与单位约定：
+    - 相机系（cam）：光轴 +Z 向前，+X 向右，+Y 向下，位置单位 m，速度单位 m/s。
+    - 基座/世界系（world）：URDF 机械臂基座坐标系，位置单位 m，角速度单位 rad/s。
+    - 关节空间：本文件与 Pinocchio 统一使用弧度（rad、rad/s，6 关节）；
+      底层 `rebot_control` SDK 使用角度（deg，7 关节含 J7 夹爪），换算完全封装在
+      `rebot_adapter.py` 内。
+    - 参数优先级：CLI 命令行参数 > `config/follow.yaml` & `config/grasp.yaml` > 模块默认值。
+
+硬件安全红线：
+    - 严禁在非零/弯肘姿态直接失能电机；所有退出路径（q / Esc / Ctrl+C / 异常）
+      必须执行统一安全退出链：停 100Hz 伺服 → 关同步采样器 → 刷盘日志 →
+      `robot.hold()` → `robot.stop()`（缓慢回零到位后再失能）。
+    - 控制雅可比、虚拟墙与指令积分严格锚定指令角 `q_cmd`；200Hz 实测反馈 `q_act/dq_act`
+      仅允许进入感知估计层（世界系 KF 与自运动补偿），严禁直接闭环到控制积分。
 
 运行模式：
     python palm_follow_grasp.py                  # 跟随 + 夹爪（完整模式）
-    python palm_follow_grasp.py --no-gripper     # 仅手掌跟随（夹爪保持打开）
+    python palm_follow_grasp.py --no-gripper     # 仅手掌跟随（启动主动打开夹爪防遮挡）
     python palm_follow_grasp.py --no-follow      # 仅捏合夹爪（手臂保持不动，
                                                  #   无需手眼标定，可先验证夹爪映射）
     python palm_follow_grasp.py --no-arm         # 纯视觉演练（不碰硬件）
     python palm_follow_grasp.py --headless       # 无窗口模式（SSH 场景，q 键退出）
 
 操作：
-    g / 空格 : 启动/停止跟随（--no-follow 时无效）
-    q        : 退出（停止并保持 → 缓慢回零 → 失能）
-    Esc      : rebot_control 内置急停（平滑回零）
+    g / 空格 : 启动/停止跟随（--no-follow 时无效；重新启动时自动清除安全监督软停机锁存）
+    q / Esc  : 退出（停止并保持 → 缓慢回零 → 失能，统一安全退出路径）
 
 ⚠️ 首次运行前：
     1. 夹爪开合标定：tools/gripper_j7_calibrate.py（结果写入 config/grasp.yaml）
@@ -77,6 +102,7 @@ from palm_detection import (PalmDetector, PalmTracker, OneEuroFilter,
 # 注意：RebotAdapter 在 main() 中惰性导入（--no-arm 模式不依赖 pinocchio/rebot_control）
 
 # ─── 初始位姿 ────────────────────────────────────────────────
+# 6 轴关节角默认 HOME（单位：rad，顺序 J1~J6）。
 # 已用 URDF + Pinocchio 网格搜索验证远离奇异。⚠️ 不要用全零位
 # （全零位在 J2/J3 限位边界上且可操作度仅 0.0017，近奇异）。
 HOME_JOINT_POS = [0.0, 1.2, 1.05, 0.0, 0.0, 0.0]
@@ -91,26 +117,27 @@ if os.path.exists(_HOME_FILE):
     print(f"[HOME] 使用示教 HOME: {np.round(HOME_JOINT_POS, 3).tolist()}"
           f"  (TCP≈{np.round(_home['tcp_position'], 3).tolist()})")
 
-# ─── 视觉伺服控制参数 ───────────────────────────────────────
-TOOL_OFFSET = np.array([0.0, 0.0, 0.0])   # TCP 相对末关节的偏移（米）
-# 相机系分方向增益：[X=画面水平(左右), Y=竖直(上下), Z=深度]
+# ─── 视觉伺服控制参数（模块级默认值；会被 follow.yaml 与 CLI 覆写）────────
+TOOL_OFFSET = np.array([0.0, 0.0, 0.0])   # TCP 相对末关节(link6)的偏移，局部系 (m)
+# 相机系分方向比例增益 [λ_x, λ_y, λ_z] (1/s)：[X=画面水平(左右), Y=竖直(上下), Z=深度]
 # 水平方向跟随主要靠底座 J1 偏航（惯量最大、限速最低），增益高了会
 # 饱和振荡（先反向、再晃回来）；竖直/深度用 J2/J3 俯仰，可以高些。
 LAMBDA_GAIN_XYZ = np.array([1.8, 2.5, 2.5])
-K_ORIENTATION = 1.6           # 姿态修正增益
+K_ORIENTATION = 1.6           # 固定姿态保持增益 (1/s)
 DESIRED_DEPTH = 0.30          # 期望相机到掌心距离 (m)，不要小于 0.20
-SERVO_DIRECTION = 1.0         # 若运动方向完全相反，改为 -1.0（标定反了的症状）
-POSITION_DEADBAND = 0.015     # 3D 误差死区 (m)，想贴更近可降到 0.010
-ORIENTATION_DEADBAND = np.deg2rad(2.0)
-MAX_VEL_CART = 0.30           # 最大末端线速度 (m/s)，首次调试建议 0.10
-MAX_VEL_ANGULAR = 1.20        # 最大角速度 (rad/s)
-MAX_VEL_JOINT = 1.20          # 标量最大关节速度 (rad/s)，适配层还有第二道限幅
-# L2 分关节差异化限速：None = 回退全轴标量 MAX_VEL_JOINT；设置 6 元向量时受硬包络保护
+SERVO_DIRECTION = 1.0         # 伺服方向极性 (+1.0/-1.0)：若运动方向完全相反则改为 -1.0
+POSITION_DEADBAND = 0.015     # 3D 位置误差死区半径 (m)，想贴更近可降到 0.010
+ORIENTATION_DEADBAND = np.deg2rad(2.0)  # 姿态轴角误差死区 (rad)，默认 2.0°
+MAX_VEL_CART = 0.30           # 末端最大线速度 (m/s)，首次调试建议 0.10，安全校验上限 0.85
+MAX_VEL_ANGULAR = 1.20        # 末端最大角速度 (rad/s)，安全校验上限 2.2
+MAX_VEL_JOINT = 1.20          # 标量最大关节速度 (rad/s)，适配层还有第二道硬限幅
+# L2 分关节差异化限速 (rad/s)：None = 回退全轴标量 MAX_VEL_JOINT；设置 6 元向量时受硬包络保护
 MAX_VEL_JOINTS = None
+# 6 轴硬件安全速度硬包络 (rad/s)：重力承载轴 J2/J3 严禁超过 2.0 rad/s
 HARD_MAX_VEL_JOINTS = np.array([2.5, 2.0, 2.0, 3.0, 3.0, 2.5], dtype=np.float64)
 CTRL_RATE = 0.01              # 控制周期 10ms (100Hz)：指令量化延迟减半
-                              # 注意：下面三个常量由 CTRL_RATE 推导（时间制），
-                              # 改频率时无需手改，安全时长不会随频率变化
+                              # 注意：所有帧数常量均由 CTRL_RATE 推导（时间制），
+                              # 改频率时无需手改，物理安全时长不会随频率变化
 
 # 目标速度前馈：纯误差反馈的跟随必有滞后（滞后 ≈ 目标速度/增益），
 # 手移动越快手臂落后越多。估计掌心目标速度并前馈叠加。0 = 关闭。
@@ -154,32 +181,36 @@ KF_R_XY = 2.5e-3              # 横向适度信任观测；保守于直接大幅
 KF_R_Z = 4e-3                 # 深度维持 v7.1 噪声强度，不放大 Z 抖动
 # 慢拖参数：在世界系掌心点阵上确认，确认后只限速迁移 hold_world。
 # 相机自运动不会进入这个通道；静止时前馈/lead 仍保持撤销。
-KF_SLOW_FOLLOW_ENABLE = True
-KF_SLOW_FOLLOW_DIST = 0.014
-KF_SLOW_FOLLOW_RELEASE = 0.008
-KF_SLOW_FOLLOW_FRAMES = 3
-KF_SLOW_FOLLOW_DIR_COS = 0.80
-KF_SLOW_FOLLOW_SPEED = 0.045
-CAMERA_HW_TIMESTAMP_ENABLE = False  # 未确认实机 SDK 前保持主机时刻基线
-CAMERA_HW_MAX_TRANSPORT_S = 0.20
-DIAG_ENABLE = True
-DIAG_QUEUE_SIZE = 8192
-DIAG_ACTUAL_FEEDBACK_HZ = 0.0  # 同步 CAN 诊断默认关闭；开启时只允许 0<hz<=2
-KF_AXIS_ADAPT_ENABLE = True    # 连续同向创新才增强 XY；Z 默认不放大
-KF_AXIS_ADAPT_REF_XY = 0.060
-KF_AXIS_ADAPT_REF_Z = 0.080
-KF_AXIS_ADAPT_MAX_XY = 1.60
-KF_AXIS_ADAPT_MAX_Z = 1.00
-KF_AXIS_ADAPT_CONFIRM = 2
-KF_AXIS_ADAPT_ATTACK_TAU = 0.040
-KF_AXIS_ADAPT_RELEASE_TAU = 0.120
-KF_AXIS_ADAPT_STATIC_GUARD = True  # 静止观测先用基准 Q，运动确认后再增强
-KF_STATIC_Q_SCALE = 1.0            # 静止时额外压低 Q 的倍率（1=关闭）
-                                   # follow.yaml 默认 0.75：静止速度估计更平滑，
-                                   # 运动确认后立即恢复 1.0 + 分轴增强
-STATIC_VEL_HOLD_ENABLE = True      # 只清除静止死区内的低速残余指令状态
-STATIC_VEL_HOLD_SPEED = 0.025      # 高于此速度仍走原 EMA + 加速度限制
-STATIC_VEL_HOLD_DELAY_S = 0.03     # 连续确认时长；帧数由 CTRL_RATE 推导
+KF_SLOW_FOLLOW_ENABLE = True      # 是否启用静止态世界系慢拖迁移（v12+ follow.yaml 默认关闭）
+KF_SLOW_FOLLOW_DIST = 0.014       # 触发慢拖所需的累计世界系位移阈值 (m)
+KF_SLOW_FOLLOW_RELEASE = 0.008    # 慢拖迁移后的保留死区半径 (m)，必须 < KF_SLOW_FOLLOW_DIST
+KF_SLOW_FOLLOW_FRAMES = 3         # 确认慢拖所需的连续同向观测帧数
+KF_SLOW_FOLLOW_DIR_COS = 0.80     # 相邻位移方向余弦下限（防抖动误触发慢拖）
+KF_SLOW_FOLLOW_SPEED = 0.045      # 确认慢拖后 hold_world 最大迁移速度 (m/s)
+
+# 相机硬件时间戳校准 & 非阻塞诊断日志配置
+CAMERA_HW_TIMESTAMP_ENABLE = False  # 未确认实机 SDK 时钟一致性前保持主机时刻基线
+CAMERA_HW_MAX_TRANSPORT_S = 0.20    # 硬件时间戳允许的最大 USB/管线传输延迟上限 (s)
+DIAG_ENABLE = True                  # 是否启用 100Hz 高频 CSV 非阻塞诊断日志（logs/servo_*.csv）
+DIAG_QUEUE_SIZE = 8192              # 诊断后台写盘队列容量（条），满时丢弃不阻塞 100Hz 伺服线程
+DIAG_ACTUAL_FEEDBACK_HZ = 0.0       # 旧版同步 CAN 诊断轮询频率 (Hz)；默认 0 关闭，严禁在伺服环内读 CAN
+
+# 分轴自适应过程噪声 Q 门控（AxisProcessNoiseGate）：连续同向创新才增强 XY，Z 默认不放大
+KF_AXIS_ADAPT_ENABLE = True         # 是否启用分轴自适应 Q 门控
+KF_AXIS_ADAPT_REF_XY = 0.060        # XY 轴创新归一化参考幅值 (m)
+KF_AXIS_ADAPT_REF_Z = 0.080         # Z 轴创新归一化参考幅值 (m)
+KF_AXIS_ADAPT_MAX_XY = 1.60         # XY 轴过程噪声最大放大倍率
+KF_AXIS_ADAPT_MAX_Z = 1.00          # Z 轴过程噪声最大放大倍率（1.0 = 不放大深度噪声）
+KF_AXIS_ADAPT_CONFIRM = 2           # 触发 Q 放大所需的连续同向创新观测帧数
+KF_AXIS_ADAPT_ATTACK_TAU = 0.040    # Q 倍率上升（攻）时间常数 (s)
+KF_AXIS_ADAPT_RELEASE_TAU = 0.120   # Q 倍率回落（释）时间常数 (s)
+KF_AXIS_ADAPT_STATIC_GUARD = True   # 静止观测先用基准 Q，运动确认后再增强
+KF_STATIC_Q_SCALE = 1.0             # 静止时额外压低 Q 的倍率（1=关闭）
+                                    # follow.yaml 默认 0.75：静止速度估计更平滑，
+                                    # 运动确认后立即恢复 1.0 + 分轴增强
+STATIC_VEL_HOLD_ENABLE = True       # 只清除静止死区内的低速残余指令状态
+STATIC_VEL_HOLD_SPEED = 0.025       # 低速残余速度清除阈值 (m/s)；高于此速仍走 EMA+加速度限幅
+STATIC_VEL_HOLD_DELAY_S = 0.03      # 连续低速确认时长 (s)；帧数由 CTRL_RATE 推导
 STATIC_VEL_HOLD_FRAMES = max(1, round(STATIC_VEL_HOLD_DELAY_S / CTRL_RATE))
 KF_RESYNC_FRAMES = 3          # 连续跳变剔除帧数上限：盲期后手真的移了位时，
 KF_ADAPT_ENABLE = True        # 自适应过程噪声：创新（观测-预测偏差）大说明
@@ -278,17 +309,18 @@ ROI_CROP_SCALE = 0.68             # ROI 边长占画面短边比例（0.45~0.90�
 # v13 P2：200Hz 真实关节反馈接入感知估计层（仅用于 pose_history/自运动补偿，不闭环到指令积分）
 MIT_ACTUAL_FEEDBACK_EST_ENABLE = False  # true = 用真实 q_act/dq_act 驱动世界系 KF 与自运动补偿
 MIT_ACTUAL_VEL_LPF_TAU_S = 0.020        # 实测角速度 dq_act 一阶低通时间常数 (s)
+# 死区内连续零速确认静止的周期数（0.08s 由 CTRL_RATE 推导，防残余 KF 速度拖住 ff_moving）
 SETTLED_CONFIRM_FRAMES = max(1, round(0.08 / CTRL_RATE))
 
-CAMERA_FPS = 30               # 相机帧率；Gemini2 支持 640x480@60，
+CAMERA_FPS = 30               # 相机帧率 (fps)；Gemini2 支持 640x480@60，
                               # 高速跟随建议 --fps 60（感知延迟砍半）
 
-# 阻尼和平滑参数
-DAMPING_BASE = 0.010
-DAMPING_ADAPTIVE = True
-MANIPULABILITY_THRESHOLD = 0.004
-MIN_MANIPULABILITY_SPEED_SCALE = 0.35
-SMOOTH_ALPHA = 0.38
+# ─── 阻尼、奇异保护与速度平滑参数 ────────────────────────────
+DAMPING_BASE = 0.010          # 阻尼最小二乘（DLS）基础阻尼系数 λ
+DAMPING_ADAPTIVE = True       # 靠近奇异位形时自动放大阻尼并降速
+MANIPULABILITY_THRESHOLD = 0.004        # Yoshikawa 可操作度奇异预警阈值（低于此值触发降速增阻尼）
+MIN_MANIPULABILITY_SPEED_SCALE = 0.35   # 奇异降速保护最低保留比例（防彻底卡死无法脱出）
+SMOOTH_ALPHA = 0.38           # 100Hz 末端速度指令 EMA 基准平滑系数（实际按 dt 缩放）
 # 方向反转时清除速度平滑的「惯性」：手突然反向快移时，若不清除，
 # 平滑后的指令仍维持原方向 → 手臂先反向冲一下再拉回
 REVERSAL_FAST_RESPONSE = True
@@ -298,21 +330,32 @@ REVERSAL_RESIDUAL_SCALE = 0.35  # 反转时保留的旧方向速度比例
                                 # 0=原逻辑（先完全停住，易顿挫）
                                 # 0.35=保留少量惯性并加速反向，减少换向卡顿
 
-# 工作空间虚拟墙（基座系，米）——按实际桌面环境设置
-WORKSPACE_MIN = np.array([-0.40, -0.10, 0.03])
-WORKSPACE_MAX = np.array([ 0.40,  0.40, 0.60])
-WORKSPACE_RADIUS = 0.42       # 70% 臂展：水平径向 hypot(X,Y) 上限；不限制 Z
+# ─── 工作空间虚拟墙（基座系，m）── 按实际桌面环境设置 ────────
+WORKSPACE_MIN = np.array([-0.40, -0.10, 0.03])  # 基座系 [X_min, Y_min, Z_min] (m)
+WORKSPACE_MAX = np.array([ 0.40,  0.40, 0.60])  # 基座系 [X_max, Y_max, Z_max] (m)
+WORKSPACE_RADIUS = 0.42       # 70% 臂展安全规则：仅限制水平径向 hypot(X,Y) 上限 (m)；不限制 Z
 
-LOST_HOLD_FRAMES = round(0.30 / CTRL_RATE)   # 连续丢手 0.30s → 保持不动
-COAST_FRAMES = round(0.12 / CTRL_RATE)       # 丢失外推窗口 0.12s
-COAST_DECAY = 0.90 ** (CTRL_RATE / 0.02)     # 每 20ms 等效衰减 0.90（防爆冲）
-COAST_MAX_VEL = 0.35          # 外推速度限幅 (m/s)：防前馈污染带跑
-TARGET_STALE_S = 0.12         # 控制侧观测看门狗：视觉线程卡住也不能永远沿用旧目标
+# ─── 丢手外推与看门狗（时间制，全部由 CTRL_RATE 推导）────────
+LOST_HOLD_FRAMES = round(0.30 / CTRL_RATE)   # 连续丢手 0.30s → 停止跟随并保持位姿
+COAST_FRAMES = round(0.12 / CTRL_RATE)       # 丢手初期有界外推（coast）窗口 0.12s
+COAST_DECAY = 0.90 ** (CTRL_RATE / 0.02)     # 外推速度衰减因子（等效每 20ms 衰减 0.90，防爆冲）
+COAST_MAX_VEL = 0.35          # 外推速度硬限幅 (m/s)：防异常前馈在丢手瞬间带跑机械臂
+TARGET_STALE_S = 0.12         # 控制侧观测看门狗 (s)：视觉线程卡住也不能永远沿用旧目标
 
 
 # ─── 命令行与配置 ────────────────────────────────────────────
 
 def parse_args():
+    """解析命令行参数。
+
+    配置优先级：CLI 命令行显式传入 > `config/follow.yaml` & `config/grasp.yaml`
+    > 本文件模块级默认值。未传入的数值型覆盖项默认为 None，由 main() 回退到 yaml 值。
+
+    Returns:
+        argparse.Namespace: 解析后的运行选项，包含跟随覆写参数（distance/gain/gain_x/
+        max_vel/fps/color_exposure）、配置文件路径、检测后端及运行模式标志
+        （no_follow/no_gripper/no_arm/headless）。
+    """
     p = argparse.ArgumentParser(description="手掌跟随 + 捏合抓取 一体程序")
     p.add_argument("--distance", type=float, default=None,
                    help="期望相机到掌心距离（米），建议 0.20~0.50；"
@@ -356,7 +399,18 @@ def parse_args():
 
 
 def load_grasp_cfg(path):
-    """读取捏合→夹爪映射配置，缺失字段给安全默认值。"""
+    """读取捏合→夹爪映射配置，缺失文件或缺失字段时自动补全安全默认值。
+
+    兼容历史与新版两套 pinch 滤波器键名（`filter_type`/`min_cutoff_hz`/`beta`
+    会自动同步映射到 `filter`/`oe_min_cutoff`/`oe_beta`）。
+
+    Args:
+        path (str): `grasp.yaml` 配置文件路径。
+
+    Returns:
+        dict: 包含 `pinch`（像素区间、滤波参数、死区度）与 `gripper`（启用标志、
+        闭合/张开目标角度 deg、手臂运动时冻结开关及速度门槛 rad/s）的配置字典。
+    """
     cfg = {"pinch": {"closed_px": 20.0, "open_px": 200.0,
                      "filter": "one_euro",
                      "oe_min_cutoff": 1.2, "oe_beta": 0.05,
@@ -383,9 +437,18 @@ def load_grasp_cfg(path):
 
 
 def load_follow_cfg(path):
-    """读取跟随伺服参数配置，缺失字段给代码内置默认值。
+    """读取跟随伺服参数配置，缺失文件或缺失字段时回退到模块级内置默认值。
 
-    优先级：命令行参数 > 本 yaml > 代码内置默认值。
+    优先级：CLI 命令行参数 > 本 yaml > 代码内置默认值。
+    兼容 v7.1 ~ v13 所有回退配置文件：旧配置中不存在的新特性开关默认保持关闭
+    或保守值（如 world_kf_enable=False、mit_actual_feedback_est_enable=False）。
+
+    Args:
+        path (str): `follow.yaml` 配置文件路径。
+
+    Returns:
+        dict: 包含 `follow`（视觉伺服/KF/前馈/伸展调度/振荡阻尼/世界系 KF/诊断参数）
+        与 `workspace`（基座系三维边界 min/max 及水平径向上限 max_radius，单位 m）的字典。
     """
     cfg = {"follow": {
                "distance": DESIRED_DEPTH,
@@ -528,7 +591,18 @@ def load_follow_cfg(path):
 
 
 def apply_follow_cfg(cfg):
-    """把 follow.yaml 的值写入伺服全局参数（伺服线程直接读全局量）。"""
+    """将已校验的 follow.yaml 配置写入模块级伺服全局参数。
+
+    100Hz 伺服控制线程及主线程直接读取这些模块级全局量；同时将时间制参数
+    （如 `static_velocity_hold_delay_s`、`kf_ff_stop_delay_s`、`lost_hold_s`、
+    `coast_window_s`、`coast_decay_per20ms`）按 `CTRL_RATE` 换算为对应的帧计数
+    或单周期衰减因子，保证修改控制频率时物理时长不变。
+
+    约定：本函数应在启动伺服线程前由主线程单次调用（无锁写入）。
+
+    Args:
+        cfg (dict): 经 `load_follow_cfg()` 加载并通过 `validate_follow_cfg()` 校验的配置字典。
+    """
     global POSITION_DEADBAND, DEADBAND_HYSTERESIS, ORIENTATION_DEADBAND
     global VEL_FEEDFORWARD, FF_SMOOTH, FF_MAX_VEL, FF_MIN_SPEED, FF_TAPER_DIST
     global FF_ADAPTIVE_TAPER_ENABLE, FF_TAPER_SPEED_REF, FF_TAPER_MAX_DIST
@@ -760,8 +834,25 @@ def apply_follow_cfg(cfg):
 
 
 def validate_follow_cfg(cfg):
-    """在相机/机械臂初始化前拒绝非有限值和危险控制配置。"""
+    """在相机与机械臂硬件初始化之前校验跟随配置，拒绝非有限值与越界危险参数。
+
+    安全红线校验包括：
+    - 递归扫描整个配置树，拦截任意 NaN / ±Inf 数值；
+    - 期望距离 [0.18, 0.60]m、增益上限、末端线速 ≤ 0.85 m/s、角速 ≤ 2.2 rad/s；
+    - 标量关节限速 ≤ 2.0 rad/s、L2 分关节限速不得超出 `HARD_MAX_VEL_JOINTS`
+      （重力承载轴 J2/J3 严禁 > 2.0 rad/s）；
+    - KF 噪声方差、回差死区、自适应 Lead、自运动补偿、振荡阻尼、世界系 KF 与
+      姿态软优先级各项物理约束；
+    - 工作空间三维边界递增且水平径向 `max_radius` ≤ 0.42m（70% 臂展防 J2 堵转规则）。
+
+    Args:
+        cfg (dict): `load_follow_cfg()` 返回的配置字典。
+
+    Raises:
+        ValueError: 当任意配置项为非有限数、类型错误或超出安全边界时抛出。
+    """
     def walk(value, path="follow"):
+        """递归遍历嵌套字典/列表，确保所有数值型配置均为有限实数（非 NaN/Inf）。"""
         if isinstance(value, dict):
             for key, item in value.items():
                 walk(item, f"{path}.{key}")
@@ -896,6 +987,18 @@ def validate_follow_cfg(cfg):
 # ═══ 以下数学函数与 palm_follow_fixed_orientation.py 完全一致 ═══
 
 def compute_damped_pseudoinverse(J, damping=0.01):
+    """计算阻尼最小二乘（DLS）雅可比伪逆，避免近奇异位形下关节速度发散。
+
+    公式：J^+ = J^T (J J^T + λ^2 I_m)^(-1)。当矩阵依然病态导致求逆失败时，
+    自动将阻尼系数扩大 10 倍兜底求逆。
+
+    Args:
+        J (np.ndarray): 任务空间雅可比矩阵，形状 (m, n)（本系统为 6×6）。
+        damping (float): 阻尼系数 λ（无量纲），越大越平滑但稳态跟踪精度略降。
+
+    Returns:
+        np.ndarray: 阻尼伪逆矩阵，形状 (n, m)。
+    """
     m, n = J.shape
     JJT = J @ J.T
     damping_matrix = (damping ** 2) * np.eye(m)
@@ -906,14 +1009,39 @@ def compute_damped_pseudoinverse(J, damping=0.01):
 
 
 def compute_manipulability(J):
+    """计算 Yoshikawa 可操作度指标 w = sqrt(max(0, det(J J^T)))。
+
+    可操作度越接近 0 表示机械臂越逼近运动学奇异点；伺服环低于
+    `MANIPULABILITY_THRESHOLD` 时自动启用自适应增阻尼与降速保护。
+
+    Args:
+        J (np.ndarray): 6×6 几何雅可比矩阵。
+
+    Returns:
+        float: 非负标量可操作度指标。
+    """
     return np.sqrt(max(0.0, np.linalg.det(J @ J.T)))
 
 
 def rotation_matrix_to_axis_angle(R):
+    """将 SO(3) 旋转矩阵对数映射为轴角旋转向量 θ·k̂（单位：rad）。
+
+    特殊奇异点处理：
+    - θ ≈ 0（|θ| < 1e-6）：直接返回零向量，避免 sin(θ) 除零；
+    - θ ≈ π（|π - θ| < 1e-3）：由对称矩阵 (R + I)/2 的对角线与非对角项符号
+      稳健提取单位转轴。
+
+    Args:
+        R (np.ndarray): 3×3 正交旋转矩阵。
+
+    Returns:
+        np.ndarray: 3 维旋转向量，方向为转轴、模长为旋转角 θ ∈ [0, π] (rad)。
+    """
     theta = np.arccos(np.clip((np.trace(R) - 1) / 2, -1.0, 1.0))
     if abs(theta) < 1e-6:
         return np.zeros(3)
     if abs(np.pi - theta) < 1e-3:
+        # θ ≈ π 时 sin(θ) → 0，改用 (R + I)/2 = k k^T 提取主轴与象限符号
         S = (R + np.eye(3)) / 2.0
         axis = np.array([np.sqrt(max(S[0, 0], 0.0)),
                          np.sqrt(max(S[1, 1], 0.0)),
@@ -930,17 +1058,60 @@ def rotation_matrix_to_axis_angle(R):
 
 
 def compute_orientation_error(R_current, R_desired):
+    """计算基座世界系下由当前姿态转向期望姿态的轴角误差向量（单位：rad）。
+
+    满足 R_err = R_desired @ R_current^T，使得施加世界系角速度 ω = K · e_ori
+    可驱使当前末端旋转矩阵指数收敛至 R_desired。
+
+    Args:
+        R_current (np.ndarray): 当前末端（TCP）在基座系下的 3×3 旋转矩阵。
+        R_desired (np.ndarray): 期望末端（TCP）在基座系下的 3×3 旋转矩阵。
+
+    Returns:
+        np.ndarray: 3 维世界系姿态误差向量 (rad)。
+    """
     return rotation_matrix_to_axis_angle(R_desired @ R_current.T)
 
 
 def skew(v):
+    """构造 3 维向量的反对称矩阵 [v]_×，满足 skew(v) @ u == np.cross(v, u)。
+
+    用于 TCP 工具偏置雅可比杠杆臂修正及 6D 空间速度伴随变换。
+
+    Args:
+        v (array-like): 长度为 3 的向量 [vx, vy, vz]。
+
+    Returns:
+        np.ndarray: 3×3 反对称矩阵。
+    """
     return np.array([[0.0, -v[2], v[1]],
                      [v[2], 0.0, -v[0]],
                      [-v[1], v[0], 0.0]])
 
 
 def compute_tcp_fk_and_jacobian(robot, joint_positions):
-    """返回 TCP 位姿和 LOCAL_WORLD_ALIGNED TCP 雅可比（6x6）"""
+    """基于 Pinocchio 计算给定关节角下的 TCP 位姿与 6×6 世界对齐几何雅可比。
+
+    数学细节：
+    - 参考系为 Pinocchio `LOCAL_WORLD_ALIGNED`（原点在末关节/TCP，坐标轴平行于基座世界系）；
+    - 当 `TOOL_OFFSET != 0` 时，按刚体速度关系修正线速度块：
+      J_v_tcp = J_v_last - [R · t_tool]_× @ J_ω_last；
+    - 输出列按 `robot.joint_names` 对应 6 个主动关节重排。
+
+    线程安全约束：
+    - 本函数读写 `robot.data`（Pinocchio 共享缓存），仅允许在启动阶段的主线程或
+      100Hz 伺服控制线程中串行调用；200Hz MIT 重力补偿必须使用独立的 `_grav_data`。
+
+    Args:
+        robot (RebotAdapter): 机械臂适配层实例（提供 `model`、`data`、`joint_names` 与 `_build_q_full`）。
+        joint_positions (array-like): 6 关节角度向量，单位 rad（可传入 `q_cmd` 或实测 `q_act`）。
+
+    Returns:
+        tuple[np.ndarray, np.ndarray, np.ndarray]:
+            - tcp_position: (3,) 基座世界系下 TCP 位置 (m)；
+            - tcp_rotation: (3, 3) 基座世界系下 TCP 旋转矩阵；
+            - J_tcp_active: (6, 6) 对应 6 关节的 TCP 几何雅可比（前 3 行线速度 m/rad，后 3 行角速度）。
+    """
     import pinocchio as pin
     q_full = robot._build_q_full(joint_positions)
 
@@ -950,12 +1121,14 @@ def compute_tcp_fk_and_jacobian(robot, joint_positions):
 
     last_jid = robot.model.getJointId(robot.joint_names[-1])
     oMi = robot.data.oMi[last_jid]
+    # 将局部工具偏移 TOOL_OFFSET 旋转到世界系叠加，得到 TCP 世界位置
     tcp_position = oMi.translation + oMi.rotation @ TOOL_OFFSET
     tcp_rotation = oMi.rotation.copy()
 
     J_full = pin.getJointJacobian(robot.model, robot.data, last_jid,
                                   pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
     J_tcp = J_full.copy()
+    # 工具偏置杠杆臂耦合：v_tcp = v_last + ω × (R · t_tool) = v_last - [R · t_tool]_× ω
     J_tcp[:3, :] -= skew(oMi.rotation @ TOOL_OFFSET) @ J_full[3:, :]
 
     cols = [robot.model.joints[robot.model.getJointId(n)].idx_v
@@ -964,7 +1137,20 @@ def compute_tcp_fk_and_jacobian(robot, joint_positions):
 
 
 def camera_velocity_to_tcp(v_camera, T_tcp_camera):
-    """相机系速度 → TCP 系速度（速度伴随变换）"""
+    """通过 6×6 速度伴随变换，将相机系空间速度（twist）映射为 TCP 局部系空间速度。
+
+    伴随矩阵结构（记 R = R_tcp_cam, t = t_tcp_cam）：
+        v_tcp = R @ v_cam + [t]_× @ R @ ω_cam
+        ω_tcp = R @ ω_cam
+    注意：本函数假设相机与 TCP 刚性固连（手眼标定外参 T_tcp_camera 恒定）。
+
+    Args:
+        v_camera (np.ndarray): 6 维相机系速度 [vx, vy, vz (m/s), wx, wy, wz (rad/s)]。
+        T_tcp_camera (np.ndarray): 4×4 齐次手眼标定矩阵（相机系 → TCP 局部系）。
+
+    Returns:
+        np.ndarray: 6 维 TCP 局部系速度 [vx, vy, vz (m/s), wx, wy, wz (rad/s)]。
+    """
     R_tcp_cam = T_tcp_camera[:3, :3]
     t_tcp_cam = T_tcp_camera[:3, 3]
     V = np.zeros((6, 6))
@@ -977,9 +1163,28 @@ def camera_velocity_to_tcp(v_camera, T_tcp_camera):
 # ═══ 主程序 ═══
 
 def main():
+    """手掌跟随 + 捏合抓取一体程序主入口。
+
+    完整生命周期与线程编排：
+    1. 配置加载与优先级解析：CLI > `follow.yaml` & `grasp.yaml` > 模块默认值，
+       在接触硬件之前执行全量有限值与安全包络校验。
+    2. 感知与执行器初始化：按运行模式（`--no-arm` / `--no-follow` / `--no-gripper`）
+       依次初始化手眼标定矩阵、Orbbec Gemini 2 相机、MediaPipe 检测器、LK 光流桥接、
+       机械臂适配层（先移至远离奇异的 HOME 位姿并锁定 `desired_rotation`）；
+       若传入 `--no-gripper`，主动打开夹爪到 `open_deg` 避免遮挡腕部视野。
+    3. 三线程协同运行：
+       - `pynput` 全局键盘线程：`g`/空格启停跟随并清除安全监督锁存，`q`/Esc 触发统一退出；
+       - 100Hz 伺服控制线程（`servo_control_loop`）：读取视觉共享状态快照，执行双 KF /
+         自运动补偿 / Smith 预估 / 阻尼伪逆 / 虚拟墙保护与高频 CSV 非阻塞日志；
+       - 视觉主线程（30/60fps）：取流与时间戳校准、2s 掉线自动重连、4 层深度保护链、
+         2D 新鲜度门控捏合夹爪映射（含手臂运动冻结）、调试信息打印与 OpenCV 显示。
+    4. 统一安全退出链（`finally`）：无论按键退出、Ctrl+C 还是异常，均严格执行
+       停 100Hz 伺服线程 → 关同步 CAN 采样器 → 刷盘关闭诊断日志 → 停键盘/检测器 →
+       `robot.hold()` → `robot.stop()`（缓慢回零到位再失能）→ 清理窗口与相机。
+    """
     args = parse_args()
 
-    # 跟随参数：yaml 为默认值，命令行参数优先级更高
+    # ── 1. 跟随配置加载与 CLI 优先级覆写（CLI > follow.yaml > 代码默认值）──
     follow_cfg = load_follow_cfg(args.follow_cfg)
     validate_follow_cfg(follow_cfg)
     apply_follow_cfg(follow_cfg)
@@ -990,6 +1195,7 @@ def main():
                                 float(fcfg["gain"]), float(fcfg["gain"])])
     max_vel_cart = float(fcfg["max_vel"])
     camera_fps = int(fcfg["fps"])
+    # CLI 显式传参覆盖 yaml 默认值，并执行与 validate_follow_cfg 一致的安全边界复检
     if args.distance is not None:
         if not 0.18 <= args.distance <= 0.60:
             raise ValueError("--distance 建议在 0.18~0.60 米之间"
@@ -1159,20 +1365,25 @@ def main():
     pinch_px_now = [None]           # 供 HUD/调试显示
     gripper_frozen_now = [False]    # 夹爪是否因手臂运动被冻结
 
-    # ── 共享状态 ────────────────────────────────────────────
+    # ── 共享状态（视觉主线程 ↔ 100Hz 伺服控制线程 ↔ pynput 键盘线程）───────
+    # 同步协议：
+    # - 视觉线程写入 current_target_cam/target_frozen/target_seq/时间戳/palm_visible；
+    # - 键盘线程读写 g_pressed、写入 quit_flag；
+    # - 伺服线程只读视觉状态、可因 M6 故障清零 g_pressed，并写入 control_status；
+    # - 所有跨线程读写必须持有 `lock`，临界区内不做重计算或阻塞 I/O。
     lock = threading.Lock()
-    current_target_cam = [None]       # 掌心在相机系下的 3D 坐标
+    current_target_cam = [None]       # 掌心在相机系下的 3D 坐标 [x, y, z] (m)
     target_frozen = [False]           # 当前目标是深度冻结帧（z=desired 的占位值）
     target_seq = [0]                  # 每个有效视觉目标递增，位置相同也能识别新帧
-    target_obs_time = [0.0]           # 成像时刻（硬件时间启用时）或主机取帧时刻
-    target_arrival_time = [0.0]       # 帧到达主机时刻；处理耗时与传输延迟分离
-    target_pub_time = [0.0]           # 检测/深度处理完成、目标发布时刻
-    target_processing_ms = [0.0]      # 主机取帧→发布处理耗时（不含传输）
-    target_hw_time = [False]          # 本帧是否通过硬件时间校准
-    palm_visible = [False]
-    g_pressed = [False]
-    quit_flag = [False]
-    control_status = {"joint_speed": 0.0, "error": "", "active": False}
+    target_obs_time = [0.0]           # 成像时刻（硬件时间启用时）或主机取帧时刻 (monotonic s)
+    target_arrival_time = [0.0]       # 帧到达主机时刻 (monotonic s)；处理耗时与传输延迟分离
+    target_pub_time = [0.0]           # 检测/深度处理完成、目标发布时刻 (monotonic s)
+    target_processing_ms = [0.0]      # 主机取帧→发布处理耗时 (ms，不含 USB 传输延迟)
+    target_hw_time = [False]          # 本帧是否通过相机硬件时间戳校准
+    palm_visible = [False]            # 当前是否有新鲜有效 3D（或深度冻结）掌心目标
+    g_pressed = [False]               # 跟随使能标志（g/空格切换；M6 软停机故障时自动置 False）
+    quit_flag = [False]               # 统一退出标志（q/Esc 置 True，主循环退出进入 finally 安全回零）
+    control_status = {"joint_speed": 0.0, "error": "", "active": False}  # 伺服线程回报给 HUD/夹爪冻结的状态字典
 
     if follow_enabled:
         print(f"跟随参数: 距离 {desired_depth}m  "
@@ -1207,10 +1418,17 @@ def main():
     print("操作: g/空格 启停跟随 | q/Esc/Ctrl+C 退出并安全回零")
     print("=" * 60 + "\n")
 
-    # ── 键盘监听 ────────────────────────────────────────────
-    last_toggle = [0.0]
+    # ── 键盘监听（pynput 独立后台线程，不依赖 OpenCV 窗口焦点）────
+    last_toggle = [0.0]  # 上次切换跟随状态的墙钟时刻 (s)，用于 250ms 防抖
 
     def toggle_tracking():
+        """切换手掌跟随启停状态（支持键盘线程与 OpenCV 窗口回调并发调用）。
+
+        并发与安全行为：
+        - 在 `lock` 保护下执行 250ms 防抖（避免按键连发或窗口+全局双回调重复翻转）；
+        - 从停止切回启动时，若底层 MIT 扩展层支持 `clear_safety_fault()`，主动解除
+          M6 安全监督软停机锁存（前提是物理跟踪误差/过力矩故障已消除）。
+        """
         if not follow_enabled:
             print("\n[跟随] 当前为 --no-follow 模式，跟随不可用")
             return
@@ -1221,11 +1439,17 @@ def main():
             g_pressed[0] = not g_pressed[0]
             enabled = g_pressed[0]
             last_toggle[0] = now
+        # 重新启动跟随时清除底层 200Hz 安全监督软停机锁存（M6 交互）
         if enabled and robot is not None and hasattr(robot, "clear_safety_fault"):
             robot.clear_safety_fault()
         print("\n[跟随] 启动" if enabled else "\n[跟随] 停止（保持当前位置）")
 
     def on_press(key):
+        """`pynput` 全局按键回调：处理 `g`/空格 启停跟随与 `q`/Esc 触发统一安全退出。
+
+        Args:
+            key (pynput.keyboard.Key | pynput.keyboard.KeyCode): 按键事件对象。
+        """
         try:
             if key.char == 'g':
                 toggle_tracking()
@@ -1357,27 +1581,62 @@ def main():
             print(f"[诊断] 实际关节采样启动失败，已禁用: {exc}")
             feedback_sampler = None
 
+    # v13 MIT 底层扩展层只读句柄（纯内存读取，严禁在 100Hz 环内发起同步 CAN 请求；
+    # 若运行在 --no-arm 或上游非扩展控制器模式，对应属性可能不存在，统一回退 None）
     mit_feedback_getter = (getattr(robot, "get_feedback_state", None)
                            if robot is not None else None)
     mit_stats_getter = (getattr(robot, "get_mit_loop_stats", None)
                         if robot is not None else None)
     mit_safety_getter = (getattr(robot, "get_safety_status", None)
                          if robot is not None else None)
-    mit_stats_cache = [None, -1.0]
+    mit_stats_cache = [None, -1.0]  # [最近一次 200Hz MIT 统计字典, 上次采样 monotonic 时刻(s)]，每 0.5s 刷新一次
 
     def servo_control_loop():
+        """100Hz 视觉伺服闭环控制线程（daemon 线程，由 `stop_ctrl` 事件通知退出）。
+
+        单周期核心流水线（周期 `CTRL_RATE = 10ms`，所有滤波器/积分均按真实 `dt` 缩放）：
+        1. **跨线程快照与观测看门狗**：短持 `lock` 拷贝视觉目标与时间戳；若观测滞留超
+           `TARGET_STALE_S`（视觉卡顿保护），强制视作不可见进入有界 coast。
+        2. **P2 实测缓存读取 & P4 M6 安全监督交互**：零 CAN I/O 读取 200Hz MIT 状态快照与
+           安全监督状态；若触发过误差/过力矩软停机（`fault=True`），自动置 `g_pressed=False`、
+           调用 `robot.hold()` 并清空全部估计器与滤波器状态（绝不在半空失能）；同时提取
+           90~110°C 温升线性降速系数 `thermal_vel_scale`。
+        3. **控制 FK 与感知 FK 严格隔离（P2 安全红线）**：
+           - `prefetched_fk` 始终由指令角 `q_cmd` 计算，专供控制雅可比、工作空间软/硬墙、
+             关节软限位缓冲与速度积分使用，防止噪声/柔顺性引入内外环自激；
+           - `est_fk` 在 `MIT_ACTUAL_FEEDBACK_EST_ENABLE=True` 且 200Hz 缓存有效时由真实物理角
+             `q_act` 计算，专供 `pose_history`、世界系 KF、静止锁存 `hold_world` 与自运动补偿使用。
+        4. **时间戳双 KF + 深度冻结局部更新**：相机系 `kf` 与滞后对齐世界系 `kf_world` 仅在新
+           `obs_seq` 到来时按真实观测间隔更新；深度冻结帧只通过 `update_partial()` 更新 XY 子空间，
+           严禁污染深度 Z。
+        5. **非对称双估计器共识门控与静止锁存**：将世界系 KF 速度与 `DelayedTwistCompensator`
+           通过 `consensus_velocity` 融合用于唤醒/停靠/前馈/Lead；死区外追赶折返需两路同低于
+           `deadband_off` 才确认静止，配合 `PostBrakeSettleGuard`、伸展度联动阈值与 `FastStartGate`。
+        6. **丢手有界外推（Coast）+ Smith 预估反投影 + 动态自适应 Lead**。
+        7. **硬墙自动回 HOME（>5cm 越界保护）与静止世界系目标 `hold_world` / 慢拖迁移**。
+        8. **笛卡尔控制律**：振荡阻尼 + 大误差非线性追赶增益 + 双模态前馈/广域 PD 刹车 +
+           tanh 软饱和 + 非对称伸展度衰减 + 温升降速 + 固定姿态闭环 + 换向消惯性 + EMA +
+           加速度限幅 + `StaticVelocityHold`。
+        9. **空间映射与硬件约束**：伴随变换至 TCP/世界系 → XYZ 软墙 + 70% 水平径向软墙 →
+           可操作度自适应奇异保护 → 大误差软姿态加权阻尼伪逆 → L2 分组/分关节限速平滑收紧 →
+           关节软限位缓冲 → 平滑进死区置零 → 更新自运动补偿器并调用 `robot.joint_vel_cmd()`。
+        10. **诊断与节拍**：非阻塞写入 `DiagnosticRecorder`（含 200Hz MIT 缓存字段），按绝对
+            `next_deadline` 休眠等待，超时则重锚节拍防止补帧连发。
+        """
         next_deadline = time.monotonic()
         last_loop_time = None
         _zero3 = np.zeros(3)
         while not stop_ctrl.is_set():
             next_deadline += CTRL_RATE
             t0 = time.monotonic()
+            # 实测周期 dt 钳位在 [1ms, 60ms]，防止系统调度毛刺导致积分或微分爆炸
             dt = (CTRL_RATE if last_loop_time is None else
                   float(np.clip(t0 - last_loop_time, 1e-3, 0.06)))
             last_loop_time = t0
             q_cmd_log = np.zeros(6)
             static_hold_now[0] = False
 
+            # 临界区：一次性原子拷贝视觉线程发布的最新目标与时间戳
             with lock:
                 following = g_pressed[0]
                 target_cam = (None if current_target_cam[0] is None
@@ -1423,8 +1682,12 @@ def main():
             if safety_tick is not None:
                 _ts = float(safety_tick.get("thermal_scale", 1.0))
                 if np.isfinite(_ts):
+                    # 90~110°C MOS 温升线性降速系数（下限兜底 0.20 防止彻底停滞）
                     thermal_vel_scale = float(np.clip(_ts, 0.20, 1.0))
                 if following and safety_tick.get("fault", False):
+                    # M6 软停机交互：底层 200Hz 监督检测到持续过误差(>12°, ≥80ms)或
+                    # 过力矩(≥80ms)时，绝不在半空失能电机，而是切为软保持(vel=0)，
+                    # 并在此撤销跟随状态、全量清空滤波器/历史状态；故障排除后按 g 恢复。
                     _reason = str(safety_tick.get("reason", "安全监督软停机"))
                     with lock:
                         g_pressed[0] = False
@@ -1621,6 +1884,9 @@ def main():
                         if p_cam_d is not None and R_cam_d is not None:
                             dt_w = float(np.clip(
                                 meas_time - world_kf_time[0], 1e-3, 0.50))
+                            # 相机系 XY 投影到世界系正交子空间（剔除光轴 Z 方向）：
+                            # p_cam = R_cam^T (p_w - p_cam_d) ⇒ 取前两行得：
+                            # R_cam[:, :2]^T @ p_w = p_cam[:2] + R_cam[:, :2]^T @ p_cam_d
                             H_w_xy = R_cam_d[:, :2].T
                             z_w_xy = target_cam[:2] + H_w_xy @ p_cam_d
                             pred_w_xy = H_w_xy @ (
@@ -1917,6 +2183,8 @@ def main():
 
             if following and target_cam is not None and lost_counter[0] <= LOST_HOLD_FRAMES:
                 try:
+                    # 控制侧红线：雅可比、工作空间软/硬墙、关节软限位与速度积分严格使用
+                    # 指令角 q_cmd 对应的 prefetched_fk，绝不将实测 q_act 直接引入控制闭环。
                     if prefetched_fk is not None:
                         current_joints, tcp_pos, tcp_rot, J_robot = prefetched_fk
                     else:
@@ -1927,6 +2195,8 @@ def main():
                     with lock:
                         control_status["tcp"] = tcp_pos.round(3).tolist()
 
+                    # 硬工作空间保护：TCP 超出 XYZ 盒状边界或 70% 水平径向半径 > 5cm 时，
+                    # 立即停顿并低速(12°/s)自动返回 HOME，复位全部滤波器/门控状态防残留速度。
                     tcp_radius = float(np.hypot(tcp_pos[0], tcp_pos[1]))
                     if (np.any(tcp_pos < WORKSPACE_MIN - 0.05)
                             or np.any(tcp_pos > WORKSPACE_MAX + 0.05)
@@ -2019,6 +2289,7 @@ def main():
                             if np.linalg.norm(held_cam) > 1e-6:
                                 target_cam = held_cam
 
+                    # ── 笛卡尔误差计算、振荡检测与伸展度联动调度 ────────────
                     target_desired = np.array([0.0, 0.0, desired_depth])
                     pos_err_cam = target_cam - target_desired
                     pos_err_norm = float(np.linalg.norm(pos_err_cam))
@@ -2031,6 +2302,8 @@ def main():
                     osc_max = float(np.max(osc_levels))
                     reach_r = float(np.hypot(tcp_pos[0], tcp_pos[1]))
                     reach_r_now[0] = reach_r
+                    # P3 伸展度自适应阻尼调度：把当前水平伸展半径通知给底层 200Hz MIT 控制器，
+                    # 伸展越远越抬高 J1~J3 kd 阻尼（[0.8x, 1.8x]），压制悬臂共振。
                     if hasattr(robot, "set_reach_radius"):
                         robot.set_reach_radius(reach_r)
                     reach_sched = compute_reach_schedule(
@@ -2223,11 +2496,13 @@ def main():
                     else:
                         prev_cmd_vel[0] = actual_velocity[0][:3].copy()
 
+                    # ── 速度变换（相机系 → TCP 局部系 → 基座世界系）与虚拟软墙 ──
                     v_tcp = camera_velocity_to_tcp(actual_velocity[0], T_tcp_camera)
                     v_world = np.zeros(6)
                     v_world[0:3] = tcp_rot @ v_tcp[0:3]
                     v_world[3:6] = angular_world
 
+                    # 盒状 XYZ 虚拟软墙：触墙时仅清零继续向外穿墙的分量，保留沿墙面切向与回退运动
                     wall_touch = False
                     for ax in range(3):
                         if tcp_pos[ax] <= WORKSPACE_MIN[ax] and v_world[ax] < 0:
@@ -2246,6 +2521,7 @@ def main():
                         or np.any(tcp_pos > WORKSPACE_MAX - 0.05)
                         or tcp_radius > WORKSPACE_RADIUS - 0.05)
 
+                    # Yoshikawa 可操作度奇异保护：逼近奇异位形时自适应增大阻尼并按比例降速
                     manip = compute_manipulability(J_robot)
                     if DAMPING_ADAPTIVE and manip < MANIPULABILITY_THRESHOLD:
                         damping = DAMPING_BASE * (1.0 + (MANIPULABILITY_THRESHOLD - manip) * 100)
@@ -2368,6 +2644,8 @@ def main():
                         control_status["active"] = True
 
                 except Exception as exc:
+                    # 控制周期异常兜底：立即保持当前位置并清零估计器/历史缓存，
+                    # 防止单次 FK/数值异常导致电机失控或向后传播脏状态。
                     robot.hold()
                     prev_camera_twist[0][:] = 0.0
                     twist_comp.reset()
@@ -2389,6 +2667,8 @@ def main():
                         control_status["error"] = str(exc)
                         control_status["active"] = False
             else:
+                # 未启用跟随（IDLE）或连续丢手超过 LOST_HOLD_FRAMES（0.30s）：
+                # 全量重置滤波器/门控/外推状态，并调用 robot.hold() 锁定当前位姿（dq_des=0）。
                 actual_velocity[0] = np.zeros(6)
                 prev_cmd_vel[0][:] = 0.0
                 prev_target_cam[0] = None
@@ -2435,6 +2715,7 @@ def main():
                     if following and lost_counter[0] > LOST_HOLD_FRAMES:
                         control_status["error"] = "手掌丢失，保持位置"
 
+            # ── 周期性能指标汇总与非阻塞诊断日志入队（DiagnosticRecorder）──
             elapsed = time.monotonic() - t0
             with lock:
                 control_status["ctrl_dt_ms"] = dt * 1000.0
@@ -2528,6 +2809,7 @@ def main():
                 if fbc is not None:
                     _tm = fbc["t_mos"][np.isfinite(fbc["t_mos"])]
                     row["tmos_max"] = float(np.max(_tm)) if _tm.size else ""
+                # 200Hz MIT 循环统计低频抽样（每 0.5s 刷新缓存，避免在 100Hz 环内频繁拷贝）
                 if mit_stats_getter is not None and t0 - mit_stats_cache[1] >= 0.5:
                     try:
                         mit_stats_cache[0] = mit_stats_getter()
@@ -2547,7 +2829,8 @@ def main():
                     _ckd = mit_stats_cache[0].get("cur_kd")
                     if _ckd and len(_ckd) >= 1:
                         row["kd_j1"] = _ckd[0]
-                diag_recorder.log(row)
+                diag_recorder.log(row)  # 非阻塞 put_nowait，队满直接丢弃，绝不拖慢伺服环
+            # 固定 100Hz 节拍调度：用 Event.wait 替代 time.sleep，支持退出信号即时唤醒
             delay = next_deadline - time.monotonic()
             if delay > 0:
                 stop_ctrl.wait(delay)
@@ -2644,12 +2927,19 @@ def main():
             ms_grab[0] = 0.9 * ms_grab[0] + 0.1 * (_t1 - _t0) * 1000
             ms_det[0] = 0.9 * ms_det[0] + 0.1 * (_t2 - _t1) * 1000
 
+            # ── 4 层深度保护链（严禁删除或绕过任意一层）───────────────
+            # 1) 多尺度中值窗口回退（7x7 → 14x14 → 21x21，滤除空洞与离群像素）；
+            # 2) 单帧跳变剔除（|Δz| > Z3D_MAX_JUMP，含 15 帧防锁死放行）；
+            # 3) 无参照恢复一致性校验（reacq_buf 连续 5 帧一致 + 距离上限，防背景穿墙）；
+            # 4) 每帧速率限幅（±Z3D_MAX_RATE）+ One Euro 深度滤波；
+            # 若上述链条判为无效，在 Z_FREEZE_MAX 窗口内回退有界“深度冻结”（横向照常跟随、Z=desired）。
             if track is not None and track['lost'] == 0:
                 ui, vi = int(round(track['u'])), int(round(track['v']))
+                # [保护层 1] 7x7→14x14→21x21 多尺度中值深度采样（优先靠近 ref_depth）
                 depth_m = get_median_depth(
                     depth_raw, depth_scale, ui, vi,
                     ref_depth=last_valid_depth[0], max_jump=Z3D_MAX_JUMP)
-                # 深度跳变剔除：BS 模式 + MediaPipe 误检会让单帧 z3d 跳到
+                # [保护层 2] 深度跳变剔除：BS 模式 + MediaPipe 误检会让单帧 z3d 跳到
                 # 0.8~1.0m（实测），直接打进伺服就是一次猛冲（整体抖动
                 # 的主因）。手一帧（16ms）物理上不可能移动 8cm，
                 # 超阈值视为无效帧：不更新 3D 目标（等效于本帧手掌丢失），
@@ -2666,7 +2956,7 @@ def main():
                     # 连续 ≥15 帧：认定为参照彻底过时，放行并重置参照
                 else:
                     z3d_reject_count[0] = 0
-                # 恢复校验（log(16) 撞墙事故的修复）：参照无效时
+                # [保护层 3] 无参照恢复校验（log(16) 撞墙事故的修复）：参照无效时
                 # （长丢失重置后/首次启动），限速器和跳变剔除都不设防，
                 # 第一帧假深度（如 0.765m 背景）会直接打穿到墙上。
                 # 要求连续 5 帧读数互相一致（max-min ≤ 跳变阈值）才接受，
@@ -2688,7 +2978,7 @@ def main():
                         else:
                             depth_m = 0.0   # 校验未通过，本帧视为无效
                 if depth_m > 0:
-                    # 深度限速（仿真验证：恢复尖峰归零）：真实手掌在 60fps
+                    # [保护层 4] 每帧深度速率限幅（仿真验证：恢复尖峰归零）：真实手掌在 60fps
                     # 下纵向每帧最多移动 ~1cm，单帧 |Δz| 超过 5cm 必然是
                     # 误检。跳变剔除在参照重置后（长丢失恢复）不设防，
                     # 限速是最后防线——0.4→0.88m 的假深度被钳成缓坡
@@ -2735,12 +3025,13 @@ def main():
                 if hasattr(depth_oe, "reset"):
                     depth_oe.reset()
 
+            # ── 原子发布视觉目标至 100Hz 伺服线程共享区 ────────────────
             target_publish_time = time.monotonic()
             with lock:
                 if track is not None and track['lost'] == 0 and track['z3d'] > 0:
                     current_target_cam[0] = [track['x3d'], track['y3d'], track['z3d']]
                     target_frozen[0] = bool(track.get('z3d_frozen', False))
-                    target_seq[0] += 1
+                    target_seq[0] += 1  # 严格递增序号：伺服线程据此区分新观测与重复周期
                     target_obs_time[0] = frame_obs_time
                     target_arrival_time[0] = frame_arrival_time
                     target_pub_time[0] = target_publish_time
@@ -2750,7 +3041,7 @@ def main():
                     palm_visible[0] = True
                 else:
                     palm_visible[0] = False
-                    # 注意：不清空 current_target_cam，短暂丢失时控制侧沿用上值
+                    # 注意：不清空 current_target_cam，短暂丢失时控制侧沿用上值做有界 coast
                     if track is None:
                         current_target_cam[0] = None
 
@@ -2789,7 +3080,8 @@ def main():
                 gripper_frozen = hold_while_moving and arm_moving
                 gripper_frozen_now[0] = gripper_frozen
 
-                # 死区：变化太小不更新（指尖是关键点中噪声最大的）
+                # 死区：变化太小不更新（指尖是关键点中噪声最大的）；
+                # 所有 J7 指令严格经由 robot.set_gripper_deg() 打包到单一 CAN 主机第 7 通道下发。
                 if (not gripper_frozen and
                         abs(smoothed_gripper_deg - last_sent_gripper_deg) >= grasp_deadband):
                     if robot is not None:
@@ -2897,19 +3189,24 @@ def main():
     except KeyboardInterrupt:
         print("\n程序被中断（Ctrl+C），走统一退出路径...")
     finally:
+        # ── 统一安全回零退出链（硬件安全红线，顺序不可颠倒）────────────
+        # 1) 停止 100Hz 伺服控制线程，确保不再向机械臂下发新速度指令；
         stop_ctrl.set()
         if ctrl_thread is not None:
             ctrl_thread.join(timeout=1.0)
-        # 同步 CAN 实际反馈只用于诊断；必须先于安全回零停止，避免争用总线。
+        # 2) 停止低频同步 CAN 诊断采样器（必须先于安全回零，避免争用 CAN 总线）；
         if feedback_sampler is not None:
             feedback_sampler.close()
+        # 3) 刷盘并关闭后台诊断日志写入线程；
         if diag_recorder is not None:
             diag_recorder.close()
             print(f"[诊断] 写入 {diag_recorder.written} 行，"
                   f"队列丢弃 {diag_recorder.dropped} 行"
                   + (f"，错误={diag_recorder.error}" if diag_recorder.error else ""))
+        # 4) 停止键盘监听与 MediaPipe 推理资源；
         kb_listener.stop()
         detector.close()
+        # 5) 机械臂先 hold 稳停，再执行缓慢回零到位后才失能（严禁在弯肘姿态直接失能防自由下落）；
         if robot is not None:
             print("机械臂保持当前位置...")
             robot.hold()
@@ -2918,6 +3215,7 @@ def main():
             # 这几秒主线程被占用、视觉窗口不刷新是正常现象，勿重复按键
             print("正在安全回零（约3秒），窗口短暂无响应属正常现象，请勿重复按键...")
             robot.stop()
+        # 6) 关闭 OpenCV 显示窗口与 Gemini 2 相机流（幂等清理）；
         if not args.headless:
             cv2.destroyAllWindows()
         try:
