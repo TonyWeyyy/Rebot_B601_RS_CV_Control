@@ -61,7 +61,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--gfx",
         default="",
-        help="指定原生图形后端（留空自动选择，可选 opengl / vulkan）",
+        help="指定原生图形后端（--native 默认自动使用 opengl_headless 以规避 mujoco 4.0.1 swapchain target 缺陷；可选 opengl_software / opengl / vulkan）",
     )
     p.add_argument("--width", type=int, default=1440, help="原生窗口初始宽度（默认 1440）")
     p.add_argument("--height", type=int, default=900, help="原生窗口初始高度（默认 900）")
@@ -90,11 +90,15 @@ def main(argv: list[str] | None = None) -> int:
         if hasattr(plg, "udp_port"):
             plg.udp_port = int(args.udp_port)
 
+    # mujoco 4.0.1 NativeViewer 在直接 swapchain (gfx='') 下存在 target='' 缺陷；
+    # opengl_headless 仍走本机 GPU Filament OpenGL 渲染，并经 Present(pixels) 显示到原生桌面窗口。
+    effective_gfx = str(args.gfx) if args.gfx else ("" if use_web else "opengl_headless")
+
     config = viewer_protocol.ViewerConfig(
         title="reBot Arm B601-RS Digital Twin",
         width=int(args.width),
         height=int(args.height),
-        gfx=str(args.gfx),
+        gfx=effective_gfx,
         http_port=int(args.http_port) if use_web else 0,
         open_browser=bool(args.open_browser) if use_web else False,
         hot_reload="" if args.no_hot_reload else "all",
