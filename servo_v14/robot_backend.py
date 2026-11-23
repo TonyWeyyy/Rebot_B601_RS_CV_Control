@@ -74,6 +74,10 @@ class RobotBackend(Protocol):
         """读取当前 J7 夹爪目标/估算角 (deg)。"""
         ...
 
+    def set_joint_speed_limits(self, limits_rad: np.ndarray) -> None:
+        """同步 L2 分关节速度上限至底层 200Hz MIT 斜坡限幅（受 HARD_MAX_JOINT_SPEED 钳位）。"""
+        ...
+
     def clear_safety_fault(self) -> bool:
         """清除 M6 安全监督软停机锁存态（按 `g` 恢复跟随时调用）。"""
         ...
@@ -210,6 +214,9 @@ class HardwareRobotBackend:
 
     def get_gripper_deg(self) -> float:
         return float(self.adapter.get_gripper_deg())
+
+    def set_joint_speed_limits(self, limits_rad: np.ndarray) -> None:
+        self.adapter.set_joint_speed_limits(np.asarray(limits_rad, dtype=np.float64))
 
     def clear_safety_fault(self) -> bool:
         sup = self.adapter.get_safety_status() or {}
@@ -620,6 +627,9 @@ class DigitalTwinBackend:
 
     def get_gripper_deg(self) -> float:
         return self.gripper_deg
+
+    def set_joint_speed_limits(self, limits_rad: np.ndarray) -> None:
+        pass
 
     def clear_safety_fault(self) -> bool:
         was = self.supervisor_latched

@@ -98,6 +98,7 @@ class WorldPBVSController:
         self.t_tcp_cam = np.asarray(T_tcp_camera[:3, 3], dtype=np.float64).copy()
 
         self._R_tcp_init: Optional[np.ndarray] = None
+        self._v_ema_state = np.zeros(3, dtype=np.float64)
         self._v_cam_w_prev = np.zeros(3, dtype=np.float64)
         self._reach_att_smoothed: float = 1.0
         self._static_vel_hold = StaticVelocityHold(
@@ -122,6 +123,7 @@ class WorldPBVSController:
 
     def reset(self, clear_reference_ori: bool = False) -> None:
         """复位内部速度平滑、伸展平滑、振荡阻尼与尾速保持状态。"""
+        self._v_ema_state[:] = 0.0
         self._v_cam_w_prev[:] = 0.0
         self._reach_att_smoothed = 1.0
         self._static_vel_hold.reset()
@@ -194,6 +196,7 @@ class WorldPBVSController:
         if not decision.allow_motion or not estimate.valid:
             # 静止期间让振荡阻尼器平滑衰减而非清零，防止回弹重启盲区
             self._osc_damper.update(zero3, now_s, dt, active=False)
+            self._v_ema_state[:] = 0.0
             self._v_cam_w_prev[:] = 0.0
             self._static_vel_hold.reset()
             self.last_osc_active = False
@@ -314,25 +317,27 @@ class WorldPBVSController:
             v_raw_w = v_raw_w * (max_v_eff / raw_norm)
 
         # 5. 分轴换向残速收缩 + EMA 平滑 + 加速度限幅
-        v_target_damped, prev_damped, reversing = apply_axis_reversal_damping(
+        # 注意：apply_axis_reversal_damping 接收 (v_target=期望速度, actual_vel=EMA滤波状态, prev_cmd_vel=上拍指令速度)
+        ema_damped, prev_damped, reversing = apply_axis_reversal_damping(
             v_target=v_raw_w,
-            actual_vel=v_w,
+            actual_vel=self._v_ema_state,
             prev_cmd_vel=self._v_cam_w_prev,
             residual_scale=self.cfg.reversal_residual_scale,
             enabled=True,
         )
         alpha = scaled_alpha(self.cfg.smooth_alpha, dt, nominal_dt=self.ctrl_dt_s)
-        v_smooth = prev_damped + alpha * (v_target_damped - prev_damped)
+        v_smooth = ema_damped + alpha * (v_raw_w - ema_damped)
+        self._v_ema_state = v_smooth.copy()
 
-        # 加速度限幅（换向时启用加速制动倍率）
-        dv = v_smooth - self._v_cam_w_prev
+        # 加速度限幅（以收缩后的 prev_damped 为基准，换向时启用加速制动倍率）
+        dv = v_smooth - prev_damped
         accel_lim = self.cfg.max_accel * float(rs["accel_scale"]) * (
             self.cfg.reversal_accel_boost if reversing else 1.0
         )
         max_dv = accel_lim * dt
         dv_norm = float(np.linalg.norm(dv))
         if dv_norm > max_dv and dv_norm > 1e-9:
-            v_cam_w = self._v_cam_w_prev + dv * (max_dv / dv_norm)
+            v_cam_w = prev_damped + dv * (max_dv / dv_norm)
         else:
             v_cam_w = v_smooth
 

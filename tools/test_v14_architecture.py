@@ -293,6 +293,21 @@ class WorldPBVSAndShieldTests(unittest.TestCase):
         err = ctrl.compute_world_position_error(p_target, tcp_p, R_tilted)
         self.assertAlmostEqual(float(np.linalg.norm(err)), 0.0, places=6)
 
+    def test_proportional_position_response_when_target_velocity_is_zero(self):
+        """回归测试：手掌速度为 0 但存在 6cm 位置误差时，PBVS 比例位置项必须产生显著纠偏速度（不被换向衰减清零）。"""
+        cfg = V14Config()
+        ctrl = WorldPBVSController(cfg.pbvs, cfg.safety, np.eye(4))
+        ctrl.set_reference_orientation(np.eye(3))
+        tcp_p = np.array([0.20, 0.0, 0.30])
+        p_target = np.array([0.26, 0.0, 0.70])  # X 方向偏差 +6cm，速度为 0
+        from servo_v14.types import TargetEstimate, FSMDecision
+        est = TargetEstimate(True, True, True, False, p_target, np.zeros(3), p_target,
+                             0.0, 0.0, 0.0, np.ones(3), tcp_p, np.eye(3))
+        dec = FSMDecision(FSMMode.DOCKING, FSMMode.DOCKING, "", True, True, True,
+                          False, False, None, 0.06)
+        cmd = ctrl.step(est, dec, tcp_p, np.eye(3), np.eye(6), 1.0, 0.01)
+        self.assertGreater(float(cmd.v_tcp_world[0]), 0.03)
+
     def test_safety_shield_unbypassable_limits_and_walls(self):
         """验证即使恶意上层输出超大速度，安全护盾仍严守硬限速、水平软墙、热降额与 M6 软保持。"""
         cfg = V14Config()

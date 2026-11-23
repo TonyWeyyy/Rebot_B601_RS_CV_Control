@@ -254,7 +254,7 @@ class WorldTargetEstimator:
         p_w = self._kf.position()
         v_w = self._kf.velocity()
         obs_age = measurement_age(
-            obs.host_time_s,
+            t_now,
             obs.meas_time_s,
             max_age=self.cfg.target_stale_s,
         )

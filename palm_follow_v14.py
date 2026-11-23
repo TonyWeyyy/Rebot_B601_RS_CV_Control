@@ -278,6 +278,8 @@ def main(argv=None) -> int:
                 backend = HardwareRobotBackend()
                 print("[HW] 缓慢移动至示教 HOME 位姿...")
                 backend.move_to_joints(home_joints, speed_deg_s=20.0, wait=True)
+                # 同步 L2 分关节速度上限 [2.5, 2.0, 2.0, 3.0, 3.0, 2.4] 至底层 200Hz MIT 斜坡
+                backend.set_joint_speed_limits(np.asarray(cfg.safety.max_vel_joints, dtype=np.float64))
 
             # --no-gripper 硬件安全规则：主动打开夹爪防止遮挡手腕相机
             if args.no_gripper:

@@ -255,10 +255,11 @@ class ServoFSM:
             reason = "settled_in_deadband"
             return self._decision(prev_mode, reason, in_cooldown, kf_reanchor, err_norm)
 
-        # 2) 死区外连续低速满 stop_confirm_s（80ms 防折返过零假停顿）→ 进入 HOLDING
+        # 2) 连续低速满 stop_confirm_s（80ms 防折返过零假停顿）→ 无条件进入 HOLDING 保持当前位姿
+        # （与 v13.0 静止保持行为一致：不要求误差必须 <= deadband_out，避免手停后在 3.5~6cm 持续蠕动）
         if speed_w <= self.cfg.vel_deadband_off:
             self._stop_timer_s += dt
-            if self._stop_timer_s >= self.cfg.stop_confirm_s and err_norm <= deadband_out:
+            if self._stop_timer_s >= self.cfg.stop_confirm_s:
                 self.mode = FSMMode.HOLDING
                 self._hold_anchor_world = estimate.p_world.copy()
                 self._fast_start.reset(origin=self._hold_anchor_world)

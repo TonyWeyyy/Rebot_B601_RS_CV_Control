@@ -202,17 +202,19 @@ class SafetyShield:
         if soft_wall_active:
             reasons.append("soft_wall")
 
-        # ── 5. 可操作度奇异保护与安全逆解 ─────────────────────────
+        # ── 5. 可操作度奇异保护与安全逆解（与 v13.0 实机验收公式完全一致） ──
         singularity_active = False
         damping = self.cfg.damping_base
         manip_scale = 1.0
         if self.cfg.damping_adaptive and manip < self.cfg.manipulability_threshold:
             singularity_active = True
-            ratio = manip / max(self.cfg.manipulability_threshold, 1e-9)
-            damping = self.cfg.damping_base + 0.08 * (1.0 - ratio) ** 2
-            manip_scale = self.cfg.min_manip_speed_scale + (
-                1.0 - self.cfg.min_manip_speed_scale
-            ) * ratio
+            damping = self.cfg.damping_base * (
+                1.0 + (self.cfg.manipulability_threshold - manip) * 100.0
+            )
+            manip_scale = max(
+                self.cfg.min_manip_speed_scale,
+                manip / max(self.cfg.manipulability_threshold, 1e-9),
+            )
             reasons.append("singularity")
 
         # 若软墙修改了速度或处于奇异区，则按护盾后的安全 twist 重新求伪逆；否则直接采用 dq_des

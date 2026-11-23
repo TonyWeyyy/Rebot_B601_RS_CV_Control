@@ -214,7 +214,7 @@ class ServoV14Pipeline:
         work_ms = (time.perf_counter() - t_work_start) * 1000.0
 
         telemetry = ServoTickTelemetry(
-            host_time_s=obs.host_time_s,
+            host_time_s=robot_state.timestamp_s,
             dt_s=dt,
             seq=obs.seq,
             new_obs=estimate.new_obs,
