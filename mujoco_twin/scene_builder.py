@@ -360,6 +360,47 @@ def build_b601_spec(
             conaffinity=0,
         )
 
+    # Mocap 4 (v15.0): 可在 3D 视口直接鼠标拖拽的 IK 目标球（双击选中后 Ctrl+右键平移 / Ctrl+左键旋转）
+    ik_body = world.add_body(
+        name="ik_target",
+        pos=[0.0, 0.0, -10.0],
+        mocap=True,
+    )
+    ik_body.add_geom(
+        name="ik_target_shell",
+        type=mujoco.mjtGeom.mjGEOM_SPHERE,
+        size=[0.028, 0.0, 0.0],
+        rgba=[1.0, 0.52, 0.08, 0.65],
+        group=1,
+        contype=0,
+        conaffinity=0,
+    )
+    ik_body.add_geom(
+        name="ik_target_core",
+        type=mujoco.mjtGeom.mjGEOM_SPHERE,
+        size=[0.011, 0.0, 0.0],
+        rgba=[1.0, 0.86, 0.18, 0.96],
+        group=1,
+        contype=0,
+        conaffinity=0,
+    )
+    # RGB 局部三轴指示杆，便于 6-DoF 姿态 IK 时直观查看末端朝向
+    for axis_name, end_pt, rgba in (
+        ("ik_axis_x", [0.055, 0.0, 0.0], [0.95, 0.22, 0.22, 0.9]),
+        ("ik_axis_y", [0.0, 0.055, 0.0], [0.22, 0.92, 0.32, 0.9]),
+        ("ik_axis_z", [0.0, 0.0, 0.055], [0.22, 0.58, 1.00, 0.9]),
+    ):
+        ik_body.add_geom(
+            name=axis_name,
+            type=mujoco.mjtGeom.mjGEOM_CAPSULE,
+            fromto=[0.0, 0.0, 0.0] + end_pt,
+            size=[0.0024, 0.0, 0.0],
+            rgba=rgba,
+            group=1,
+            contype=0,
+            conaffinity=0,
+        )
+
     # 添加示教 HOME 关键帧（按编译顺序填充关节初值，Studio Reset 按钮一键归位）
     q_home = load_home_q_rad() if home_q_sdk is None else np.asarray(home_q_sdk, dtype=np.float64)
     q_off = load_joint_offset_rad() if joint_offset_rad is None else np.asarray(joint_offset_rad, dtype=np.float64)

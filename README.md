@@ -11,10 +11,43 @@
 手掌移动 → 机械臂跟随（保持固定距离与姿态）；拇指食指捏合 → 夹爪开合。
 
 > 日常调参只改 `config/v14.yaml`（v14 主线架构）、`config/follow.yaml`（v13 经典单文件基线）、`config/grasp.yaml`（夹爪）和 `config/mit_ext.yaml`（MIT 底层扩展）；
-> 命令行参数临时覆盖。完整技术文档：
-> - 总体技术与踩坑手册：[技术手册.md](技术手册.md)
-> - MIT 底层通用辨识与标定指南：[MIT底层辨识与标定开发指南.md](MIT底层辨识与标定开发指南.md)
-> - 原版 vs 现版 MIT 控制全面对比：[MIT控制升级前后对比文档.md](MIT控制升级前后对比文档.md)
+> 命令行参数临时覆盖。完整技术文档：[技术手册.md](技术手册.md)。
+
+## 开发版 v15.0（`develop` 分支：MuJoCo ↔ 真实机械臂双向数字孪生遥操作）
+
+在 v14.0 单向镜像（真机 → MuJoCo）的基础上，v15.0 打通了**双通道零阻塞本机 UDP 双向闭环**（状态上传 `:19870` + 遥操作下发 `:19871`），同时支持 **关节滑块控真机** 与 **3D 视口拖拽目标球实时 IK 控真机**，两种模式可在 MuJoCo 面板一键切换：
+
+### 核心能力与 5 道不可绕过硬件安全防线
+
+- **两种遥操作模式（`mujoco_twin/sim_plugin.py` + `viewer_plugin.py`）**：
+  1. **`Joint Sliders`（关节空间遥操作）**：拖动面板 `J1~J6` 与 `J7` 夹爪滑块，平滑同步驱动外部真机；
+  2. **`3D IK Sphere`（3D 交互目标球实时 IK）**：在 MuJoCo 3D 视口直接**双击橙金色目标球 → `Ctrl+右键` 平移 / `Ctrl+左键` 旋转**（亦可在面板微调 X/Y/Z 滑块与勾选 `Lock TCP Orientation`），内置基于 MuJoCo 解析雅可比 `mj_jacBody` 的阻尼最小二乘（DLS）IK（`<0.3mm` 精度，内置 `r≤0.42m / z≥0.06m` 裁剪）；
+  3. **`Monitor Only`（默认安全态）**：100% 兼容 v14.0 只读实时镜像与 CSV 实机日志回放。
+- **5 道硬件安全防线（`servo_v14/teleop_bridge.py` + `mujoco_teleop_v15.py`）**：
+  1. **显式解锁 + 8° 姿态对齐防跳变**：默认 `DISARMED`；点 `ARM Real Robot Follow` 先自动对齐虚拟目标至真机当前位姿，真机侧独立复核 `max|q_des - q_act| ≤ 8°`，杜绝误解锁甩臂；
+  2. **分轴速度包络 + 零超调加减速斜坡**：硬包络 `[1.5, 1.2, 1.2, 1.8, 1.8, 1.5] rad/s`（承重 `J2/J3 ≤ 1.2 rad/s`），叠加面板限速滑块 `5~60°/s`、热降额与离散制动曲线；
+  3. **URDF 软限位 + 0.42m 柱面软/硬墙 + 桌面 Z≥0.05m 防撞**：每拍执行前 FK 预检，拦截外推/撞桌但允许回撤，越界 `>5cm` 自动回 HOME；
+  4. **250ms 失联看门狗 + 200Hz M6 碰撞/过载联锁**：断连或碰撞立刻解除武装并原地软保持（绝不半空失能），支持终端 `Space/h` 急停与 `g` 清除锁存；
+  5. **单 CAN 主机与统一安全回零退出**：`q / Esc / Ctrl+C` 始终走「保持 → 缓慢回零到位 → 失能」。
+
+### v15.0 快速运行与离线验证
+
+```bash
+# 1. 离线单元测试（v15 7项 + v14 18项 + v13 96项 = 121项全绿，无需硬件）
+python3 tools/test_v15_teleop.py
+python3 tools/test_v14_architecture.py
+python3 tools/test_servo_upgrades.py
+
+# 2. 终端 1：启动本地原生 MuJoCo 3D 窗口
+./tools/launch_mujoco_twin.sh --native
+
+# 3. 终端 2：先跑仿真演练确认手感，再上低速真机
+conda activate rebot-cv
+python3 mujoco_teleop_v15.py --sim                 # 离线 200Hz 数字孪生双向演练（安全无硬件）
+python3 mujoco_teleop_v15.py --max-speed 20        # 真机低速安全双向同步（--no-gripper 可禁用夹爪）
+```
+
+---
 
 ## 稳定定版 v14.0（四层解耦架构 + 统一世界系 PBVS + MuJoCo Studio 3D 实时数字孪生）
 
