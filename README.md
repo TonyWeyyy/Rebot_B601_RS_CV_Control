@@ -65,7 +65,9 @@ python3 tools/replay_digital_twin.py logs/servo_20261123_171409.csv --sweep gain
 # 3. 启动 MuJoCo Studio 3D 数字孪生（首次使用需在独立 venv 安装 mujoco>=4.0.1）
 # uv venv ~/.venvs/mujoco-studio --python 3.12
 # uv pip install --python ~/.venvs/mujoco-studio/bin/python "mujoco>=4.0.1"
-./tools/launch_mujoco_twin.sh              # 浏览器打开 http://localhost:8080/
+./tools/launch_mujoco_twin.sh --native     # 本地原生桌面 3D 窗口（默认，无需浏览器与 Antigravity）
+./tools/launch_mujoco_twin.sh --web        # 独立浏览器 Web 模式（http://localhost:8080/）
+./tools/launch_mujoco_twin.sh --sidecar    # Antigravity 侧边栏模式
 
 # 4. 实机 / 仿真联动（保持 MuJoCo Studio 打开即自动双机同步）
 conda activate rebot-cv
@@ -400,6 +402,7 @@ rebot_palm_follow_grasp/
 │   └── mujoco_bridge.py           非阻塞本机 UDP 实时遥测桥接（127.0.0.1:19870）
 │
 ├── mujoco_twin/                   ★ MuJoCo Studio 4.0+ 3D 实时数字孪生工作区
+│   ├── run_twin.py                独立启动器（原生桌面窗口 --native / 独立浏览器 --web）
 │   ├── scene_builder.py           B601-RS 精模 MjSpec 构建（32 STL + Gemini 2 + 安全环）
 │   ├── sim_plugin.py              热重载仿真插件（真机 UDP 实时镜像 + CSV 日志回放 + 手动测试）
 │   ├── viewer_plugin.py           Dear ImGui 实时仪表盘与回放控制台
