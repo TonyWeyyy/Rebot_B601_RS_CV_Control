@@ -64,6 +64,7 @@ from servo_v14.config import (
     validate_v14_config,
 )
 from servo_v14.depth_guard import DepthProtectionChain
+from servo_v14.mujoco_bridge import DEFAULT_MUJOCO_PORT, MuJoCoTwinPublisher
 from servo_v14.pipeline import ServoV14Pipeline
 from servo_v14.robot_backend import DigitalTwinBackend, HardwareRobotBackend, RobotBackend
 from servo_v14.types import FSMMode, Observation
@@ -176,6 +177,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--gain-x", type=float, default=None, help="覆盖水平偏航增益")
     p.add_argument("--max-vel", type=float, default=None, help="覆盖最大末端线速度 (m/s, ≤0.85)")
     p.add_argument("--fps", type=int, default=None, help="覆盖相机帧率 (15/30/60)")
+    p.add_argument("--no-mujoco-sync", action="store_true",
+                   help="关闭向 MuJoCo Studio 数字孪生的本机 UDP 实时状态同步")
+    p.add_argument("--mujoco-port", type=int, default=DEFAULT_MUJOCO_PORT,
+                   help=f"MuJoCo 数字孪生 UDP 同步端口（默认 {DEFAULT_MUJOCO_PORT}）")
     return p.parse_args(argv)
 
 
@@ -222,6 +227,7 @@ def main(argv=None) -> int:
     camera: Optional[Gemini2Camera] = None
     detector: Optional[PalmDetector] = None
     diag: Optional[DiagnosticRecorder] = None
+    mj_pub: Optional[MuJoCoTwinPublisher] = None
     kb_listener = None
 
     stop_event = threading.Event()
@@ -293,6 +299,14 @@ def main(argv=None) -> int:
             if enable_follow:
                 pipeline = ServoV14Pipeline(cfg=cfg, backend=backend, T_tcp_camera=T_tcp_cam)
                 pipeline.lock_current_orientation(home_joints)
+
+            if not args.no_mujoco_sync:
+                mj_pub = MuJoCoTwinPublisher(
+                    port=args.mujoco_port,
+                    max_hz=100.0,
+                    enabled=True,
+                )
+                print(f"[MuJoCo] 实时数字孪生同步已就绪 -> udp://127.0.0.1:{args.mujoco_port}")
 
         # ── 2. 初始化相机与视觉组件 ──────────────────────────────
         camera = Gemini2Camera(
@@ -366,6 +380,25 @@ def main(argv=None) -> int:
 
                     if diag is not None:
                         diag.log(pipeline.telemetry_to_diag_row(telem, robot_state, following))
+
+                    if mj_pub is not None:
+                        mj_pub.publish(
+                            q_act=telem.q_act,
+                            q_cmd=telem.q_cmd,
+                            dq_act=telem.dq_act,
+                            tau_act=telem.tau_act,
+                            gripper_deg=backend.get_gripper_deg(),
+                            p_world=telem.p_world_est if (telem.visible and telem.kf_valid) else None,
+                            p_cam=obs.p_cam if obs.visible else None,
+                            visible=telem.visible,
+                            following=following,
+                            mode=telem.mode.value,
+                            err_norm_m=telem.error_norm_m,
+                            track_err_deg=telem.tracking_err_max_deg,
+                            tmos_max=robot_state.t_mos_max_c,
+                            m6_fault=robot_state.supervisor_latched,
+                            source="sim" if args.sim else "hw",
+                        )
 
                     next_tick += dt_nom
                     sleep_s = next_tick - time.perf_counter()
@@ -478,6 +511,24 @@ def main(argv=None) -> int:
                 cur_mode = shared["mode"]
                 cur_err = shared["err_norm"]
 
+            # 仅夹爪模式（无伺服线程）下也在视觉主循环同步 MuJoCo 状态
+            if mj_pub is not None and servo_thread is None and backend is not None:
+                st = backend.get_state(host_t)
+                mj_pub.publish(
+                    q_act=st.q_act,
+                    q_cmd=st.q_cmd,
+                    dq_act=st.dq_act,
+                    tau_act=st.tau_act,
+                    gripper_deg=backend.get_gripper_deg(),
+                    p_cam=obs_new.p_cam if obs_new.visible else None,
+                    visible=obs_new.visible,
+                    following=False,
+                    mode="GRIPPER_ONLY",
+                    tmos_max=st.t_mos_max_c,
+                    m6_fault=st.supervisor_latched,
+                    source="sim" if args.sim else "hw",
+                )
+
             # 可视化 HUD
             if not args.headless:
                 vis = color_img.copy()
@@ -523,6 +574,8 @@ def main(argv=None) -> int:
                 pass
         if diag is not None:
             diag.close()
+        if mj_pub is not None:
+            mj_pub.close()
         if backend is not None:
             print("[v14] 机械臂保持并安全缓慢回零...")
             backend.stop()

@@ -524,7 +524,7 @@ class DigitalTwinAndEndToEndTests(unittest.TestCase):
 
         with mock.patch.object(v14_mod, "Gemini2Camera", _FakeCam), \
              mock.patch.object(v14_mod, "PalmDetector", _FakeDet):
-            rc = v14_mod.main(["--sim", "--headless"])
+            rc = v14_mod.main(["--sim", "--headless", "--no-mujoco-sync"])
         self.assertEqual(rc, 0)
 
         after_logs = {n for n in os.listdir(log_dir) if n.startswith("servo_v14_") and n.endswith(".csv")}
@@ -533,6 +533,53 @@ class DigitalTwinAndEndToEndTests(unittest.TestCase):
         # 清理本次单测生成的临时日志，保持 logs/ 干净
         for name in new_logs:
             os.remove(os.path.join(log_dir, name))
+
+    def test_mujoco_udp_bridge_roundtrip_and_latest_drain(self):
+        """验证 MuJoCo 数字孪生非阻塞 UDP 遥测桥接：收发闭环、排空仅留最新帧、关闭安全。"""
+        from servo_v14.mujoco_bridge import MuJoCoTwinPublisher, MuJoCoTwinReceiver
+
+        rx = MuJoCoTwinReceiver(port=0, stale_timeout_s=0.5)
+        try:
+            self.assertIsNone(rx.bind_error)
+            port = rx._sock.getsockname()[1]
+            pub = MuJoCoTwinPublisher(port=port, max_hz=1000.0, enabled=True)
+            try:
+                for k in range(5):
+                    ok = pub.publish(
+                        q_act=[0.1 * k, 0.3, 0.4, 0.1, 0.0, 0.0],
+                        q_cmd=[0.1 * k + 0.02, 0.3, 0.4, 0.1, 0.0, 0.0],
+                        dq_act=[0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        tau_act=[0.2, 7.5, 6.8, 1.1, 0.1, 0.0],
+                        gripper_deg=180.0,
+                        p_world=[0.45, 0.10, 0.32],
+                        visible=True,
+                        following=True,
+                        mode="TRACKING",
+                        err_norm_m=0.052,
+                        track_err_deg=1.15,
+                        tmos_max=35.5,
+                        source="hw",
+                        force=True,
+                    )
+                    self.assertTrue(ok)
+                # 短暂等待 loopback 送达后一次性排空，仅保留最新帧 (k=4)
+                import time as _t
+                pkt = None
+                for _ in range(20):
+                    pkt = rx.poll_latest()
+                    if pkt is not None and abs(pkt["q_act"][0] - 0.4) < 1e-4:
+                        break
+                    _t.sleep(0.005)
+                self.assertIsNotNone(pkt)
+                self.assertAlmostEqual(pkt["q_act"][0], 0.4, places=4)
+                self.assertEqual(pkt["mode"], "TRACKING")
+                self.assertEqual(pkt["source"], "hw")
+                self.assertAlmostEqual(pkt["gripper_deg"], 180.0, places=1)
+                self.assertTrue(rx.is_live)
+            finally:
+                pub.close()
+        finally:
+            rx.close()
 
 
 if __name__ == "__main__":
