@@ -11,12 +11,45 @@
 手掌移动 → 机械臂跟随（保持固定距离与姿态）；拇指食指捏合 → 夹爪开合。
 
 > 日常调参只改 `config/v14.yaml`（v14 主线架构）、`config/follow.yaml`（v13 经典单文件基线）、`config/grasp.yaml`（夹爪）和 `config/mit_ext.yaml`（MIT 底层扩展）；
-> 命令行参数临时覆盖。完整技术文档：
-> - 总体技术与踩坑手册：[技术手册.md](技术手册.md)
-> - MIT 底层通用辨识与标定指南：[MIT底层辨识与标定开发指南.md](MIT底层辨识与标定开发指南.md)
-> - 原版 vs 现版 MIT 控制全面对比：[MIT控制升级前后对比文档.md](MIT控制升级前后对比文档.md)
+> 命令行参数临时覆盖。完整技术文档：[技术手册.md](技术手册.md)。
 
-## 稳定定版 v14.0（四层解耦架构 + 统一世界系 PBVS + MuJoCo Studio 3D 实时数字孪生）
+## 稳定定版 v15.0（MuJoCo ↔ 真实机械臂双向数字孪生遥操作 + 原生桌面窗口）
+
+在 v14.0 单向镜像（真机 → MuJoCo）的基础上，v15.0 完成了**双通道零阻塞本机 UDP 双向闭环**（状态上传 `:19870` + 遥操作下发 `:19871`）与**本地原生桌面 3D 窗口**（`--native`，不依赖浏览器与 Antigravity），同时支持 **关节滑块控真机** 与 **3D 视口拖拽目标球实时 IK 控真机**，两种模式可在 MuJoCo 面板一键切换，已通过实机与全量离线测试验收定版：
+
+### 核心能力与 5 道不可绕过硬件安全防线
+
+- **两种遥操作模式（`mujoco_twin/sim_plugin.py` + `viewer_plugin.py`）**：
+  1. **`Joint Sliders`（关节空间遥操作）**：拖动面板 `J1~J6` 与 `J7` 夹爪滑块，平滑同步驱动外部真机；
+  2. **`3D IK Sphere`（3D 交互目标球实时 IK）**：在 MuJoCo 3D 视口直接**双击橙金色目标球 → `Ctrl+右键` 平移 / `Ctrl+左键` 旋转**（亦可在面板微调 X/Y/Z 滑块与勾选 `Lock TCP Orientation`），内置基于 MuJoCo 解析雅可比 `mj_jacBody` 的阻尼最小二乘（DLS）IK（`<0.3mm` 精度，内置 `r≤0.42m / z≥0.06m` 裁剪）；
+  3. **`Monitor Only`（默认安全态）**：100% 兼容 v14.0 只读实时镜像与 CSV 实机日志回放。
+- **5 道硬件安全防线（`servo_v14/teleop_bridge.py` + `mujoco_teleop_v15.py`）**：
+  1. **显式解锁 + 8° 姿态对齐防跳变**：默认 `DISARMED`；点 `ARM Real Robot Follow` 先自动对齐虚拟目标至真机当前位姿，真机侧独立复核 `max|q_des - q_act| ≤ 8°`，杜绝误解锁甩臂；
+  2. **分轴速度包络 + 零超调加减速斜坡**：硬包络 `[1.5, 1.2, 1.2, 1.8, 1.8, 1.5] rad/s`（承重 `J2/J3 ≤ 1.2 rad/s`），叠加面板限速滑块 `5~60°/s`、热降额与离散制动曲线；
+  3. **URDF 软限位 + 0.42m 柱面软/硬墙 + 桌面 Z≥0.05m 防撞**：每拍执行前 FK 预检，拦截外推/撞桌但允许回撤，越界 `>5cm` 自动回 HOME；
+  4. **250ms 失联看门狗 + 200Hz M6 碰撞/过载联锁**：断连或碰撞立刻解除武装并原地软保持（绝不半空失能），支持终端 `Space/h` 急停与 `g` 清除锁存；
+  5. **单 CAN 主机与统一安全回零退出**：`q / Esc / Ctrl+C` 始终走「保持 → 缓慢回零到位 → 失能」。
+
+### v15.0 快速运行与离线验证
+
+```bash
+# 1. 离线单元测试（v15 7项 + v14 18项 + v13 96项 = 121项全绿，无需硬件）
+python3 tools/test_v15_teleop.py
+python3 tools/test_v14_architecture.py
+python3 tools/test_servo_upgrades.py
+
+# 2. 终端 1：启动本地原生 MuJoCo 3D 窗口
+./tools/launch_mujoco_twin.sh --native
+
+# 3. 终端 2：先跑仿真演练确认手感，再上低速真机
+conda activate rebot-cv
+python3 mujoco_teleop_v15.py --sim                 # 离线 200Hz 数字孪生双向演练（安全无硬件）
+python3 mujoco_teleop_v15.py --max-speed 20        # 真机低速安全双向同步（--no-gripper 可禁用夹爪）
+```
+
+---
+
+## 历史版本 v14.0（四层解耦架构 + 统一世界系 PBVS + MuJoCo Studio 3D 实时数字孪生）
 
 在保留 `palm_follow_grasp.py`（v13.0 实机定版基线）100% 完好可对照的前提下，v14.0 完成了全新**模块化四层解耦架构**（`servo_v14/` + 薄入口 `palm_follow_v14.py` + `config/v14.yaml`）与 **MuJoCo Studio 3D 实时数字孪生**（`mujoco_twin/` + 零阻塞 UDP 桥接），经真机高频日志验收，跟踪精度与控制性能**全面超越 v13.0**：
 
@@ -384,11 +417,12 @@ python3 tools/analyze_servo_log.py logs/servo_时间.csv --json
 
 ```
 rebot_palm_follow_grasp/
-├── palm_follow_v14.py             ★ v14.0 主程序（四层解耦架构 + MuJoCo 实时同步 + --sim 模式）
+├── mujoco_teleop_v15.py           ★ v15.0 MuJoCo <-> 真机/SIM 双向遥操作桥接主程序
+├── palm_follow_v14.py             ★ v14.0 视觉伺服主程序（四层解耦架构 + MuJoCo 实时同步 + --sim 模式）
 ├── palm_follow_grasp.py           v13.0 稳定基线主程序（单文件对照保留）
 ├── palm_follow_fixed_orientation.py   仅跟随版（历史基线对照）
 │
-├── servo_v14/                     ★ v14.0 四层解耦核心包
+├── servo_v14/                     ★ v14/v15 模块化核心包
 │   ├── types.py                   强类型数据契约与 FSMMode 8 态枚举
 │   ├── config.py                  不可变 dataclass 配置与安全红线校验
 │   ├── depth_guard.py             4 层深度保护链
@@ -398,13 +432,14 @@ rebot_palm_follow_grasp/
 │   ├── safety_shield.py           层 4：不可绕过安全护盾（硬限速/软硬墙/奇异/限位/M6）
 │   ├── robot_backend.py           可插拔后端（HardwareRobotBackend + DigitalTwinBackend）
 │   ├── pipeline.py                四层流水线装配与遥测转换
-│   └── mujoco_bridge.py           非阻塞本机 UDP 实时遥测桥接（127.0.0.1:19870）
+│   ├── mujoco_bridge.py           双通道非阻塞本机 UDP 协议（状态 :19870 / 遥操作指令 :19871）
+│   └── teleop_bridge.py           v15.0 遥操作安全控制器（对齐门控/零超调斜坡/软硬墙/防撞桌/看门狗）
 │
 ├── mujoco_twin/                   ★ MuJoCo Studio 4.0+ 3D 实时数字孪生工作区
 │   ├── run_twin.py                独立启动器（原生桌面窗口 --native / 独立浏览器 --web）
-│   ├── scene_builder.py           B601-RS 精模 MjSpec 构建（32 STL + Gemini 2 + 安全环）
-│   ├── sim_plugin.py              热重载仿真插件（真机 UDP 实时镜像 + CSV 日志回放 + 手动测试）
-│   ├── viewer_plugin.py           Dear ImGui 实时仪表盘与回放控制台
+│   ├── scene_builder.py           B601-RS 精模 MjSpec 构建（32 STL + Gemini 2 + 安全环 + 3D IK 目标球）
+│   ├── sim_plugin.py              热重载仿真插件（实时镜像 + 日志回放 + 关节滑块/DLS 3D IK 控真机）
+│   ├── viewer_plugin.py           Dear ImGui 实时仪表盘、双向遥操作面板与回放控制台
 │   └── messages.py                Sim <-> Viewer 强类型 Snapshot / Event 定义
 │
 ├── gemini2_camera.py              相机层（Orbbec SDK，RGB+深度硬件对齐）
@@ -429,8 +464,9 @@ rebot_palm_follow_grasp/
 │   └── hand_landmarker.task       MediaPipe 手掌模型
 │
 ├── tools/                         标定、仿真与验收工具
-│   ├── launch_mujoco_twin.sh      ★ 一键启动 MuJoCo Studio 3D 实时数字孪生
+│   ├── launch_mujoco_twin.sh      ★ 一键启动 MuJoCo Studio 3D 实时数字孪生（默认 --native）
 │   ├── replay_digital_twin.py     v14.0 离线数字孪生闭环回放与 --sweep 参数扫描
+│   ├── test_v15_teleop.py         v15.0 双向 UDP 协议、对齐门控、软硬墙与遥操作单测（7 项）
 │   ├── test_v14_architecture.py   v14.0 架构、安全护盾、数字孪生与 UDP 桥接单测（18 项）
 │   ├── test_servo_upgrades.py     v13 核心与 MIT 扩展单元测试（96 项）
 │   ├── offline_smoke_test.py      假相机/假机械臂完整主程序冒烟测试
@@ -446,9 +482,7 @@ rebot_palm_follow_grasp/
 │
 ├── requirements.txt
 ├── README.md                      快速开始、版本验收对比与架构总览
-├── 技术手册.md                     项目全部技术与工程踩坑手册（v14~v8 全演进）
-├── MIT底层辨识与标定开发指南.md     新机械臂通用的 MIT 底层辨识/标定/分级验收工程指南
-├── MIT控制升级前后对比文档.md       原版纯位置 PD 与升级后完整 MIT 五元组全面对比
+├── 技术手册.md                     项目全部技术与工程踩坑手册（v15~v8 全演进）
 └── B601手掌跟随系统_定稿技术文档.md  早期系统定稿归档文档
 ```
 

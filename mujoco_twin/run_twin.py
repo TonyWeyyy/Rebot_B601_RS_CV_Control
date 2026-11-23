@@ -45,7 +45,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--udp-port",
         type=int,
         default=19870,
-        help="监听真机/SIM 实时遥测的本机 UDP 端口（默认 19870）",
+        help="监听真机/SIM 实时遥测的本机 UDP 端口（通道 A，默认 19870）",
+    )
+    p.add_argument(
+        "--cmd-port",
+        type=int,
+        default=19871,
+        help="向真机/SIM 遥操作桥接下发目标指令的本机 UDP 端口（通道 B，默认 19871）",
     )
     p.add_argument(
         "--http-port",
@@ -89,13 +95,15 @@ def main(argv: list[str] | None = None) -> int:
     for plg in user_plugins:
         if hasattr(plg, "udp_port"):
             plg.udp_port = int(args.udp_port)
+        if hasattr(plg, "cmd_port"):
+            plg.cmd_port = int(args.cmd_port)
 
     # mujoco 4.0.1 NativeViewer 在直接 swapchain (gfx='') 下存在 target='' 缺陷；
     # opengl_headless 仍走本机 GPU Filament OpenGL 渲染，并经 Present(pixels) 显示到原生桌面窗口。
     effective_gfx = str(args.gfx) if args.gfx else ("" if use_web else "opengl_headless")
 
     config = viewer_protocol.ViewerConfig(
-        title="reBot Arm B601-RS Digital Twin",
+        title="reBot Arm B601-RS Digital Twin v15.0",
         width=int(args.width),
         height=int(args.height),
         gfx=effective_gfx,
@@ -107,15 +115,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if use_web:
         print(
-            f"[MuJoCo Twin] WebViewer 模式启动 -> http://localhost:{args.http_port}/ "
-            f"| UDP 监听 127.0.0.1:{args.udp_port}",
+            f"[MuJoCo Twin v15.0] WebViewer 模式启动 -> http://localhost:{args.http_port}/ "
+            f"| UDP 状态:{args.udp_port} <-> 指令:{args.cmd_port}",
             flush=True,
         )
         launch_web.run(config, plugins=all_plugins)
     else:
         print(
-            f"[MuJoCo Twin] 本地原生桌面窗口启动 ({args.width}x{args.height}) "
-            f"| UDP 监听 127.0.0.1:{args.udp_port}",
+            f"[MuJoCo Twin v15.0] 本地原生桌面窗口启动 ({args.width}x{args.height}) "
+            f"| UDP 状态:{args.udp_port} <-> 指令:{args.cmd_port}",
             flush=True,
         )
         launch_native.run(config, plugins=all_plugins)
